@@ -1,20 +1,40 @@
 {
   "name": "@1agents/dreammate-node",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "DreamMate Network 的本机 node agent：节点身份、服务报备、探活。固定监听 36908。",
-  "keywords": ["dreammate", "node-agent", "service-registry", "tailscale", "discovery"],
+  "keywords": [
+    "dreammate",
+    "node-agent",
+    "service-registry",
+    "tailscale",
+    "discovery"
+  ],
   "license": "MIT",
-  "repository": { "type": "git", "url": "git+https://github.com/scottzx/dreammate-node.git" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/scottzx/dreammate-node.git"
+  },
   "type": "module",
   "main": "./dist/src/index.js",
   "types": "./dist/src/index.d.ts",
   "exports": {
-    ".": { "types": "./dist/src/index.d.ts", "import": "./dist/src/index.js" },
-    "./client": { "types": "./dist/src/client.d.ts", "import": "./dist/src/client.js" },
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    },
+    "./client": {
+      "types": "./dist/src/client.d.ts",
+      "import": "./dist/src/client.js"
+    },
     "./package.json": "./package.json"
   },
-  "bin": { "dreammate-node": "dist/bin/dreammate-node.js" },
-  "files": ["dist", "README.md"],
+  "bin": {
+    "dreammate-node": "dist/bin/dreammate-node.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "sideEffects": false,
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
@@ -22,8 +42,19 @@
     "test": "node --import tsx --test test/*.test.ts",
     "prepack": "npm run build"
   },
-  "engines": { "node": ">=22.5" },
-  "dependencies": { "@1agents/dreammate-network": "^0.3.0" },
-  "devDependencies": { "@types/node": "^22.10.2", "tsx": "^4.19.2", "typescript": "^5.7.2" },
-  "publishConfig": { "access": "public", "registry": "https://registry.npmjs.org" }
+  "engines": {
+    "node": ">=22.5"
+  },
+  "dependencies": {
+    "@1agents/dreammate-network": "^0.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  }
 }
