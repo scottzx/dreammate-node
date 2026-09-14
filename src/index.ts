@@ -3,6 +3,7 @@ export {
   nodeTypeOf,
   localIdentityPath,
   resetIdentityCache,
+  resetBinCache,
   CACHE_MS,
   type NodeIdentity,
 } from './identity.js';

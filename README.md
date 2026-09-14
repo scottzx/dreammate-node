@@ -26,8 +26,25 @@
 ## 跑起来
 
 ```bash
-npx @1agents/dreammate-node              # 0.0.0.0:36908
-npx @1agents/dreammate-node --host 127.0.0.1   # 只对本机可见
+npm i -g @1agents/dreammate-node
+dreammate-node install      # 装成开机自启的常驻服务
+dreammate-node status       # 看服务与端口状态
+dreammate-node uninstall
+```
+
+macOS 装 launchd LaunchAgent（`~/Library/LaunchAgents/work.dreammate.node.plist`），
+Linux 装 systemd user unit（`~/.config/systemd/user/dreammate-node.service`），
+**两边都不需要 sudo**——agent 只读本机服务清单，没有要 root 的理由。
+挂了会自动拉起（KeepAlive / Restart=always），日志在 `~/.1agents/logs/`。
+
+> Linux 上用户级 systemd 服务在登出后会被停掉，服务器上要真常驻得开 linger：
+> `sudo loginctl enable-linger <user>`。`install` 会检测并提示。
+
+前台跑（调试用）：
+
+```bash
+dreammate-node                        # 0.0.0.0:36908
+dreammate-node --host 127.0.0.1       # 只对本机可见
 ```
 
 ## 服务怎么报备
@@ -77,6 +94,13 @@ type      macos                ← 由 tailscale 的 OS 映射
 
 > ⚠️ 名字取 **DNSName** 而非 HostName：iOS 设备的 HostName 全是 `localhost`，
 > 实测一个 11 节点的 tailnet 里只有 9 个 HostName 唯一。
+
+> ⚠️ **找 tailscale 不能只靠 PATH。** launchd 给的 PATH 只有
+> `/usr/bin:/bin:/usr/sbin:/sbin`，systemd 的也好不到哪去，而 homebrew 的
+> tailscale 在 `/opt/homebrew/bin`。不处理的话，装成常驻服务后会静默回退到
+> 本地身份——同一台机器在前台和服务模式下变成**两个 Node**，而且没人会注意到。
+> 所以这里除了 PATH 还会依次试几个已知位置，plist / unit 里也补了 PATH。
+> 装在别处用 `DREAMMATE_TAILSCALE_BIN` 指定。
 
 没装 / 没登录 tailscale 时静默回退到本地身份（hostname + 首次生成的 uuid，
 存在 `~/.1agents/node.json`），`metadata.identity_source` 如实报告来源。

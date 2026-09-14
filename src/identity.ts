@@ -54,22 +54,63 @@ interface RawStatus {
 }
 
 /**
+ * 去哪儿找 tailscale。
+ *
+ * 光靠 PATH 不够：launchd 给的 PATH 只有 `/usr/bin:/bin:/usr/sbin:/sbin`，
+ * systemd 的也好不到哪去。装成常驻服务后会找不到 homebrew 里的 tailscale，
+ * 于是静默回退到本地身份——同一台机器在前台和服务模式下变成两个 Node，
+ * 而且没人会注意到。
+ */
+const TAILSCALE_CANDIDATES = [
+  'tailscale',
+  '/opt/homebrew/bin/tailscale',
+  '/usr/local/bin/tailscale',
+  '/usr/bin/tailscale',
+  '/Applications/Tailscale.app/Contents/MacOS/Tailscale',
+];
+
+/** 找到过一次就记住，省得每次启动都试一遍。 */
+let resolvedBin: string | undefined;
+
+/** `DREAMMATE_TAILSCALE_BIN` 覆盖查找，装在别处时用。 */
+function candidates(): string[] {
+  const override = process.env.DREAMMATE_TAILSCALE_BIN?.trim();
+  if (override) return [override];
+  return resolvedBin ? [resolvedBin, ...TAILSCALE_CANDIDATES] : TAILSCALE_CANDIDATES;
+}
+
+/**
  * 跑一次 `tailscale status --json`。
  *
  * 任何不顺利都返回 undefined 而不是抛错：没装、没登录、CLI 卡住、输出换了格式——
  * 这些都只该让我们回退，不该让 agent 起不来。stderr 会有版本告警，只读 stdout。
  */
-function readStatus(timeoutMs: number): Promise<RawStatus | undefined> {
+function runOne(bin: string, timeoutMs: number): Promise<RawStatus | undefined> {
   return new Promise((resolve) => {
-    execFile('tailscale', ['status', '--json'], { timeout: timeoutMs, maxBuffer: 8 << 20 }, (error, stdout) => {
+    execFile(bin, ['status', '--json'], { timeout: timeoutMs, maxBuffer: 8 << 20 }, (error, stdout) => {
       if (error || !stdout) return resolve(undefined);
       try {
-        resolve(JSON.parse(stdout) as RawStatus);
+        const parsed = JSON.parse(stdout) as RawStatus;
+        resolvedBin = bin;
+        resolve(parsed);
       } catch {
         resolve(undefined);
       }
     });
   });
+}
+
+async function readStatus(timeoutMs: number): Promise<RawStatus | undefined> {
+  for (const bin of candidates()) {
+    const status = await runOne(bin, timeoutMs);
+    if (status) return status;
+  }
+  return undefined;
+}
+
+/** 测试用：忘掉已解析的 tailscale 路径。 */
+export function resetBinCache(): void {
+  resolvedBin = undefined;
 }
 
 let cache: { at: number; value: NodeIdentity } | undefined;

@@ -162,3 +162,25 @@ test('nodeTypeOf 映射 tailscale 的 OS，未知值原样降级', () => {
   assert.equal(nodeTypeOf('iOS'), 'ios');
   assert.equal(nodeTypeOf('plan9'), 'plan9');
 });
+
+test('PATH 里没有 tailscale 时仍能从已知位置找到它', async (t) => {
+  const { resetBinCache } = await import('../src/identity.js');
+  const savedPath = process.env.PATH;
+  // 模拟 launchd 的环境：PATH 里没有 homebrew。
+  process.env.PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
+  try {
+    resetIdentityCache();
+    resetBinCache();
+    const identity = await nodeIdentity({ force: true });
+    if (identity.source === 'local') {
+      return t.skip('本机没装 tailscale 或未登录，无从验证');
+    }
+    // 关键断言：PATH 里找不到，但候选路径兜住了，身份仍是 tailnet 的。
+    assert.equal(identity.source, 'tailscale');
+    assert.notEqual(identity.name, 'localhost');
+  } finally {
+    process.env.PATH = savedPath;
+    resetIdentityCache();
+    resetBinCache();
+  }
+});

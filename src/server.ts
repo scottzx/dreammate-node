@@ -11,7 +11,7 @@ import { nodeIdentity } from './identity.js';
 import { ServiceRegistry, type Registration } from './registry.js';
 
 /** 固定端口。改它等于让全网的探测方同时失明。 */
-export const NODE_AGENT_PORT = DEFAULT_PORTS['node-agent'];
+export const NODE_AGENT_PORT: number = DEFAULT_PORTS['node-agent'];
 
 export interface AgentOptions {
   port?: number;
