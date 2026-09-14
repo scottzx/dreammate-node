@@ -16,6 +16,7 @@ export {
   type RegistryOptions,
 } from './registry.js';
 export { createAgent, serveAgent, NODE_AGENT_PORT, type AgentOptions } from './server.js';
+export { rediscover, type RediscoverOptions } from './rediscover.js';
 export {
   reportToAgent,
   withdrawFromAgent,

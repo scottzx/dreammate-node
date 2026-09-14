@@ -77,11 +77,14 @@ try {
     }
 
     case 'run': {
-      const { registry } = await serveAgent({ port, host });
+      const { registry, rebuilt } = await serveAgent({ port, host });
       const identity = await nodeIdentity();
       console.log(`dreammate-node — ${identity.name} (${identity.node_id})  [${identity.source}]`);
       console.log(`  http://${host}:${port}/manifest`);
-      console.log(`  服务报备仅接受 localhost；已注册 ${registry.list().length} 个服务`);
+      console.log(
+        `  服务报备仅接受 localhost；已注册 ${registry.list().length} 个服务` +
+          (rebuilt > 0 ? `（其中 ${rebuilt} 个是扫约定端口捡回来的）` : ''),
+      );
       break;
     }
 

@@ -5,7 +5,7 @@
  * 探它们的 health 端点。**Node 在线不代表 Service 在线**——tailnet 只知道机器
  * 开着，进程被 kill 了它照样报在线，所以这一层必须自己探。
  */
-import type { Reachability, Service } from '@1agents/dreammate-network';
+import type { Reachability, ResourceDescriptor, Service } from '@1agents/dreammate-network';
 
 /** 服务报备时提交的内容。 */
 export interface Registration {
@@ -18,7 +18,7 @@ export interface Registration {
   reachability?: Reachability;
   /** 存活探测路径，默认 `/health`。 */
   health?: string;
-  resources?: { scheme: string; description?: string }[];
+  resources?: ResourceDescriptor[];
   metadata?: Record<string, unknown>;
 }
 

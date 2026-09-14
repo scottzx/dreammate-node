@@ -213,3 +213,82 @@ test('没有 tailnet 时不给重复的 access', () => {
   // host 与 ipv4 相同也不该给两条一样的。
   assert.equal(registry.toServices('100.88.227.56', '100.88.227.56')[0]!.access!.length, 1);
 });
+
+/* ---------- 启动时重建注册表 ---------- */
+
+/** 起一个假服务，只回答 /manifest 与 /health——刚好是重建需要的两个端点。 */
+async function withFakeService(
+  manifest: unknown,
+  body: (port: number) => Promise<void>,
+  host = '127.0.0.1',
+): Promise<void> {
+  const { createServer } = await import('node:http');
+  const server = createServer((req, res) => {
+    const ok = (payload: unknown): void => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(payload));
+    };
+    if (req.url === '/manifest') return ok(manifest);
+    if (req.url === '/health') return ok({ status: 'ok' });
+    res.writeHead(404).end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, host, resolve));
+  try {
+    await body((server.address() as import('node:net').AddressInfo).port);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+}
+
+const fakeManifest = {
+  node_id: 'n1',
+  name: 'x',
+  type: 'linux',
+  services: [
+    { id: 'session-registry', name: 'session-reader', kind: 'session_registry', capabilities: ['sessions.read'] },
+  ],
+};
+
+test('重建：扫约定端口，把还在跑的服务捡回来', async () => {
+  const { rediscover } = await import('../src/rediscover.js');
+  await withFakeService(fakeManifest, async (port) => {
+    const registry = new ServiceRegistry();
+    // agent 重启后注册表是空的——这正是要修的场景。
+    assert.equal(registry.list().length, 0);
+    const rebuilt = await rediscover(registry, { ports: [port] });
+    assert.equal(rebuilt, 1);
+    const service = registry.get('session-registry')!;
+    assert.equal(service.port, port);
+    assert.deepEqual(service.capabilities, ['sessions.read']);
+    assert.equal(service.metadata?.rediscovered, true, '应标明是捡回来的，不是自己报的');
+  });
+});
+
+test('重建：reachability 是探出来的，不是服务说的', async () => {
+  const { rediscover } = await import('../src/rediscover.js');
+  await withFakeService(fakeManifest, async (port) => {
+    // 服务只在回环上，给一个连不上的"对外地址"——探不通就该判定 localhost。
+    const registry = new ServiceRegistry();
+    await rediscover(registry, { ports: [port], ipv4: '192.0.2.1', timeoutMs: 500 });
+    assert.equal(registry.get('session-registry')!.reachability, 'localhost');
+  });
+});
+
+test('重建：端口没人应答就跳过，不留下幽灵条目', async () => {
+  const { rediscover } = await import('../src/rediscover.js');
+  const registry = new ServiceRegistry();
+  // 1 号端口不会有人应答。悬空条目比没有条目更糟。
+  assert.equal(await rediscover(registry, { ports: [1], timeoutMs: 300 }), 0);
+  assert.equal(registry.list().length, 0);
+});
+
+test('serveAgent 启动时会重建，可以关掉', async () => {
+  const { serveAgent } = await import('../src/server.js');
+  const quiet = await serveAgent({ port: 0, host: '127.0.0.1', rediscover: false });
+  try {
+    assert.equal(quiet.rebuilt, 0);
+  } finally {
+    quiet.registry.stop();
+    await new Promise<void>((resolve) => quiet.server.close(() => resolve()));
+  }
+});

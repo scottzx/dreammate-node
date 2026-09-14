@@ -21,6 +21,8 @@ export interface AgentOptions {
    */
   host?: string;
   registry?: ServiceRegistry;
+  /** 关掉启动时的注册表重建（测试用）。 */
+  rediscover?: boolean;
 }
 
 const json = (res: http.ServerResponse, status: number, body: unknown): void => {
@@ -146,11 +148,22 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
   return { server, registry };
 }
 
-export async function serveAgent(options: AgentOptions = {}): Promise<{ server: http.Server; registry: ServiceRegistry; port: number }> {
+export async function serveAgent(
+  options: AgentOptions = {},
+): Promise<{ server: http.Server; registry: ServiceRegistry; port: number; rebuilt: number }> {
   const { server, registry } = createAgent(options);
   const host = options.host ?? '0.0.0.0';
   const port = options.port ?? NODE_AGENT_PORT;
   await new Promise<void>((resolve) => server.listen(port, host, resolve));
+
+  // 报备只在服务启动时发生一次，所以 agent 一重启，还在跑的服务就从注册表里
+  // 消失了。扫一遍约定端口把它们捡回来——端口不多且都在回环，代价很小。
+  const { rediscover } = await import('./rediscover.js');
+  const identity = await nodeIdentity();
+  const rebuilt = options.rediscover === false
+    ? 0
+    : await rediscover(registry, { ...(identity.ipv4 ? { ipv4: identity.ipv4 } : {}) }).catch(() => 0);
+
   registry.start();
-  return { server, registry, port: (server.address() as AddressInfo).port };
+  return { server, registry, port: (server.address() as AddressInfo).port, rebuilt };
 }
