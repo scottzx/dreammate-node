@@ -99,7 +99,7 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
           });
         }
 
-        if (req.method === 'GET' && (pathname === '/manifest' || pathname === '/v1/node')) {
+        if (req.method === 'GET' && pathname === '/manifest') {
           const host = identity.dnsName ?? identity.name;
           const manifest: NodeManifest = {
             node_id: identity.node_id,
