@@ -108,7 +108,7 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
             tailscale_name: identity.dnsName ?? null,
             online: true,
             metadata: { protocol_version: PROTOCOL_VERSION, identity_source: identity.source },
-            services: registry.toServices(host),
+            services: registry.toServices(host, identity.ipv4),
           };
           return json(res, 200, manifest);
         }

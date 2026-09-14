@@ -103,20 +103,28 @@ export class ServiceRegistry {
    *
    * `access.base_url` 用调用方能用的地址：只监听回环的服务如实写 127.0.0.1，
    * 让对方一眼看出连不上，而不是给一个看着能连、连上却超时的地址。
+   *
+   * 对外服务给两个 access——MagicDNS 名在前，tailnet IP 兜底。调用方的 DNS
+   * 可能被劫持（实测一台装了 fake-ip 代理的 Mac 会把 MagicDNS 名解析到
+   * 198.18.x.x），只给名字的话那台机器就永远连不上。
    */
-  toServices(host: string): Service[] {
+  toServices(host: string, ipv4?: string): Service[] {
     return this.list().map((s) => ({
       id: s.id,
       ...(s.name ? { name: s.name } : {}),
       ...(s.kind ? { kind: s.kind } : {}),
       capabilities: s.capabilities,
       ...(s.resources ? { resources: s.resources } : {}),
-      access: [
-        {
-          protocol: 'http' as const,
-          base_url: `http://${s.reachability === 'localhost' ? '127.0.0.1' : host}:${s.port}`,
-        },
-      ],
+      access:
+        s.reachability === 'localhost'
+          ? [{ protocol: 'http' as const, base_url: `http://127.0.0.1:${s.port}` }]
+          : [
+              { protocol: 'http' as const, base_url: `http://${host}:${s.port}` },
+              // 同一个 host 时不重复给（没有 tailnet 就只有一个地址）。
+              ...(ipv4 && ipv4 !== host
+                ? [{ protocol: 'http' as const, base_url: `http://${ipv4}:${s.port}` }]
+                : []),
+            ],
       reachability: s.reachability,
       port: s.port,
       health: s.health,

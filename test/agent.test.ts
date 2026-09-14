@@ -184,3 +184,32 @@ test('PATH 里没有 tailscale 时仍能从已知位置找到它', async (t) => 
     resetBinCache();
   }
 });
+
+test('对外服务给 MagicDNS 与 IP 两个 access，回环服务只给 127.0.0.1', () => {
+  const registry = new ServiceRegistry();
+  registry.register({ ...sample, reachability: 'network' });
+  const services = registry.toServices('scott-mac.tailfb4720.ts.net', '100.88.227.56');
+  const urls = services[0]!.access!.map((a) => a.base_url);
+  // 顺序有意义：名字在前（可读、IP 变了不用改），IP 兜底。
+  assert.deepEqual(urls, [
+    'http://scott-mac.tailfb4720.ts.net:7777',
+    'http://100.88.227.56:7777',
+  ]);
+
+  // 只听回环的服务给 IP 没有意义——外部本来就连不上。
+  const loopback = new ServiceRegistry();
+  loopback.register({ ...sample, reachability: 'localhost' });
+  assert.deepEqual(
+    loopback.toServices('scott-mac.tailfb4720.ts.net', '100.88.227.56')[0]!.access!.map((a) => a.base_url),
+    ['http://127.0.0.1:7777'],
+  );
+});
+
+test('没有 tailnet 时不给重复的 access', () => {
+  const registry = new ServiceRegistry();
+  registry.register({ ...sample, reachability: 'network' });
+  // 回退身份下 host 就是主机名，没有单独的 tailnet IP。
+  assert.equal(registry.toServices('some-host')[0]!.access!.length, 1);
+  // host 与 ipv4 相同也不该给两条一样的。
+  assert.equal(registry.toServices('100.88.227.56', '100.88.227.56')[0]!.access!.length, 1);
+});
