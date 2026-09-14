@@ -1,6 +1,6 @@
 {
   "name": "@1agents/dreammate-node",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "DreamMate Network 的本机 node agent：节点身份、服务报备、探活。固定监听 36908。",
   "keywords": [
     "dreammate",
