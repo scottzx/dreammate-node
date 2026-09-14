@@ -88,3 +88,18 @@ test('status 在未安装时如实报告，不抛错', async (t) => {
   assert.equal(status.responding, false);
   assert.equal(status.installed, fs.existsSync(status.file), 'installed 应该等于文件真的在不在');
 });
+
+test('install 是幂等的，且必须让新代码真正生效', async () => {
+  // 回归：`systemctl enable --now` 对已 active 的服务不会重启，于是 npm 更新
+  // 了文件、进程还在跑旧代码。这里只能检查我们发出的命令里含 restart——
+  // 真实行为在装了 systemd 的机器上验证过（manifest 的 protocol 版本从旧值
+  // 跳到新值才算数）。
+  const source = await fs.promises.readFile(new URL('../src/service.ts', import.meta.url), 'utf8');
+  const systemd = source.slice(source.indexOf("const file = unitPath();"));
+  assert.match(systemd, /'restart', SYSTEMD_UNIT/, 'systemd 分支必须 restart');
+  assert.ok(!/'enable', '--now'/.test(systemd), '不能用 enable --now，它对已运行的服务是 no-op');
+  // launchd 分支靠 bootout + bootstrap 达到同样效果。
+  const launchd = source.slice(source.indexOf("if (platform === 'launchd')"), source.indexOf("const file = unitPath();"));
+  assert.match(launchd, /'bootout'/);
+  assert.match(launchd, /'bootstrap'/);
+});

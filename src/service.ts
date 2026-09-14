@@ -156,7 +156,12 @@ export async function installService(options: InstallOptions = {}, defaultScript
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, renderUnit(r));
   await run('systemctl', ['--user', 'daemon-reload']);
-  await run('systemctl', ['--user', 'enable', '--now', SYSTEMD_UNIT]);
+  await run('systemctl', ['--user', 'enable', SYSTEMD_UNIT]);
+  // 必须 restart 而不是 `enable --now`：对已经 active 的服务，start 是 no-op，
+  // 于是 npm 更新了文件、进程却还在跑旧代码——实测升级后 manifest 少了一条
+  // access，查了半天才发现是没重启。launchd 那边 bootout+bootstrap 本来就是
+  // 真重启，没这个问题。
+  await run('systemctl', ['--user', 'restart', SYSTEMD_UNIT]);
   // 用户级 unit 默认在登出后被杀，服务器上必须开 linger 才算真常驻。
   const lingering = await run('loginctl', ['show-user', os.userInfo().username, '--property=Linger'])
     .then((out) => out.stdout.includes('Linger=yes'))
