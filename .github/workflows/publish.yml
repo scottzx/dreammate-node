@@ -36,7 +36,7 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
-      - name: Test（schema 与 types 的一致性、三条硬规则）
+      - name: Test（注册表、探活、回环限制）
         run: npm test
 
       - name: Build

@@ -1,4 +1,4 @@
-# 每次 push / PR 都跑：协议包最怕的是 schema 与 types.ts 悄悄漂移。
+# 每次 push / PR 都跑：agent 最怕的是回环限制被改坏、探活静默失效。
 name: ci
 
 on:
