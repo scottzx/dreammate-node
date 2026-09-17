@@ -8,9 +8,9 @@
  * 的实现拉进自己的进程。
  */
 import { DEFAULT_PORTS, type Reachability } from '@1agents/dreammate-network';
-import type { Registration } from './registry.js';
+import type { MethodDescriptor, Registration } from './registry.js';
 
-export type { Registration, Reachability };
+export type { Registration, MethodDescriptor, Reachability };
 
 const AGENT_BASE = `http://127.0.0.1:${DEFAULT_PORTS['node-agent']}`;
 

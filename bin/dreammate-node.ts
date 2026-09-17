@@ -22,6 +22,7 @@ const flag = (name: string): string | undefined => {
 const USAGE = `dreammate-node — DreamMate Network 本机 node agent
 
   dreammate-node [--host 0.0.0.0] [--port ${NODE_AGENT_PORT}]   前台跑
+  dreammate-node mcp [--agent http://127.0.0.1:${NODE_AGENT_PORT}] 作为 MCP Stdio Server 运行供大模型消费
   dreammate-node install [--host ...] [--port ...]          装成常驻服务（开机自启）
   dreammate-node status                                     服务与端口状态
   dreammate-node uninstall                                  卸载
@@ -31,6 +32,7 @@ const USAGE = `dreammate-node — DreamMate Network 本机 node agent
   GET  /services    各服务的存活与可达性
   POST /services    服务报备（仅接受 localhost）
   DELETE /services/:id
+  POST /services/:id/invoke  调用指定服务的方法/能力
 
 端口 ${NODE_AGENT_PORT} 是协议固定的：外部节点靠探这一个端口，就能知道这台机器上有什么。
 install 在 macOS 上装 launchd LaunchAgent、Linux 上装 systemd user unit，都不需要 sudo。`;
@@ -47,6 +49,13 @@ const entry = fileURLToPath(import.meta.url);
 
 try {
   switch (command) {
+    case 'mcp': {
+      const { runMcpServer } = await import('../src/mcp.js');
+      const agentUrl = flag('agent') ?? `http://127.0.0.1:${port}`;
+      await runMcpServer({ agentUrl });
+      break;
+    }
+
     case 'install': {
       const result = await installService({ host, port, script: entry }, entry);
       console.log(`✅ 已安装为常驻服务（${result.platform}）`);

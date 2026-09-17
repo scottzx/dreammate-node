@@ -292,3 +292,194 @@ test('serveAgent 启动时会重建，可以关掉', async () => {
     await new Promise<void>((resolve) => quiet.server.close(() => resolve()));
   }
 });
+
+/* ---------- Phase 1: Methods 自声明与通用调用路由 ---------- */
+
+test('携带 methods 报备，能在 /services/:id 与 /manifest 中正确获取', async () => {
+  const registry = new ServiceRegistry();
+  const sampleWithMethods = {
+    ...sample,
+    id: 'podcast-adapter',
+    capabilities: ['podcast.latest', 'podcast.transcribe'],
+    methods: {
+      'podcast.latest': {
+        description: '获取最新单集',
+        parameters: { limit: { type: 'number' } },
+      },
+      'podcast.transcribe': {
+        description: '离线转写音频',
+        parameters: { file_path: { type: 'string', required: true } },
+      },
+    },
+    metadata: { enabled: true },
+  };
+
+  await withAgent(registry, async (base) => {
+    const postRes = await fetch(`${base}/services`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(sampleWithMethods),
+    });
+    assert.equal(postRes.status, 201);
+
+    // GET /services/:id
+    const single = (await (await fetch(`${base}/services/podcast-adapter`)).json()) as typeof sampleWithMethods;
+    assert.equal(single.id, 'podcast-adapter');
+    assert.ok(single.methods?.['podcast.latest']);
+    assert.equal(single.methods?.['podcast.latest']?.description, '获取最新单集');
+
+    // 404 for non-existent service
+    const notFound = await fetch(`${base}/services/non-existent`);
+    assert.equal(notFound.status, 404);
+
+    // /manifest contains methods in metadata
+    const manifest = (await (await fetch(`${base}/manifest`)).json()) as {
+      services: { id: string; metadata?: { methods?: Record<string, unknown> } }[];
+    };
+    const foundInManifest = manifest.services.find((s) => s.id === 'podcast-adapter');
+    assert.ok(foundInManifest?.metadata?.methods?.['podcast.latest']);
+  });
+});
+
+test('报备时 methods 如果类型不合法会被拒绝', async () => {
+  await withAgent(new ServiceRegistry(), async (base) => {
+    const bad = async (methodsVal: unknown): Promise<number> =>
+      (
+        await fetch(`${base}/services`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ ...sample, methods: methodsVal }),
+        })
+      ).status;
+    assert.equal(await bad('not an object'), 400);
+    assert.equal(await bad(['array', 'not', 'object']), 400);
+  });
+});
+
+test('POST /services/:id/invoke 能够代理转发至目标服务并获得响应', async () => {
+  const { createServer } = await import('node:http');
+  let receivedPayload: unknown;
+
+  // 启动一个受调用的 downstream mock service
+  const downstream = createServer((req, res) => {
+    if (req.method === 'POST' && req.url === '/invoke') {
+      let body = '';
+      req.on('data', (c) => (body += c));
+      req.on('end', () => {
+        receivedPayload = JSON.parse(body);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ success: true, echoed: receivedPayload }));
+      });
+      return;
+    }
+    res.writeHead(404).end();
+  });
+
+  await new Promise<void>((resolve) => downstream.listen(0, '127.0.0.1', resolve));
+  const downstreamPort = (downstream.address() as AddressInfo).port;
+
+  try {
+    const registry = new ServiceRegistry();
+    registry.register({
+      id: 'mock-target',
+      capabilities: ['test.echo'],
+      port: downstreamPort,
+    });
+
+    await withAgent(registry, async (base) => {
+      // 正常转发
+      const res = await fetch(`${base}/services/mock-target/invoke`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'echo', text: 'hello' }),
+      });
+      assert.equal(res.status, 200);
+      const data = (await res.json()) as { success: boolean; echoed: { action: string; text: string } };
+      assert.equal(data.success, true);
+      assert.deepEqual(data.echoed, { action: 'echo', text: 'hello' });
+
+      // 服务不存在
+      const missing = await fetch(`${base}/services/ghost/invoke`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      assert.equal(missing.status, 404);
+    });
+  } finally {
+    await new Promise<void>((resolve) => downstream.close(() => resolve()));
+  }
+});
+
+test('POST /services/:id/invoke 在服务标记为 disabled 时拒绝调用', async () => {
+  const registry = new ServiceRegistry();
+  registry.register({
+    id: 'disabled-service',
+    capabilities: ['do.something'],
+    port: 5555,
+    metadata: { enabled: false },
+  });
+
+  await withAgent(registry, async (base) => {
+    const res = await fetch(`${base}/services/disabled-service/invoke`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    assert.equal(res.status, 400);
+    const body = (await res.json()) as { error: string };
+    assert.match(body.error, /disabled/);
+  });
+});
+
+test('POST /capabilities/:name/invoke 可根据 capability 自动匹配服务并转发', async () => {
+  const { createServer } = await import('node:http');
+  const downstream = createServer((req, res) => {
+    if (req.method === 'POST' && req.url === '/invoke') {
+      let body = '';
+      req.on('data', (c) => (body += c));
+      req.on('end', () => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ from: 'cap-service', body: JSON.parse(body) }));
+      });
+      return;
+    }
+    res.writeHead(404).end();
+  });
+
+  await new Promise<void>((resolve) => downstream.listen(0, '127.0.0.1', resolve));
+  const downstreamPort = (downstream.address() as AddressInfo).port;
+
+  try {
+    const registry = new ServiceRegistry();
+    registry.register({
+      id: 'worker-service',
+      capabilities: ['audio.transcribe'],
+      port: downstreamPort,
+    });
+
+    await withAgent(registry, async (base) => {
+      const res = await fetch(`${base}/capabilities/audio.transcribe/invoke`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ file: 'test.mp3' }),
+      });
+      assert.equal(res.status, 200);
+      const data = (await res.json()) as { from: string; body: { capability: string; file: string } };
+      assert.equal(data.from, 'cap-service');
+      assert.equal(data.body.capability, 'audio.transcribe');
+      assert.equal(data.body.file, 'test.mp3');
+
+      // 未知 capability 返回 404
+      const notFound = await fetch(`${base}/capabilities/unknown.cap/invoke`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      assert.equal(notFound.status, 404);
+    });
+  } finally {
+    await new Promise<void>((resolve) => downstream.close(() => resolve()));
+  }
+});
+

@@ -79,6 +79,11 @@ function validate(body: unknown): Registration {
   if (entry.reachability && entry.reachability !== 'localhost' && entry.reachability !== 'network') {
     throw new Error('reachability must be "localhost" or "network"');
   }
+  if (entry.methods !== undefined) {
+    if (typeof entry.methods !== 'object' || entry.methods === null || Array.isArray(entry.methods)) {
+      throw new Error('methods must be an object');
+    }
+  }
   return entry as Registration;
 }
 
@@ -119,12 +124,102 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
           return json(res, 200, { node: identity.name, services: registry.list() });
         }
 
+        if (req.method === 'GET' && pathname === '/nodes') {
+          const { listNetworkNodes } = await import('./identity.js');
+          const nodes = await listNetworkNodes();
+          return json(res, 200, { node: identity.name, nodes });
+        }
+
+        const getSingle = /^\/services\/([^/]+)$/.exec(pathname);
+        if (req.method === 'GET' && getSingle) {
+          const id = decodeURIComponent(getSingle[1]!);
+          const service = registry.get(id);
+          return service
+            ? json(res, 200, service)
+            : json(res, 404, { error: `no such service: ${id}` });
+        }
+
         if (req.method === 'POST' && pathname === '/services') {
           if (!isLoopback(req)) {
             return json(res, 403, { error: 'registration is loopback-only' });
           }
           const entry = validate(JSON.parse(await readBody(req)));
           return json(res, 201, registry.register(entry));
+        }
+
+        const invokeService = /^\/services\/([^/]+)\/invoke$/.exec(pathname);
+        if (req.method === 'POST' && invokeService) {
+          const id = decodeURIComponent(invokeService[1]!);
+          const service = registry.get(id);
+          if (!service) {
+            return json(res, 404, { error: `no such service: ${id}` });
+          }
+          if (service.metadata?.enabled === false) {
+            return json(res, 400, { error: `service "${id}" is disabled` });
+          }
+          const raw = await readBody(req);
+          const payload = raw ? JSON.parse(raw) : {};
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 15_000);
+          try {
+            const forwardRes = await fetch(`http://127.0.0.1:${service.port}/invoke`, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify(payload),
+              signal: controller.signal,
+            });
+            const forwardText = await forwardRes.text();
+            let parsed: unknown;
+            try {
+              parsed = JSON.parse(forwardText);
+            } catch {
+              parsed = forwardText;
+            }
+            return json(res, forwardRes.status, parsed);
+          } catch (err: unknown) {
+            return json(res, 502, {
+              error: `failed to reach service "${id}" at port ${service.port}: ${err instanceof Error ? err.message : String(err)}`,
+            });
+          } finally {
+            clearTimeout(timeout);
+          }
+        }
+
+        const invokeCap = /^\/capabilities\/([^/]+)\/invoke$/.exec(pathname);
+        if (req.method === 'POST' && invokeCap) {
+          const capability = decodeURIComponent(invokeCap[1]!);
+          const target = registry.list().find(
+            (s) => s.capabilities.includes(capability) && s.metadata?.enabled !== false && s.liveness !== 'down',
+          );
+          if (!target) {
+            return json(res, 404, { error: `no active service found for capability: ${capability}` });
+          }
+          const raw = await readBody(req);
+          const payload = raw ? JSON.parse(raw) : {};
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 15_000);
+          try {
+            const forwardRes = await fetch(`http://127.0.0.1:${target.port}/invoke`, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ capability, ...payload }),
+              signal: controller.signal,
+            });
+            const forwardText = await forwardRes.text();
+            let parsed: unknown;
+            try {
+              parsed = JSON.parse(forwardText);
+            } catch {
+              parsed = forwardText;
+            }
+            return json(res, forwardRes.status, parsed);
+          } catch (err: unknown) {
+            return json(res, 502, {
+              error: `failed to reach service "${target.id}" at port ${target.port}: ${err instanceof Error ? err.message : String(err)}`,
+            });
+          } finally {
+            clearTimeout(timeout);
+          }
         }
 
         const remove = /^\/services\/([^/]+)$/.exec(pathname);

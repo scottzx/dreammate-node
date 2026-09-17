@@ -48,9 +48,29 @@ export function localIdentityPath(): string {
   return path.join(os.homedir(), '.1agents', 'node.json');
 }
 
+export interface NetworkNode {
+  node_id: string;
+  name: string;
+  type: string;
+  online: boolean;
+  is_self: boolean;
+  dnsName?: string;
+  ipv4?: string;
+}
+
+interface PeerStatus {
+  ID?: string;
+  HostName?: string;
+  DNSName?: string;
+  OS?: string;
+  TailscaleIPs?: string[];
+  Online?: boolean;
+}
+
 interface RawStatus {
   BackendState?: string;
-  Self?: { ID?: string; DNSName?: string; OS?: string; TailscaleIPs?: string[] };
+  Self?: { ID?: string; DNSName?: string; OS?: string; TailscaleIPs?: string[]; HostName?: string; Online?: boolean };
+  Peer?: Record<string, PeerStatus>;
 }
 
 /**
@@ -181,3 +201,45 @@ function localIdentity(envId?: string, envName?: string): NodeIdentity {
     source: 'local',
   };
 }
+
+/**
+ * 获取局域网 / Tailnet 内已知的所有设备节点（包括本机与对端 Peers）。
+ */
+export async function listNetworkNodes(options: { timeoutMs?: number; force?: boolean } = {}): Promise<NetworkNode[]> {
+  const self = await nodeIdentity({ force: options.force, timeoutMs: options.timeoutMs });
+  const nodes: NetworkNode[] = [
+    {
+      node_id: self.node_id,
+      name: self.name,
+      type: self.type,
+      online: true,
+      is_self: true,
+      dnsName: self.dnsName,
+      ipv4: self.ipv4,
+    },
+  ];
+
+  const status = await readStatus(options.timeoutMs ?? 2_000);
+  if (!status || status.BackendState !== 'Running' || !status.Peer) {
+    return nodes;
+  }
+
+  for (const peer of Object.values(status.Peer)) {
+    if (!peer.ID) continue;
+    const dnsName = peer.DNSName ? peer.DNSName.replace(/\.$/, '') : undefined;
+    const name = (dnsName ? dnsName.split('.')[0] : peer.HostName) ?? peer.ID;
+    const ipv4 = peer.TailscaleIPs?.find((ip) => ip.includes('.'));
+    nodes.push({
+      node_id: peer.ID,
+      name,
+      type: nodeTypeOf(peer.OS ?? ''),
+      online: Boolean(peer.Online),
+      is_self: false,
+      dnsName,
+      ipv4,
+    });
+  }
+
+  return nodes;
+}
+

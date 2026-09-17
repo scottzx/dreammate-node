@@ -7,6 +7,14 @@
  */
 import type { Reachability, ResourceDescriptor, Service } from '@1agents/dreammate-network';
 
+/** 方法与参数契约描述。 */
+export interface MethodDescriptor {
+  description?: string;
+  /** 参数定义，可为简易字段说明或 JSON Schema 对象。 */
+  parameters?: Record<string, unknown>;
+  returns?: Record<string, unknown>;
+}
+
 /** 服务报备时提交的内容。 */
 export interface Registration {
   id: string;
@@ -19,6 +27,8 @@ export interface Registration {
   /** 存活探测路径，默认 `/health`。 */
   health?: string;
   resources?: ResourceDescriptor[];
+  /** 服务自声明的方法契约。 */
+  methods?: Record<string, MethodDescriptor>;
   metadata?: Record<string, unknown>;
 }
 
@@ -128,7 +138,12 @@ export class ServiceRegistry {
       reachability: s.reachability,
       port: s.port,
       health: s.health,
-      metadata: { ...s.metadata, liveness: s.liveness, ...(s.lastProbedAt ? { last_probed_at: s.lastProbedAt } : {}) },
+      metadata: {
+        ...s.metadata,
+        liveness: s.liveness,
+        ...(s.lastProbedAt ? { last_probed_at: s.lastProbedAt } : {}),
+        ...(s.methods ? { methods: s.methods } : {}),
+      },
     }));
   }
 
