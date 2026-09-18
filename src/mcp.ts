@@ -34,6 +34,40 @@ function resolveNodeBaseUrl(localAgentUrl: string, node?: string): string {
   return `http://${node}:${DEFAULT_PORTS['node-agent']}`;
 }
 
+function extractSkillsMap(service: RegisteredService): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  if (service.skills) {
+    if (Array.isArray(service.skills)) {
+      for (const item of service.skills) {
+        if (item && typeof item === 'object' && 'name' in item) {
+          result[String(item.name)] = item;
+        }
+      }
+    } else if (typeof service.skills === 'object') {
+      Object.assign(result, service.skills);
+    }
+  }
+  if (service.metadata?.skills && typeof service.metadata.skills === 'object') {
+    if (Array.isArray(service.metadata.skills)) {
+      for (const item of service.metadata.skills) {
+        if (item && typeof item === 'object' && 'name' in item) {
+          result[String(item.name)] = item;
+        }
+      }
+    } else {
+      Object.assign(result, service.metadata.skills);
+    }
+  }
+  if (service.metadata?.remote_skill && typeof service.metadata.remote_skill === 'object') {
+    const rs = service.metadata.remote_skill as { name?: string };
+    const key = rs.name || 'default';
+    if (!result[key]) {
+      result[key] = rs;
+    }
+  }
+  return result;
+}
+
 export const MCP_TOOLS: Tool[] = [
   {
     name: 'dreammate_list_nodes',
@@ -82,7 +116,7 @@ export const MCP_TOOLS: Tool[] = [
   {
     name: 'dreammate_inspect',
     description:
-      '按需查看指定服务的方法契约、详细描述与入参 JSON Schema（两阶段发现第 2 步）。在准备调用具体工具前使用。',
+      '按需查看指定服务的方法契约、详细描述与入参 JSON Schema，或查看其附带的业务 SOP / 技能指南（两阶段发现第 2 步）。在准备调用具体工具前使用。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -96,7 +130,11 @@ export const MCP_TOOLS: Tool[] = [
         },
         capability: {
           type: 'string',
-          description: '可选：指定要查询的具体某项能力或方法名',
+          description: '可选：指定要查询的具体某项能力或方法名（查看参数契约与入参 JSON Schema）',
+        },
+        skill: {
+          type: 'string',
+          description: '可选：指定要查看的配套业务 SOP 或技能指南名称（查看操作规范、多步骤指导书）',
         },
       },
       required: ['service_id'],
@@ -137,7 +175,7 @@ export function createMcpServer(options: McpOptions = {}): Server {
   const server = new Server(
     {
       name: 'dreammate-mcp',
-      version: '0.5.0',
+      version: '0.5.1',
     },
     {
       capabilities: {
@@ -291,28 +329,34 @@ export function createMcpServer(options: McpOptions = {}): Server {
         }
         if (keyword) {
           services = services.filter((s) => {
+            const skillsMap = extractSkillsMap(s);
             const matchId = s.id.toLowerCase().includes(keyword);
             const matchName = s.name ? s.name.toLowerCase().includes(keyword) : false;
             const matchKind = s.kind ? s.kind.toLowerCase().includes(keyword) : false;
-            const matchCaps = s.capabilities.some((c) => c.toLowerCase().includes(keyword));
+            const matchCaps = (s.capabilities ?? []).some((c) => c.toLowerCase().includes(keyword));
             const matchMethods = s.methods
               ? Object.keys(s.methods).some((m) => m.toLowerCase().includes(keyword))
               : false;
-            return matchId || matchName || matchKind || matchCaps || matchMethods;
+            const matchSkills = Object.keys(skillsMap).some((k) => k.toLowerCase().includes(keyword));
+            return matchId || matchName || matchKind || matchCaps || matchMethods || matchSkills;
           });
         }
 
-        const summary = services.map((s) => ({
-          node: s.node,
-          service_id: s.id,
-          name: s.name ?? s.id,
-          kind: s.kind ?? 'generic',
-          capabilities: s.capabilities,
-          methods: s.methods ? Object.keys(s.methods) : [],
-          liveness: s.liveness,
-          enabled: s.metadata?.enabled !== false,
-          reachability: s.reachability ?? 'network',
-        }));
+        const summary = services.map((s) => {
+          const skillsMap = extractSkillsMap(s);
+          return {
+            node: s.node,
+            service_id: s.id,
+            name: s.name ?? s.id,
+            kind: s.kind ?? 'generic',
+            capabilities: s.capabilities ?? [],
+            methods: s.methods ? Object.keys(s.methods) : [],
+            skills: Object.keys(skillsMap),
+            liveness: s.liveness,
+            enabled: s.metadata?.enabled !== false,
+            reachability: s.reachability ?? 'network',
+          };
+        });
 
         return {
           content: [
@@ -336,6 +380,7 @@ export function createMcpServer(options: McpOptions = {}): Server {
         const node = args.node as string | undefined;
         const serviceId = args.service_id as string;
         const capability = args.capability as string | undefined;
+        const skill = args.skill as string | undefined;
 
         if (!serviceId) {
           return {
@@ -369,6 +414,33 @@ export function createMcpServer(options: McpOptions = {}): Server {
         }
 
         const service = (await res.json()) as RegisteredService;
+        const skillsMap = extractSkillsMap(service);
+
+        if (skill) {
+          const skillDef = skillsMap[skill];
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify(
+                  {
+                    node: node || 'local',
+                    service_id: service.id,
+                    name: service.name,
+                    skill,
+                    defined: Boolean(skillDef),
+                    details: skillDef ?? {
+                      message: `在服务 ${service.id} 中未找到名为 "${skill}" 的技能。可用技能: ${Object.keys(skillsMap).join(', ') || '无'}`,
+                    },
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        }
+
         if (capability) {
           const methodDef = service.methods?.[capability];
           return {
@@ -404,8 +476,9 @@ export function createMcpServer(options: McpOptions = {}): Server {
                   service_id: service.id,
                   name: service.name,
                   kind: service.kind,
-                  capabilities: service.capabilities,
+                  capabilities: service.capabilities ?? [],
                   methods: service.methods ?? {},
+                  skills: Object.keys(skillsMap),
                   reachability: service.reachability,
                   liveness: service.liveness,
                   enabled: service.metadata?.enabled !== false,

@@ -76,12 +76,12 @@ export async function rediscover(
 
       let count = 0;
       for (const service of manifest.services) {
-        if (!service.id || !Array.isArray(service.capabilities)) continue;
+        if (!service.id || (service.capabilities !== undefined && !Array.isArray(service.capabilities))) continue;
         registry.register({
           id: service.id,
           ...(service.name ? { name: service.name } : {}),
           ...(service.kind ? { kind: service.kind } : {}),
-          capabilities: service.capabilities,
+          ...(service.capabilities ? { capabilities: service.capabilities } : {}),
           ...(service.resources ? { resources: service.resources } : {}),
           port,
           reachability: outward ? 'network' : 'localhost',

@@ -15,12 +15,20 @@ export interface MethodDescriptor {
   returns?: Record<string, unknown>;
 }
 
+/** 技能描述定义。 */
+export interface SkillDescriptor {
+  name: string;
+  description?: string;
+  sop?: string;
+  metadata?: Record<string, unknown>;
+}
+
 /** 服务报备时提交的内容。 */
 export interface Registration {
   id: string;
   name?: string;
   kind?: Service['kind'];
-  capabilities: string[];
+  capabilities?: string[];
   port: number;
   /** 省略按 `network` 理解——大多数服务是对外的，只监听回环的那个才特殊。 */
   reachability?: Reachability;
@@ -29,6 +37,8 @@ export interface Registration {
   resources?: ResourceDescriptor[];
   /** 服务自声明的方法契约。 */
   methods?: Record<string, MethodDescriptor>;
+  /** 服务配套声明的业务技能/SOP。 */
+  skills?: Record<string, SkillDescriptor> | SkillDescriptor[];
   metadata?: Record<string, unknown>;
 }
 
@@ -123,7 +133,7 @@ export class ServiceRegistry {
       id: s.id,
       ...(s.name ? { name: s.name } : {}),
       ...(s.kind ? { kind: s.kind } : {}),
-      capabilities: s.capabilities,
+      ...(s.capabilities ? { capabilities: s.capabilities } : {}),
       ...(s.resources ? { resources: s.resources } : {}),
       access:
         s.reachability === 'localhost'
@@ -143,6 +153,7 @@ export class ServiceRegistry {
         liveness: s.liveness,
         ...(s.lastProbedAt ? { last_probed_at: s.lastProbedAt } : {}),
         ...(s.methods ? { methods: s.methods } : {}),
+        ...(s.skills ? { skills: s.skills } : {}),
       },
     }));
   }

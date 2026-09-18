@@ -102,6 +102,14 @@ test('报备内容不合法就拒绝', async () => {
     assert.equal(await bad({ id: 'x', capabilities: [], port: 99999 }), 400, '端口越界');
     assert.equal(await bad({ id: 'x', port: 1, capabilities: 'nope' }), 400, 'capabilities 不是数组');
     assert.equal(await bad({ id: 'x', port: 1, capabilities: [], reachability: 'maybe' }), 400, '可达性取值非法');
+
+    // 允许省略 capabilities
+    const okNoCaps = (await fetch(`${base}/services`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: 'no-caps-service', port: 1234 }),
+    })).status;
+    assert.equal(okNoCaps, 201, '省略 capabilities 应该成功');
   });
 });
 

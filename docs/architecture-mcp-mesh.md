@@ -84,7 +84,7 @@
 
 ## 3. 服务自声明自治协议（Self-Declaration）
 
-业务工具完全无需理解 MCP 协议，仅需向本机 `dreammate-node:36908`（受信任回环链路）进行自声明报备：
+业务工具完全无需理解 MCP 协议，仅需向本机 `dreammate-node:36908`（基于 MVP 受信任主机假设，详见 [安全架构规范](./security-architecture.md)）进行自声明报备：
 
 ```ts
 import { reportAndHoldRegistration } from '@1agents/dreammate-node/client';
@@ -126,14 +126,16 @@ await reportAndHoldRegistration({
 ## 4. 实施阶段规划
 
 ### 阶段 1（当前 MVP 核心路线）
-- [ ] **扩展注册表协议**：在 `Registration` 结构中支持 `methods`（包含入参定义）。
-- [ ] **实现 MCP 网关子命令**：`dreammate-node mcp`，提供 `dreammate_list_capabilities`、`dreammate_inspect`、`dreammate_invoke` 三个元工具。
-- [ ] **服务开关与过滤**：支持 `metadata.enabled` 过滤与关键词列表匹配。
+- [x] **扩展注册表协议**：在 `Registration` 结构中支持 `methods`（包含入参定义）。
+- [x] **实现 MCP 网关子命令**：`dreammate-node mcp`，提供 `dreammate_list_capabilities`、`dreammate_inspect`、`dreammate_invoke` 三个元工具。
+- [x] **服务开关与过滤**：支持 `metadata.enabled` 过滤与关键词列表匹配。
 
-### 阶段 2（零信任能力凭证与跨节点调用 - 见 GitHub Issue）
-- [ ] **报备换凭证（Ephemeral Capability Token）**：
-  - 服务启动时生成一次性随机 Token，报备给 `dreammate-node`，保存在节点内存中。
-  - 服务业务端口强制校验 `Authorization: Bearer <token>`，杜绝局域网内非授权直探端口绕过。
-  - `dreammate-node` 代理调用时自动注入该 Token。
+### 阶段 2（零信任双向通信与能力租约 - 详见 [安全架构规范](./security-architecture.md)）
+- [ ] **UDS 进程鉴真与 Node 权威签发 Capability Lease**：
+  - 通道升级至 Unix Domain Socket，以 `0600` 文件权限阻断本地其他用户进程；
+  - Node 通过内核元数据（`SO_PEERCRED` / `LOCAL_PEERCRED`）核验服务进程身份（PID、路径指纹）；
+  - 权威签发反转：Node 验证身份后向 Service 签发短期 `Capability Lease`（包含 `service_id`、`allowed_methods`、`audience`、`expires_at`）；
+  - 代理调用时双向验签，支持 TTL 自动过期、静默轮换与瞬时吊销（Revocation）。
 - [ ] **跨节点 Tailnet 凭证分发与权限委托**：
-  - Node A 调用 Node B 时，通过 Tailscale 节点互信验证，Node B 代为注入本地 Secret 调用底层服务。
+  - Node A 调用 Node B 时，通过 Tailscale WireGuard 权威节点互信验证；
+  - Node B 作为本地信任根，代表远程调用方在物理机本地派生并注入局部 Capability Lease 调用下游服务。

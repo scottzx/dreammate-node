@@ -198,6 +198,65 @@ test('MCP: dreammate_inspect 能够按需返回详细方法契约与参数 Schem
   });
 });
 
+test('MCP: dreammate_inspect 能够按需返回业务 SOP / 技能指南并支持未声明 capabilities 的服务', async () => {
+  const registry = new ServiceRegistry();
+  // 报备一个 capabilities 省略，但带有 skills 的服务
+  registry.register({
+    id: 'session-reader',
+    name: '会话管理服务',
+    port: 7788,
+    skills: {
+      '1session-remote-guide': {
+        name: '1session-remote-guide',
+        description: '远程会话分析与增量提取',
+        sop: '# 远程会话分析 SOP\n1. 调用 dreammate_invoke 查会话',
+      },
+    },
+  });
+
+  await withTestAgent(registry, async (agentUrl) => {
+    await withMcpClient(agentUrl, async (client) => {
+      // 1. 列表能看到 skills 并且 capabilities 为空数组
+      const listRes = await client.callTool({
+        name: 'dreammate_list_capabilities',
+        arguments: { keyword: 'session' },
+      });
+      const listData = JSON.parse((listRes.content as [{ text: string }])[0].text) as {
+        services: { service_id: string; capabilities: string[]; skills: string[] }[];
+      };
+      assert.equal(listData.services.length, 1);
+      assert.deepEqual(listData.services[0]!.capabilities, []);
+      assert.deepEqual(listData.services[0]!.skills, ['1session-remote-guide']);
+
+      // 2. 检查特定 skill
+      const skillRes = await client.callTool({
+        name: 'dreammate_inspect',
+        arguments: { service_id: 'session-reader', skill: '1session-remote-guide' },
+      });
+      const skillData = JSON.parse((skillRes.content as [{ text: string }])[0].text) as {
+        skill: string;
+        defined: boolean;
+        details: { sop: string };
+      };
+      assert.equal(skillData.skill, '1session-remote-guide');
+      assert.equal(skillData.defined, true);
+      assert.match(skillData.details.sop, /远程会话分析 SOP/);
+
+      // 3. 检查不存在的 skill
+      const missingSkillRes = await client.callTool({
+        name: 'dreammate_inspect',
+        arguments: { service_id: 'session-reader', skill: 'non-existent-skill' },
+      });
+      const missingData = JSON.parse((missingSkillRes.content as [{ text: string }])[0].text) as {
+        defined: boolean;
+        details: { message: string };
+      };
+      assert.equal(missingData.defined, false);
+      assert.match(missingData.details.message, /未找到名为 "non-existent-skill"/);
+    });
+  });
+});
+
 test('MCP: dreammate_invoke 能够通过通用路由触发下游业务服务', async () => {
   let receivedAction: string | undefined;
   let receivedParams: Record<string, unknown> | undefined;

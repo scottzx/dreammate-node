@@ -75,13 +75,20 @@ function validate(body: unknown): Registration {
   if (typeof entry.port !== 'number' || entry.port < 1 || entry.port > 65535) {
     throw new Error('port must be 1-65535');
   }
-  if (!Array.isArray(entry.capabilities)) throw new Error('capabilities must be an array');
+  if (entry.capabilities !== undefined && !Array.isArray(entry.capabilities)) {
+    throw new Error('capabilities must be an array');
+  }
   if (entry.reachability && entry.reachability !== 'localhost' && entry.reachability !== 'network') {
     throw new Error('reachability must be "localhost" or "network"');
   }
   if (entry.methods !== undefined) {
     if (typeof entry.methods !== 'object' || entry.methods === null || Array.isArray(entry.methods)) {
       throw new Error('methods must be an object');
+    }
+  }
+  if (entry.skills !== undefined) {
+    if (typeof entry.skills !== 'object' || entry.skills === null) {
+      throw new Error('skills must be an object or array');
     }
   }
   return entry as Registration;
@@ -189,7 +196,10 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
         if (req.method === 'POST' && invokeCap) {
           const capability = decodeURIComponent(invokeCap[1]!);
           const target = registry.list().find(
-            (s) => s.capabilities.includes(capability) && s.metadata?.enabled !== false && s.liveness !== 'down',
+            (s) =>
+              Boolean(s.capabilities?.includes(capability)) &&
+              s.metadata?.enabled !== false &&
+              s.liveness !== 'down',
           );
           if (!target) {
             return json(res, 404, { error: `no active service found for capability: ${capability}` });
