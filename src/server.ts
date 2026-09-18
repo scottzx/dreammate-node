@@ -185,10 +185,19 @@ async function executeViaCli(
         }
       }
 
+      const trimmed = stdout.trim();
       try {
-        const parsed = JSON.parse(stdout.trim());
-        resolve({ status: 200, data: parsed });
+        const parsed = JSON.parse(trimmed);
+        return resolve({ status: 200, data: parsed });
       } catch {
+        // 容错兜底：尝试从输出中提取完整的 JSON 对象或数组
+        const match = trimmed.match(/(\{[\s\S]*\}|\[[\s\S]*\])/);
+        if (match) {
+          try {
+            const parsed = JSON.parse(match[1]!);
+            return resolve({ status: 200, data: parsed });
+          } catch {}
+        }
         resolve({
           status: 502,
           data: {
