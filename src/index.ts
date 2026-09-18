@@ -32,4 +32,12 @@ export {
   MCP_TOOLS,
   type McpOptions,
 } from './mcp.js';
+export {
+  loadSkillsFromDir,
+  parseSkillMarkdown,
+  archiveSkill,
+  installSkillPackage,
+  listSkillArchive,
+  type SkillDescriptorWithSource,
+} from './skills.js';
 

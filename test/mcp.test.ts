@@ -44,14 +44,14 @@ async function withMcpClient<T>(
   }
 }
 
-test('MCP_TOOLS 声明了固化的 4 个元工具', () => {
+test('MCP_TOOLS 声明了固化的元工具', () => {
   const names = MCP_TOOLS.map((t) => t.name);
-  assert.deepEqual(names, [
-    'dreammate_list_nodes',
-    'dreammate_list_capabilities',
-    'dreammate_inspect',
-    'dreammate_invoke',
-  ]);
+  assert.ok(names.includes('dreammate_list_nodes'));
+  assert.ok(names.includes('dreammate_list_services'));
+  assert.ok(names.includes('dreammate_list_capabilities'));
+  assert.ok(names.includes('dreammate_inspect'));
+  assert.ok(names.includes('dreammate_invoke'));
+  assert.ok(names.includes('dreammate_download_skill'));
 });
 
 test('MCP: dreammate_list_nodes 能够发现网络中的设备节点', async () => {
@@ -77,7 +77,7 @@ test('MCP: dreammate_list_nodes 能够发现网络中的设备节点', async () 
   });
 });
 
-test('MCP: dreammate_list_capabilities 能够检索服务并进行关键词过滤', async () => {
+test('MCP: dreammate_list_capabilities 与 dreammate_list_services 能够检索服务并过滤', async () => {
   const registry = new ServiceRegistry();
   registry.register({
     id: 'podcast-tool',
@@ -85,7 +85,7 @@ test('MCP: dreammate_list_capabilities 能够检索服务并进行关键词过�
     capabilities: ['podcast.list', 'podcast.transcribe'],
     port: 7780,
     methods: {
-      'podcast.transcribe': { description: '转写音频' },
+      'podcast.transcribe': { description: '转写音频', parameters: { type: 'object' } },
     },
   });
   registry.register({
@@ -104,9 +104,9 @@ test('MCP: dreammate_list_capabilities 能够检索服务并进行关键词过�
 
   await withTestAgent(registry, async (agentUrl) => {
     await withMcpClient(agentUrl, async (client) => {
-      // 1. 无过滤：默认过滤掉 disabled
+      // 1. 无过滤：使用 dreammate_list_services 检索
       const resAll = await client.callTool({
-        name: 'dreammate_list_capabilities',
+        name: 'dreammate_list_services',
         arguments: {},
       });
       const dataAll = JSON.parse((resAll.content as [{ text: string }])[0].text) as {
@@ -133,7 +133,7 @@ test('MCP: dreammate_list_capabilities 能够检索服务并进行关键词过�
 
       // 3. 包含已禁用的服务
       const resDisabled = await client.callTool({
-        name: 'dreammate_list_capabilities',
+        name: 'dreammate_list_services',
         arguments: { include_disabled: true },
       });
       const dataDisabled = JSON.parse((resDisabled.content as [{ text: string }])[0].text) as {
@@ -155,7 +155,11 @@ test('MCP: dreammate_inspect 能够按需返回详细方法契约与参数 Schem
       'podcast.transcribe': {
         description: '将指定音频离线转写为 SRT 字幕',
         parameters: {
-          file_path: { type: 'string', description: '本地文件路径', required: true },
+          type: 'object',
+          properties: {
+            file_path: { type: 'string', description: '本地文件路径' },
+          },
+          required: ['file_path'],
         },
       },
     },
@@ -175,16 +179,16 @@ test('MCP: dreammate_inspect 能够按需返回详细方法契约与参数 Schem
       assert.equal(fullData.service_id, 'tingqi-service');
       assert.ok(fullData.methods['podcast.transcribe']);
 
-      // 2. 检查单项 capability
+      // 2. 检查单项 method
       const singleRes = await client.callTool({
         name: 'dreammate_inspect',
-        arguments: { service_id: 'tingqi-service', capability: 'podcast.transcribe' },
+        arguments: { service_id: 'tingqi-service', method: 'podcast.transcribe' },
       });
       const singleData = JSON.parse((singleRes.content as [{ text: string }])[0].text) as {
-        capability: string;
+        method: string;
         details: { description: string };
       };
-      assert.equal(singleData.capability, 'podcast.transcribe');
+      assert.equal(singleData.method, 'podcast.transcribe');
       assert.equal(singleData.details.description, '将指定音频离线转写为 SRT 字幕');
 
       // 3. 查询不存在的服务
@@ -326,5 +330,69 @@ test('MCP: 在 node-agent 未启动时返回友好引导提示', async () => {
     });
     assert.equal(res.isError, true);
     assert.match((res.content as [{ text: string }])[0].text, /无法连接到/);
+  });
+});
+
+test('MCP: dreammate_download_skill 能够下载并安装/预览远程技能包', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const os = await import('node:os');
+
+  const registry = new ServiceRegistry();
+  registry.register({
+    id: 'writer-service',
+    name: '写作服务',
+    port: 7799,
+    skills: {
+      'xhs-card': {
+        name: 'xhs-card',
+        description: '小红书卡片排版技能',
+        sop: '# XHS Card SOP\nGenerate cards cleanly.',
+      },
+    },
+  });
+
+  await withTestAgent(registry, async (agentUrl) => {
+    await withMcpClient(agentUrl, async (client) => {
+      // 1. 内存预览模式 (install: false)
+      const previewRes = await client.callTool({
+        name: 'dreammate_download_skill',
+        arguments: {
+          service_id: 'writer-service',
+          skill: 'xhs-card',
+          install: false,
+        },
+      });
+      assert.equal(previewRes.isError, undefined);
+      const previewData = JSON.parse((previewRes.content as [{ text: string }])[0].text) as {
+        status: string;
+        files: string[];
+      };
+      assert.equal(previewData.status, 'preview');
+      assert.ok(previewData.files.some((f) => f.includes('SKILL.md')));
+
+      // 2. 安装落盘模式 (install: true)
+      const tmpDest = fs.mkdtempSync(path.join(os.tmpdir(), 'dm-mcp-skills-'));
+      const installRes = await client.callTool({
+        name: 'dreammate_download_skill',
+        arguments: {
+          service_id: 'writer-service',
+          skill: 'xhs-card',
+          target_dir: tmpDest,
+          install: true,
+        },
+      });
+      assert.equal(installRes.isError, undefined);
+      const installData = JSON.parse((installRes.content as [{ text: string }])[0].text) as {
+        status: string;
+        installed_path: string;
+      };
+      assert.equal(installData.status, 'installed');
+      assert.ok(fs.existsSync(path.join(installData.installed_path, 'SKILL.md')));
+      const content = fs.readFileSync(path.join(installData.installed_path, 'SKILL.md'), 'utf8');
+      assert.match(content, /Generate cards cleanly/);
+
+      fs.rmSync(tmpDest, { recursive: true, force: true });
+    });
   });
 });

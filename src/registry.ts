@@ -5,29 +5,23 @@
  * 探它们的 health 端点。**Node 在线不代表 Service 在线**——tailnet 只知道机器
  * 开着，进程被 kill 了它照样报在线，所以这一层必须自己探。
  */
-import type { Reachability, ResourceDescriptor, Service } from '@1agents/dreammate-network';
+import type {
+  Reachability,
+  ResourceDescriptor,
+  Service,
+  MethodDescriptor,
+  SkillDescriptor,
+} from '@1agents/dreammate-network';
+import { loadSkillsFromDir, type SkillDescriptorWithSource } from './skills.js';
 
-/** 方法与参数契约描述。 */
-export interface MethodDescriptor {
-  description?: string;
-  /** 参数定义，可为简易字段说明或 JSON Schema 对象。 */
-  parameters?: Record<string, unknown>;
-  returns?: Record<string, unknown>;
-}
-
-/** 技能描述定义。 */
-export interface SkillDescriptor {
-  name: string;
-  description?: string;
-  sop?: string;
-  metadata?: Record<string, unknown>;
-}
+export type { MethodDescriptor, SkillDescriptor, SkillDescriptorWithSource };
 
 /** 服务报备时提交的内容。 */
 export interface Registration {
   id: string;
   name?: string;
   kind?: Service['kind'];
+  /** @deprecated 历史过渡字段，请使用 methods 与 skills */
   capabilities?: string[];
   port: number;
   /** 省略按 `network` 理解——大多数服务是对外的，只监听回环的那个才特殊。 */
@@ -35,16 +29,17 @@ export interface Registration {
   /** 存活探测路径，默认 `/health`。 */
   health?: string;
   resources?: ResourceDescriptor[];
-  /** 服务自声明的方法契约。 */
+  /** 服务自声明的方法契约集合。 */
   methods?: Record<string, MethodDescriptor>;
-  /** 服务配套声明的业务技能/SOP。 */
-  skills?: Record<string, SkillDescriptor> | SkillDescriptor[];
+  /** 服务配套声明的业务技能/SOP，支持对象、数组或本地技能目录路径。 */
+  skills?: Record<string, SkillDescriptorWithSource> | SkillDescriptorWithSource[] | string;
   metadata?: Record<string, unknown>;
 }
 
 export type Liveness = 'up' | 'down' | 'unknown';
 
-export interface RegisteredService extends Registration {
+export interface RegisteredService extends Omit<Registration, 'skills'> {
+  skills?: Record<string, SkillDescriptorWithSource> | SkillDescriptorWithSource[];
   registeredAt: string;
   /** `unknown` 表示还没探过，与"探过且不通"是两回事。 */
   liveness: Liveness;
@@ -94,8 +89,13 @@ export class ServiceRegistry {
   /** 重复报备同一个 id 就是更新——服务重启后换了端口应该能盖掉旧的。 */
   register(entry: Registration): RegisteredService {
     const existing = this.#services.get(entry.id);
+    let skills = entry.skills;
+    if (typeof skills === 'string') {
+      skills = loadSkillsFromDir(skills);
+    }
     const record: RegisteredService = {
       ...entry,
+      skills,
       reachability: entry.reachability ?? 'network',
       health: entry.health ?? '/health',
       registeredAt: existing?.registeredAt ?? new Date().toISOString(),
@@ -133,6 +133,24 @@ export class ServiceRegistry {
       id: s.id,
       ...(s.name ? { name: s.name } : {}),
       ...(s.kind ? { kind: s.kind } : {}),
+      ...(s.methods ? { methods: s.methods } : {}),
+      ...(s.skills
+        ? {
+            skills: Object.fromEntries(
+              (Array.isArray(s.skills)
+                ? s.skills
+                : Object.values(s.skills)
+              ).map((item) => [
+                item.name,
+                {
+                  name: item.name,
+                  ...(item.description ? { description: item.description } : {}),
+                  ...(item.sop ? { sop: item.sop } : {}),
+                },
+              ]),
+            ) as Record<string, SkillDescriptor>,
+          }
+        : {}),
       ...(s.capabilities ? { capabilities: s.capabilities } : {}),
       ...(s.resources ? { resources: s.resources } : {}),
       access:
@@ -152,8 +170,6 @@ export class ServiceRegistry {
         ...s.metadata,
         liveness: s.liveness,
         ...(s.lastProbedAt ? { last_probed_at: s.lastProbedAt } : {}),
-        ...(s.methods ? { methods: s.methods } : {}),
-        ...(s.skills ? { skills: s.skills } : {}),
       },
     }));
   }

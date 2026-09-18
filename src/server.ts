@@ -6,9 +6,10 @@
  */
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { DEFAULT_PORTS, PROTOCOL_VERSION, type NodeManifest } from '@1agents/dreammate-network';
+import { DEFAULT_PORTS, PROTOCOL_VERSION, type NodeManifest, type MethodDescriptor } from '@1agents/dreammate-network';
 import { nodeIdentity } from './identity.js';
 import { ServiceRegistry, type Registration } from './registry.js';
+import { archiveSkill, type SkillDescriptorWithSource } from './skills.js';
 
 /** 固定端口。改它等于让全网的探测方同时失明。 */
 export const NODE_AGENT_PORT: number = DEFAULT_PORTS['node-agent'];
@@ -85,10 +86,22 @@ function validate(body: unknown): Registration {
     if (typeof entry.methods !== 'object' || entry.methods === null || Array.isArray(entry.methods)) {
       throw new Error('methods must be an object');
     }
+    for (const [mName, mDesc] of Object.entries(entry.methods)) {
+      if (!mDesc || typeof mDesc !== 'object') {
+        throw new Error(`method "${mName}" must be an object`);
+      }
+      const desc = mDesc as MethodDescriptor;
+      if (typeof desc.description !== 'string' || !desc.description.trim()) {
+        throw new Error(`method "${mName}" requires a non-empty description`);
+      }
+      if (!desc.parameters || typeof desc.parameters !== 'object' || desc.parameters.type !== 'object') {
+        throw new Error(`method "${mName}" parameters must be an object schema with type: "object"`);
+      }
+    }
   }
   if (entry.skills !== undefined) {
-    if (typeof entry.skills !== 'object' || entry.skills === null) {
-      throw new Error('skills must be an object or array');
+    if (typeof entry.skills !== 'string' && (typeof entry.skills !== 'object' || entry.skills === null)) {
+      throw new Error('skills must be an object, array or directory path');
     }
   }
   return entry as Registration;
@@ -135,6 +148,38 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
           const { listNetworkNodes } = await import('./identity.js');
           const nodes = await listNetworkNodes();
           return json(res, 200, { node: identity.name, nodes });
+        }
+
+        const getSkillArchive = /^\/services\/([^/]+)\/skills\/([^/]+)\/archive$/.exec(pathname);
+        if (req.method === 'GET' && getSkillArchive) {
+          const serviceId = decodeURIComponent(getSkillArchive[1]!);
+          const skillName = decodeURIComponent(getSkillArchive[2]!);
+          const service = registry.get(serviceId);
+          if (!service) {
+            return json(res, 404, { error: `no such service: ${serviceId}` });
+          }
+          let targetSkill: SkillDescriptorWithSource | undefined;
+          if (service.skills) {
+            if (Array.isArray(service.skills)) {
+              targetSkill = service.skills.find((s) => s.name === skillName);
+            } else {
+              targetSkill = service.skills[skillName];
+            }
+          }
+          if (!targetSkill) {
+            return json(res, 404, { error: `no such skill "${skillName}" in service "${serviceId}"` });
+          }
+
+          const { stream, cleanup } = archiveSkill({ skill: targetSkill, skillName });
+          res.writeHead(200, {
+            'content-type': 'application/gzip',
+            'content-disposition': `attachment; filename="${encodeURIComponent(skillName)}.tar.gz"`,
+          });
+          stream.pipe(res);
+          req.on('close', () => {
+            cleanup();
+          });
+          return;
         }
 
         const getSingle = /^\/services\/([^/]+)$/.exec(pathname);
@@ -197,12 +242,12 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
           const capability = decodeURIComponent(invokeCap[1]!);
           const target = registry.list().find(
             (s) =>
-              Boolean(s.capabilities?.includes(capability)) &&
+              (Boolean(s.capabilities?.includes(capability)) || Boolean(s.methods && capability in s.methods)) &&
               s.metadata?.enabled !== false &&
               s.liveness !== 'down',
           );
           if (!target) {
-            return json(res, 404, { error: `no active service found for capability: ${capability}` });
+            return json(res, 404, { error: `no active service found for capability/method: ${capability}` });
           }
           const raw = await readBody(req);
           const payload = raw ? JSON.parse(raw) : {};
@@ -212,7 +257,7 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
             const forwardRes = await fetch(`http://127.0.0.1:${target.port}/invoke`, {
               method: 'POST',
               headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ capability, ...payload }),
+              body: JSON.stringify({ method: capability, capability, ...payload }),
               signal: controller.signal,
             });
             const forwardText = await forwardRes.text();

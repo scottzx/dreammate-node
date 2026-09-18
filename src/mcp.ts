@@ -17,6 +17,7 @@ import {
 import { DEFAULT_PORTS } from '@1agents/dreammate-network';
 import type { RegisteredService } from './registry.js';
 import type { NetworkNode } from './identity.js';
+import { installSkillPackage, listSkillArchive } from './skills.js';
 
 export interface McpOptions {
   agentUrl?: string;
@@ -88,9 +89,9 @@ export const MCP_TOOLS: Tool[] = [
     },
   },
   {
-    name: 'dreammate_list_capabilities',
+    name: 'dreammate_list_services',
     description:
-      '轻量检索指定节点（或本机、或全网 "all"）中已报备的服务与能力概要（两阶段发现第 1 步）。不包含庞大的入参 Schema，避免上下文溢出。支持关键词模糊匹配。',
+      '轻量检索指定节点（或本机、或全网 "all"）中已报备的服务列表与概要（两阶段发现第 1 步）。不包含庞大的入参 Schema，避免上下文溢出。支持关键词模糊匹配。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -100,7 +101,7 @@ export const MCP_TOOLS: Tool[] = [
         },
         keyword: {
           type: 'string',
-          description: '可选关键词（模糊匹配服务 ID、名称、分类或能力标签）',
+          description: '可选关键词（模糊匹配服务 ID、名称、分类、方法契约或技能名称）',
         },
         kind: {
           type: 'string',
@@ -109,6 +110,32 @@ export const MCP_TOOLS: Tool[] = [
         include_disabled: {
           type: 'boolean',
           description: '是否包含已被软禁用的服务（默认 false）',
+        },
+      },
+    },
+  },
+  {
+    name: 'dreammate_list_capabilities',
+    description:
+      '(向后兼容别名，推荐使用 dreammate_list_services) 轻量检索指定节点中已报备的服务与能力概要。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        node: {
+          type: 'string',
+          description: '可选：指定设备节点名称或 IP（省略时默认本机）',
+        },
+        keyword: {
+          type: 'string',
+          description: '可选关键词',
+        },
+        kind: {
+          type: 'string',
+          description: '可选服务类型过滤',
+        },
+        include_disabled: {
+          type: 'boolean',
+          description: '是否包含已禁用服务',
         },
       },
     },
@@ -128,13 +155,17 @@ export const MCP_TOOLS: Tool[] = [
           type: 'string',
           description: '要查询的目标服务 ID',
         },
-        capability: {
+        method: {
           type: 'string',
-          description: '可选：指定要查询的具体某项能力或方法名（查看参数契约与入参 JSON Schema）',
+          description: '可选：指定要查询的具体某项方法契约与入参 JSON Schema（例如 "asr.transcribe"）',
         },
         skill: {
           type: 'string',
           description: '可选：指定要查看的配套业务 SOP 或技能指南名称（查看操作规范、多步骤指导书）',
+        },
+        capability: {
+          type: 'string',
+          description: '可选（向后兼容别名，同 method）：指定要查询的方法名',
         },
       },
       required: ['service_id'],
@@ -143,7 +174,7 @@ export const MCP_TOOLS: Tool[] = [
   {
     name: 'dreammate_invoke',
     description:
-      '通用分布式执行器：通过 DreamMate 网关透明路由并执行指定节点与服务的方法或能力。',
+      '通用分布式执行器：通过 DreamMate 网关透明路由并执行指定节点与服务的方法。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -155,16 +186,51 @@ export const MCP_TOOLS: Tool[] = [
           type: 'string',
           description: '目标服务 ID',
         },
+        method: {
+          type: 'string',
+          description: '要调用的方法名（例如 "asr.transcribe"）',
+        },
         capability: {
           type: 'string',
-          description: '要调用的能力或方法名',
+          description: '可选（向后兼容别名，同 method）：要调用的方法名',
         },
         params: {
           type: 'object',
           description: '传递给该方法的参数键值对对象',
         },
       },
-      required: ['service_id', 'capability'],
+      required: ['service_id'],
+    },
+  },
+  {
+    name: 'dreammate_download_skill',
+    description:
+      '分布式 SkillsHub：从目标节点下载指定服务的配套完整技能包（包含 SKILL.md、脚本与静态资源），可直接安装到本地技能目录供 Agent 使用，或以内存预览模式查看。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        node: {
+          type: 'string',
+          description: '可选：目标服务所在的设备节点名称或 IP（省略时为本机）',
+        },
+        service_id: {
+          type: 'string',
+          description: '目标服务 ID（例如 "transcribe"）',
+        },
+        skill: {
+          type: 'string',
+          description: '要下载的技能名称（例如 "transcribe"）',
+        },
+        target_dir: {
+          type: 'string',
+          description: '安装目标根目录（默认 "~/.gemini/config/skills"）。若 install 为 true，则解压到该目录下以技能名命名的子目录。',
+        },
+        install: {
+          type: 'boolean',
+          description: '是否落盘解压安装到 target_dir（默认 true；若为 false 则仅在内存中解析并返回技能文件列表与 SOP 内容）。',
+        },
+      },
+      required: ['service_id', 'skill'],
     },
   },
 ];
@@ -175,7 +241,7 @@ export function createMcpServer(options: McpOptions = {}): Server {
   const server = new Server(
     {
       name: 'dreammate-mcp',
-      version: '0.5.1',
+      version: '0.6.0',
     },
     {
       capabilities: {
@@ -251,7 +317,7 @@ export function createMcpServer(options: McpOptions = {}): Server {
         };
       }
 
-      if (name === 'dreammate_list_capabilities') {
+      if (name === 'dreammate_list_services' || name === 'dreammate_list_capabilities') {
         const node = args.node as string | undefined;
         const keyword = (args.keyword as string | undefined)?.toLowerCase().trim();
         const kind = args.kind as string | undefined;
@@ -349,9 +415,9 @@ export function createMcpServer(options: McpOptions = {}): Server {
             service_id: s.id,
             name: s.name ?? s.id,
             kind: s.kind ?? 'generic',
-            capabilities: s.capabilities ?? [],
             methods: s.methods ? Object.keys(s.methods) : [],
             skills: Object.keys(skillsMap),
+            capabilities: s.capabilities ?? [],
             liveness: s.liveness,
             enabled: s.metadata?.enabled !== false,
             reachability: s.reachability ?? 'network',
@@ -379,7 +445,7 @@ export function createMcpServer(options: McpOptions = {}): Server {
       if (name === 'dreammate_inspect') {
         const node = args.node as string | undefined;
         const serviceId = args.service_id as string;
-        const capability = args.capability as string | undefined;
+        const method = (args.method as string | undefined) ?? (args.capability as string | undefined);
         const skill = args.skill as string | undefined;
 
         if (!serviceId) {
@@ -441,8 +507,8 @@ export function createMcpServer(options: McpOptions = {}): Server {
           };
         }
 
-        if (capability) {
-          const methodDef = service.methods?.[capability];
+        if (method) {
+          const methodDef = service.methods?.[method];
           return {
             content: [
               {
@@ -452,10 +518,10 @@ export function createMcpServer(options: McpOptions = {}): Server {
                     node: node || 'local',
                     service_id: service.id,
                     name: service.name,
-                    capability,
+                    method,
                     defined: Boolean(methodDef),
                     details: methodDef ?? {
-                      description: `能力 ${capability} 尚未声明详细入参 Schema，可直接使用 params 对象传参`,
+                      description: `方法 ${method} 尚未在 methods 契约中声明入参 Schema，可直接使用 params 对象传参`,
                     },
                   },
                   null,
@@ -476,9 +542,9 @@ export function createMcpServer(options: McpOptions = {}): Server {
                   service_id: service.id,
                   name: service.name,
                   kind: service.kind,
-                  capabilities: service.capabilities ?? [],
                   methods: service.methods ?? {},
                   skills: Object.keys(skillsMap),
+                  capabilities: service.capabilities ?? [],
                   reachability: service.reachability,
                   liveness: service.liveness,
                   enabled: service.metadata?.enabled !== false,
@@ -494,12 +560,12 @@ export function createMcpServer(options: McpOptions = {}): Server {
       if (name === 'dreammate_invoke') {
         const node = args.node as string | undefined;
         const serviceId = args.service_id as string;
-        const capability = args.capability as string;
+        const method = (args.method as string | undefined) ?? (args.capability as string | undefined);
         const params = (args.params as Record<string, unknown> | undefined) ?? {};
 
-        if (!serviceId || !capability) {
+        if (!serviceId || !method) {
           return {
-            content: [{ type: 'text', text: '缺少必填参数: service_id 和 capability' }],
+            content: [{ type: 'text', text: '缺少必填参数: service_id 和 method (或 capability)' }],
             isError: true,
           };
         }
@@ -510,7 +576,7 @@ export function createMcpServer(options: McpOptions = {}): Server {
           res = await fetch(`${targetUrl}/services/${encodeURIComponent(serviceId)}/invoke`, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ capability, params }),
+            body: JSON.stringify({ method, capability: method, params }),
           });
         } catch (err: unknown) {
           return {
@@ -552,6 +618,130 @@ export function createMcpServer(options: McpOptions = {}): Server {
             },
           ],
         };
+      }
+
+      if (name === 'dreammate_download_skill') {
+        const node = args.node as string | undefined;
+        const serviceId = args.service_id as string;
+        const skill = args.skill as string;
+        const targetDir = (args.target_dir as string | undefined) || '~/.gemini/config/skills';
+        const install = args.install !== false;
+
+        if (!serviceId || !skill) {
+          return {
+            content: [{ type: 'text', text: '缺少必填参数: service_id 和 skill' }],
+            isError: true,
+          };
+        }
+
+        const targetUrl = resolveNodeBaseUrl(agentUrl, node);
+        let res: Response;
+        try {
+          res = await fetch(
+            `${targetUrl}/services/${encodeURIComponent(serviceId)}/skills/${encodeURIComponent(skill)}/archive`,
+          );
+        } catch (err: unknown) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `无法从目标节点 (${targetUrl}) 下载技能归档: ${err instanceof Error ? err.message : String(err)}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        if (res.status === 404) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `在节点 (${targetUrl}) 的服务 "${serviceId}" 中未找到技能 "${skill}" 的归档包。`,
+              },
+            ],
+            isError: true,
+          };
+        }
+        if (!res.ok) {
+          return {
+            content: [{ type: 'text', text: `下载技能失败: HTTP ${res.status}` }],
+            isError: true,
+          };
+        }
+
+        const arrayBuffer = await res.arrayBuffer();
+        const buffer = Buffer.from(arrayBuffer);
+
+        if (install) {
+          try {
+            const installedPath = await installSkillPackage(buffer, targetDir, skill);
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify(
+                    {
+                      status: 'installed',
+                      service_id: serviceId,
+                      skill,
+                      target_dir: targetDir,
+                      installed_path: installedPath,
+                      node: node || 'local',
+                      message: `技能 "${skill}" 已成功从节点分发并安装到本地: ${installedPath}。当前 Agent 即可直接激活使用此技能。`,
+                    },
+                    null,
+                    2,
+                  ),
+                },
+              ],
+            };
+          } catch (err: unknown) {
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: `解压并安装技能包失败: ${err instanceof Error ? err.message : String(err)}`,
+                },
+              ],
+              isError: true,
+            };
+          }
+        } else {
+          // 预览模式
+          try {
+            const files = await listSkillArchive(buffer);
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify(
+                    {
+                      status: 'preview',
+                      service_id: serviceId,
+                      skill,
+                      node: node || 'local',
+                      archive_bytes: buffer.byteLength,
+                      files,
+                    },
+                    null,
+                    2,
+                  ),
+                },
+              ],
+            };
+          } catch (err: unknown) {
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: `解析技能归档包清单失败: ${err instanceof Error ? err.message : String(err)}`,
+                },
+              ],
+              isError: true,
+            };
+          }
+        }
       }
 
       return {

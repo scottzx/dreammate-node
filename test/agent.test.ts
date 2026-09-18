@@ -312,11 +312,11 @@ test('携带 methods 报备，能在 /services/:id 与 /manifest 中正确获取
     methods: {
       'podcast.latest': {
         description: '获取最新单集',
-        parameters: { limit: { type: 'number' } },
+        parameters: { type: 'object', properties: { limit: { type: 'number' } } },
       },
       'podcast.transcribe': {
         description: '离线转写音频',
-        parameters: { file_path: { type: 'string', required: true } },
+        parameters: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] },
       },
     },
     metadata: { enabled: true },
@@ -340,12 +340,12 @@ test('携带 methods 报备，能在 /services/:id 与 /manifest 中正确获取
     const notFound = await fetch(`${base}/services/non-existent`);
     assert.equal(notFound.status, 404);
 
-    // /manifest contains methods in metadata
+    // /manifest contains methods at top-level
     const manifest = (await (await fetch(`${base}/manifest`)).json()) as {
-      services: { id: string; metadata?: { methods?: Record<string, unknown> } }[];
+      services: { id: string; methods?: Record<string, unknown> }[];
     };
     const foundInManifest = manifest.services.find((s) => s.id === 'podcast-adapter');
-    assert.ok(foundInManifest?.metadata?.methods?.['podcast.latest']);
+    assert.ok(foundInManifest?.methods?.['podcast.latest']);
   });
 });
 
@@ -361,6 +361,9 @@ test('报备时 methods 如果类型不合法会被拒绝', async () => {
       ).status;
     assert.equal(await bad('not an object'), 400);
     assert.equal(await bad(['array', 'not', 'object']), 400);
+    assert.equal(await bad({ test: { description: '' } }), 400, '缺少非空 description');
+    assert.equal(await bad({ test: { description: 'ok', parameters: 'not an object' } }), 400, 'parameters 必须为 object');
+    assert.equal(await bad({ test: { description: 'ok', parameters: { type: 'string' } } }), 400, 'parameters 必须是 type: object');
   });
 });
 
@@ -489,5 +492,92 @@ test('POST /capabilities/:name/invoke 可根据 capability 自动匹配服务并
   } finally {
     await new Promise<void>((resolve) => downstream.close(() => resolve()));
   }
+});
+
+test('使用本地技能目录报备，自动扫描解析并在 /services/:id 与 /manifest 中正确呈现', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const os = await import('node:os');
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dm-test-skills-'));
+  const transcribeDir = path.join(tmpDir, 'transcribe');
+  fs.mkdirSync(transcribeDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(transcribeDir, 'SKILL.md'),
+    `---
+name: transcribe
+description: 测试转写技能
+---
+# Transcribe Guide
+Run the task step by step.`,
+    'utf8',
+  );
+
+  const registry = new ServiceRegistry();
+  await withAgent(registry, async (base) => {
+    const res = await reportToAgent({
+      id: 'asr-service',
+      port: 7782,
+      skills: tmpDir,
+    }, { baseUrl: base });
+    assert.ok(res.ok);
+
+    const single = (await (await fetch(`${base}/services/asr-service`)).json()) as any;
+    assert.ok(single.skills?.transcribe);
+    assert.equal(single.skills.transcribe.name, 'transcribe');
+    assert.equal(single.skills.transcribe.description, '测试转写技能');
+    assert.match(single.skills.transcribe.sop, /# Transcribe Guide/);
+
+    const manifest = (await (await fetch(`${base}/manifest`)).json()) as any;
+    const found = manifest.services.find((s: any) => s.id === 'asr-service');
+    assert.ok(found.skills?.transcribe);
+    assert.equal(found.skills.transcribe.name, 'transcribe');
+  });
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test('GET /services/:id/skills/:skill/archive 能打包技能并可解压还原', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const os = await import('node:os');
+  const { installSkillPackage, listSkillArchive } = await import('../src/skills.js');
+
+  const tmpSource = fs.mkdtempSync(path.join(os.tmpdir(), 'dm-test-archive-src-'));
+  const skillFolder = path.join(tmpSource, 'my-skill');
+  fs.mkdirSync(skillFolder, { recursive: true });
+  fs.writeFileSync(path.join(skillFolder, 'SKILL.md'), '---\nname: my-skill\n---\n# SOP content\n', 'utf8');
+  fs.writeFileSync(path.join(skillFolder, 'extra.txt'), 'extra resource', 'utf8');
+
+  const registry = new ServiceRegistry();
+  await withAgent(registry, async (base) => {
+    await reportToAgent({
+      id: 'demo-service',
+      port: 8080,
+      skills: tmpSource,
+    }, { baseUrl: base });
+
+    // 拉取 archive
+    const archiveRes = await fetch(`${base}/services/demo-service/skills/my-skill/archive`);
+    assert.equal(archiveRes.status, 200);
+    assert.equal(archiveRes.headers.get('content-type'), 'application/gzip');
+
+    const buffer = Buffer.from(await archiveRes.arrayBuffer());
+    assert.ok(buffer.length > 0);
+
+    // 验证 tar 内部包含的文件
+    const fileList = await listSkillArchive(buffer);
+    assert.ok(fileList.some((f) => f.includes('SKILL.md')));
+    assert.ok(fileList.some((f) => f.includes('extra.txt')));
+
+    // 解压安装
+    const tmpDest = fs.mkdtempSync(path.join(os.tmpdir(), 'dm-test-archive-dest-'));
+    const installedPath = await installSkillPackage(buffer, tmpDest, 'my-skill');
+    assert.ok(fs.existsSync(path.join(installedPath, 'SKILL.md')));
+    assert.ok(fs.existsSync(path.join(installedPath, 'extra.txt')));
+
+    fs.rmSync(tmpDest, { recursive: true, force: true });
+  });
+
+  fs.rmSync(tmpSource, { recursive: true, force: true });
 });
 

@@ -9,8 +9,14 @@
  */
 import { DEFAULT_PORTS, type Reachability } from '@1agents/dreammate-network';
 import type { MethodDescriptor, Registration } from './registry.js';
+import {
+  loadSkillsFromDir,
+  parseSkillMarkdown,
+  type SkillDescriptorWithSource,
+} from './skills.js';
 
-export type { Registration, MethodDescriptor, Reachability };
+export type { Registration, MethodDescriptor, Reachability, SkillDescriptorWithSource };
+export { loadSkillsFromDir, parseSkillMarkdown };
 
 const AGENT_BASE = `http://127.0.0.1:${DEFAULT_PORTS['node-agent']}`;
 
@@ -52,7 +58,14 @@ export async function reportToAgent(
   entry: Registration,
   options: ReportOptions = {},
 ): Promise<{ ok: boolean; reason?: string }> {
-  const res = await call('POST', '/services', entry, options);
+  let finalEntry = entry;
+  if (typeof entry.skills === 'string') {
+    finalEntry = {
+      ...entry,
+      skills: loadSkillsFromDir(entry.skills),
+    };
+  }
+  const res = await call('POST', '/services', finalEntry, options);
   if (!res) return { ok: false, reason: 'agent 未运行' };
   if (!res.ok) return { ok: false, reason: `agent 返回 ${res.status}` };
   return { ok: true };
