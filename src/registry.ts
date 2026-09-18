@@ -5,16 +5,27 @@
  * 探它们的 health 端点。**Node 在线不代表 Service 在线**——tailnet 只知道机器
  * 开着，进程被 kill 了它照样报在线，所以这一层必须自己探。
  */
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
 import type {
   Reachability,
   ResourceDescriptor,
   Service,
   MethodDescriptor,
   SkillDescriptor,
+  ExecutionMode,
+  ServiceLifecycle,
 } from '@1agents/dreammate-network';
 import { loadSkillsFromDir, type SkillDescriptorWithSource } from './skills.js';
 
-export type { MethodDescriptor, SkillDescriptor, SkillDescriptorWithSource };
+export type {
+  MethodDescriptor,
+  SkillDescriptor,
+  SkillDescriptorWithSource,
+  ExecutionMode,
+  ServiceLifecycle,
+};
 
 /** 服务报备时提交的内容。 */
 export interface Registration {
@@ -23,7 +34,8 @@ export interface Registration {
   kind?: Service['kind'];
   /** @deprecated 历史过渡字段，请使用 methods 与 skills */
   capabilities?: string[];
-  port: number;
+  /** 服务实际监听的端口。纯 CLI 模式可省略。 */
+  port?: number;
   /** 省略按 `network` 理解——大多数服务是对外的，只监听回环的那个才特殊。 */
   reachability?: Reachability;
   /** 存活探测路径，默认 `/health`。 */
@@ -33,6 +45,12 @@ export interface Registration {
   methods?: Record<string, MethodDescriptor>;
   /** 服务配套声明的业务技能/SOP，支持对象、数组或本地技能目录路径。 */
   skills?: Record<string, SkillDescriptorWithSource> | SkillDescriptorWithSource[] | string;
+  /** 服务调用执行模式：cli=仅本地CLI，http=仅HTTP，hybrid=双模优先CLI */
+  execution?: ExecutionMode;
+  /** 命令行执行所使用的命令或可执行文件名，如 'transcribe' */
+  command?: string;
+  /** 生命周期管理声明，包括拉起与优雅关闭命令 */
+  lifecycle?: ServiceLifecycle;
   metadata?: Record<string, unknown>;
 }
 
@@ -58,6 +76,8 @@ export interface RegistryOptions {
   probeTimeoutMs?: number;
   /** 注入用，方便测试不起真服务。 */
   probe?: (url: string, timeoutMs: number) => Promise<boolean>;
+  /** 持久化文件路径。设置为 false 则禁用落盘。 */
+  storagePath?: string | false;
 }
 
 async function httpProbe(url: string, timeoutMs: number): Promise<boolean> {
@@ -75,15 +95,67 @@ async function httpProbe(url: string, timeoutMs: number): Promise<boolean> {
 
 export class ServiceRegistry {
   readonly #services = new Map<string, RegisteredService>();
-  readonly #options: Required<Omit<RegistryOptions, 'probe'>> & Pick<RegistryOptions, 'probe'>;
+  readonly #options: Required<Omit<RegistryOptions, 'probe' | 'storagePath'>> &
+    Pick<RegistryOptions, 'probe'> & { storagePath: string | false };
   #timer?: NodeJS.Timeout;
 
   constructor(options: RegistryOptions = {}) {
+    const isTest =
+      process.env.NODE_ENV === 'test' ||
+      Boolean(process.env.NODE_TEST_CONTEXT) ||
+      process.execArgv.includes('--test') ||
+      process.argv.some((arg) => arg.includes('test'));
+
+    const defaultStorage = isTest
+      ? false
+      : path.join(os.homedir(), '.1agents', 'registry.json');
+
     this.#options = {
       probeIntervalMs: options.probeIntervalMs ?? 15_000,
       probeTimeoutMs: options.probeTimeoutMs ?? 3_000,
       probe: options.probe,
+      storagePath: options.storagePath ?? defaultStorage,
     };
+
+    this.#loadFromDisk();
+  }
+
+  #loadFromDisk(): void {
+    if (!this.#options.storagePath) return;
+    try {
+      if (fs.existsSync(this.#options.storagePath)) {
+        const raw = fs.readFileSync(this.#options.storagePath, 'utf8');
+        const list = JSON.parse(raw);
+        if (Array.isArray(list)) {
+          for (const item of list) {
+            if (item && typeof item === 'object' && item.id) {
+              this.#services.set(item.id, {
+                ...item,
+                registeredAt: item.registeredAt ?? new Date().toISOString(),
+                liveness: item.port !== undefined ? 'unknown' : 'up',
+                failures: 0,
+              });
+            }
+          }
+        }
+      }
+    } catch {
+      // 容忍磁盘读取异常，不阻断 agent 初始化
+    }
+  }
+
+  #saveToDisk(): void {
+    if (!this.#options.storagePath) return;
+    try {
+      const dir = path.dirname(this.#options.storagePath);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+      const data = JSON.stringify([...this.#services.values()], null, 2);
+      fs.writeFileSync(this.#options.storagePath, data, 'utf8');
+    } catch {
+      // 容忍磁盘写入异常
+    }
   }
 
   /** 重复报备同一个 id 就是更新——服务重启后换了端口应该能盖掉旧的。 */
@@ -99,15 +171,20 @@ export class ServiceRegistry {
       reachability: entry.reachability ?? 'network',
       health: entry.health ?? '/health',
       registeredAt: existing?.registeredAt ?? new Date().toISOString(),
-      liveness: 'unknown',
+      liveness: entry.port !== undefined ? 'unknown' : 'up',
       failures: 0,
     };
     this.#services.set(entry.id, record);
+    this.#saveToDisk();
     return record;
   }
 
   deregister(id: string): boolean {
-    return this.#services.delete(id);
+    const result = this.#services.delete(id);
+    if (result) {
+      this.#saveToDisk();
+    }
+    return result;
   }
 
   list(): RegisteredService[] {
@@ -120,13 +197,6 @@ export class ServiceRegistry {
 
   /**
    * 转成协议的 Service 形状，放进节点 manifest。
-   *
-   * `access.base_url` 用调用方能用的地址：只监听回环的服务如实写 127.0.0.1，
-   * 让对方一眼看出连不上，而不是给一个看着能连、连上却超时的地址。
-   *
-   * 对外服务给两个 access——MagicDNS 名在前，tailnet IP 兜底。调用方的 DNS
-   * 可能被劫持（实测一台装了 fake-ip 代理的 Mac 会把 MagicDNS 名解析到
-   * 198.18.x.x），只给名字的话那台机器就永远连不上。
    */
   toServices(host: string, ipv4?: string): Service[] {
     return this.list().map((s) => ({
@@ -153,19 +223,26 @@ export class ServiceRegistry {
         : {}),
       ...(s.capabilities ? { capabilities: s.capabilities } : {}),
       ...(s.resources ? { resources: s.resources } : {}),
+      ...(s.execution ? { execution: s.execution } : {}),
+      ...(s.command ? { command: s.command } : {}),
+      ...(s.lifecycle ? { lifecycle: s.lifecycle } : {}),
       access:
-        s.reachability === 'localhost'
-          ? [{ protocol: 'http' as const, base_url: `http://127.0.0.1:${s.port}` }]
-          : [
-              { protocol: 'http' as const, base_url: `http://${host}:${s.port}` },
-              // 同一个 host 时不重复给（没有 tailnet 就只有一个地址）。
-              ...(ipv4 && ipv4 !== host
-                ? [{ protocol: 'http' as const, base_url: `http://${ipv4}:${s.port}` }]
-                : []),
-            ],
+        s.port !== undefined
+          ? (s.reachability === 'localhost'
+              ? [{ protocol: 'http' as const, base_url: `http://127.0.0.1:${s.port}` }]
+              : [
+                  { protocol: 'http' as const, base_url: `http://${host}:${s.port}` },
+                  // 同一个 host 时不重复给（没有 tailnet 就只有一个地址）。
+                  ...(ipv4 && ipv4 !== host
+                    ? [{ protocol: 'http' as const, base_url: `http://${ipv4}:${s.port}` }]
+                    : []),
+                ])
+          : (s.command
+              ? [{ protocol: 'cli' as const, command: s.command }]
+              : []),
       reachability: s.reachability,
-      port: s.port,
-      health: s.health,
+      ...(s.port !== undefined ? { port: s.port } : {}),
+      ...(s.health ? { health: s.health } : {}),
       metadata: {
         ...s.metadata,
         liveness: s.liveness,
@@ -174,19 +251,32 @@ export class ServiceRegistry {
     }));
   }
 
-  /** 探一轮所有服务。连续失败够多次就移除。 */
+  /** 探一轮所有服务。连续失败够多次就移除。纯 CLI 服务不发 HTTP 探针。 */
   async probeAll(): Promise<void> {
     const probe = this.#options.probe ?? httpProbe;
     await Promise.all(
       this.list().map(async (service) => {
-        const url = `http://127.0.0.1:${service.port}${service.health}`;
+        if (service.port === undefined) {
+          // 纯 CLI 服务，无 HTTP 端口，始终标记 up
+          const current = this.#services.get(service.id);
+          if (current) current.liveness = 'up';
+          return;
+        }
+
+        const url = `http://127.0.0.1:${service.port}${service.health ?? '/health'}`;
         const alive = await probe(url, this.#options.probeTimeoutMs);
         const current = this.#services.get(service.id);
         if (!current) return; // 探测期间被注销了
         current.liveness = alive ? 'up' : 'down';
         current.lastProbedAt = new Date().toISOString();
         current.failures = alive ? 0 : current.failures + 1;
-        if (current.failures >= EVICT_AFTER_FAILURES) this.#services.delete(service.id);
+        if (current.failures >= EVICT_AFTER_FAILURES) {
+          // 仅驱逐无本地 CLI 命令的纯临时 HTTP 服务；具有 command 或 execution=hybrid/cli 的常驻元数据保留
+          if (!service.command && service.execution !== 'cli' && service.execution !== 'hybrid') {
+            this.#services.delete(service.id);
+            this.#saveToDisk();
+          }
+        }
       }),
     );
   }

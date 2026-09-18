@@ -581,3 +581,151 @@ test('GET /services/:id/skills/:skill/archive 能打包技能并可解压还原'
   fs.rmSync(tmpSource, { recursive: true, force: true });
 });
 
+test('支持纯 CLI 模式服务报备，免提供端口，并在 manifest 中生成 protocol=cli access', async () => {
+  const registry = new ServiceRegistry();
+  await withAgent(registry, async (base) => {
+    const res = await fetch(`${base}/services`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        id: 'ffmpeg-helper',
+        name: 'FFmpeg CLI 辅助工具',
+        execution: 'cli',
+        command: 'ffmpeg',
+        methods: {
+          'ffmpeg.convert': {
+            description: '音视频转码',
+            parameters: { type: 'object', properties: { input: { type: 'string' } } },
+          },
+        },
+      }),
+    });
+    assert.equal(res.status, 201);
+
+    const manifestRes = await fetch(`${base}/manifest`);
+    const manifest = (await manifestRes.json()) as { services: any[] };
+    const svc = manifest.services.find((s) => s.id === 'ffmpeg-helper');
+    assert.ok(svc);
+    assert.equal(svc.execution, 'cli');
+    assert.equal(svc.command, 'ffmpeg');
+    assert.equal(svc.access[0].protocol, 'cli');
+    assert.equal(svc.access[0].command, 'ffmpeg');
+  });
+});
+
+test('注册表支持落盘持久化与加载恢复', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const os = await import('node:os');
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dm-test-persist-'));
+  const storageFile = path.join(tmpDir, 'registry.json');
+
+  try {
+    const reg1 = new ServiceRegistry({ storagePath: storageFile });
+    reg1.register({
+      id: 'cli-tool',
+      execution: 'cli',
+      command: 'my-cli',
+    });
+
+    assert.ok(fs.existsSync(storageFile));
+    const content = JSON.parse(fs.readFileSync(storageFile, 'utf8'));
+    assert.equal(content.length, 1);
+    assert.equal(content[0].id, 'cli-tool');
+
+    // 建立新的 registry 实例，验证从磁盘还原
+    const reg2 = new ServiceRegistry({ storagePath: storageFile });
+    assert.equal(reg2.list().length, 1);
+    assert.equal(reg2.get('cli-tool')?.command, 'my-cli');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('POST /services/:id/invoke 优先执行本地 CLI spawn 引擎', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const os = await import('node:os');
+
+  // 创建一个微型 CLI 脚本
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dm-test-cli-'));
+  const scriptPath = path.join(tmpDir, 'mock-cli.js');
+  fs.writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env node
+let input = '';
+process.stdin.on('data', d => input += d);
+process.stdin.on('end', () => {
+  const payload = JSON.parse(input);
+  process.stderr.write('loading mock model...\\n');
+  process.stdout.write(JSON.stringify({ executed_by: 'cli', echo: payload.params?.text || 'none' }));
+});
+`,
+    { mode: 0o755 },
+  );
+
+  const registry = new ServiceRegistry();
+  registry.register({
+    id: 'mock-cli-service',
+    execution: 'hybrid',
+    command: scriptPath,
+  });
+
+  await withAgent(registry, async (base) => {
+    const res = await fetch(`${base}/services/mock-cli-service/invoke`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ method: 'echo', params: { text: 'hello dreammate' } }),
+    });
+
+    assert.equal(res.status, 200);
+    const data = (await res.json()) as any;
+    assert.equal(data.executed_by, 'cli');
+    assert.equal(data.echo, 'hello dreammate');
+  });
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test('服务生命周期控制：POST /services/:id/stop 能通过 stop_endpoint 优雅关机', async () => {
+  const http = await import('node:http');
+
+  let stopped = false;
+  const mockServer = http.createServer((req, res) => {
+    if (req.method === 'POST' && req.url === '/shutdown') {
+      stopped = true;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+      mockServer.close();
+      return;
+    }
+    res.writeHead(404).end();
+  });
+
+  await new Promise<void>((r) => mockServer.listen(0, '127.0.0.1', r));
+  const port = (mockServer.address() as any).port;
+
+  const registry = new ServiceRegistry();
+  registry.register({
+    id: 'lifecycle-service',
+    port,
+    execution: 'hybrid',
+    lifecycle: {
+      can_shutdown: true,
+      stop_endpoint: '/shutdown',
+      can_spawn: true,
+      start_command: 'echo start',
+    },
+  });
+
+  await withAgent(registry, async (base) => {
+    const stopRes = await fetch(`${base}/services/lifecycle-service/stop`, {
+      method: 'POST',
+    });
+    assert.equal(stopRes.status, 200);
+    assert.equal(stopped, true);
+    assert.equal(registry.get('lifecycle-service')?.liveness, 'down');
+  });
+});
+

@@ -233,6 +233,30 @@ export const MCP_TOOLS: Tool[] = [
       required: ['service_id', 'skill'],
     },
   },
+  {
+    name: 'dreammate_manage_service',
+    description:
+      '管理服务的生命周期（按需启动常驻 HTTP 服务、优雅停止常驻服务释放显存/内存、或查看运行状态与执行模式）。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        node: {
+          type: 'string',
+          description: '可选：目标服务所在的设备节点名称或 IP（省略时为本机）',
+        },
+        service_id: {
+          type: 'string',
+          description: '目标服务 ID（例如 "transcribe"）',
+        },
+        action: {
+          type: 'string',
+          enum: ['start', 'stop', 'status'],
+          description: '操作类型：start（按需启动常驻服务）、stop（停止服务释放资源）、status（查询服务状态与启停能力）',
+        },
+      },
+      required: ['service_id', 'action'],
+    },
+  },
 ];
 
 export function createMcpServer(options: McpOptions = {}): Server {
@@ -241,7 +265,7 @@ export function createMcpServer(options: McpOptions = {}): Server {
   const server = new Server(
     {
       name: 'dreammate-mcp',
-      version: '0.6.0',
+      version: '0.7.0',
     },
     {
       capabilities: {
@@ -415,6 +439,9 @@ export function createMcpServer(options: McpOptions = {}): Server {
             service_id: s.id,
             name: s.name ?? s.id,
             kind: s.kind ?? 'generic',
+            execution: s.execution ?? (s.command ? 'hybrid' : 'http'),
+            command: s.command,
+            lifecycle: s.lifecycle,
             methods: s.methods ? Object.keys(s.methods) : [],
             skills: Object.keys(skillsMap),
             capabilities: s.capabilities ?? [],
@@ -542,6 +569,9 @@ export function createMcpServer(options: McpOptions = {}): Server {
                   service_id: service.id,
                   name: service.name,
                   kind: service.kind,
+                  execution: service.execution ?? (service.command ? 'hybrid' : 'http'),
+                  command: service.command,
+                  lifecycle: service.lifecycle,
                   methods: service.methods ?? {},
                   skills: Object.keys(skillsMap),
                   capabilities: service.capabilities ?? [],
@@ -741,6 +771,117 @@ export function createMcpServer(options: McpOptions = {}): Server {
               isError: true,
             };
           }
+        }
+      }
+
+      if (name === 'dreammate_manage_service') {
+        const node = args.node as string | undefined;
+        const serviceId = args.service_id as string;
+        const action = args.action as 'start' | 'stop' | 'status';
+
+        if (!serviceId || !action) {
+          return {
+            content: [{ type: 'text', text: '缺少必填参数: service_id 和 action' }],
+            isError: true,
+          };
+        }
+
+        const targetUrl = resolveNodeBaseUrl(agentUrl, node);
+
+        if (action === 'status') {
+          let res: Response;
+          try {
+            res = await fetch(`${targetUrl}/services/${encodeURIComponent(serviceId)}`);
+          } catch {
+            return {
+              content: [{ type: 'text', text: `无法连接到节点 (${targetUrl})。` }],
+              isError: true,
+            };
+          }
+          if (!res.ok) {
+            return {
+              content: [{ type: 'text', text: `获取服务状态失败: HTTP ${res.status}` }],
+              isError: true,
+            };
+          }
+          const service = (await res.json()) as RegisteredService;
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify(
+                  {
+                    node: node || 'local',
+                    service_id: service.id,
+                    name: service.name,
+                    liveness: service.liveness,
+                    execution: service.execution ?? (service.command ? 'hybrid' : 'http'),
+                    command: service.command,
+                    lifecycle: service.lifecycle,
+                    port: service.port,
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        }
+
+        if (action === 'start') {
+          let res: Response;
+          try {
+            res = await fetch(`${targetUrl}/services/${encodeURIComponent(serviceId)}/start`, {
+              method: 'POST',
+            });
+          } catch (err: unknown) {
+            return {
+              content: [
+                { type: 'text', text: `启动服务失败: ${err instanceof Error ? err.message : String(err)}` },
+              ],
+              isError: true,
+            };
+          }
+          const data = (await res.json()) as Record<string, unknown>;
+          if (!res.ok) {
+            return {
+              content: [
+                { type: 'text', text: `启动服务失败 (HTTP ${res.status}): ${JSON.stringify(data, null, 2)}` },
+              ],
+              isError: true,
+            };
+          }
+          return {
+            content: [{ type: 'text', text: JSON.stringify(data, null, 2) }],
+          };
+        }
+
+        if (action === 'stop') {
+          let res: Response;
+          try {
+            res = await fetch(`${targetUrl}/services/${encodeURIComponent(serviceId)}/stop`, {
+              method: 'POST',
+            });
+          } catch (err: unknown) {
+            return {
+              content: [
+                { type: 'text', text: `停止服务失败: ${err instanceof Error ? err.message : String(err)}` },
+              ],
+              isError: true,
+            };
+          }
+          const data = (await res.json()) as Record<string, unknown>;
+          if (!res.ok) {
+            return {
+              content: [
+                { type: 'text', text: `停止服务失败 (HTTP ${res.status}): ${JSON.stringify(data, null, 2)}` },
+              ],
+              isError: true,
+            };
+          }
+          return {
+            content: [{ type: 'text', text: JSON.stringify(data, null, 2) }],
+          };
         }
       }
 

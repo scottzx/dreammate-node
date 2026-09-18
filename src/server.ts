@@ -6,9 +6,10 @@
  */
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { spawn } from 'node:child_process';
 import { DEFAULT_PORTS, PROTOCOL_VERSION, type NodeManifest, type MethodDescriptor } from '@1agents/dreammate-network';
 import { nodeIdentity } from './identity.js';
-import { ServiceRegistry, type Registration } from './registry.js';
+import { ServiceRegistry, type Registration, type RegisteredService } from './registry.js';
 import { archiveSkill, type SkillDescriptorWithSource } from './skills.js';
 
 /** 固定端口。改它等于让全网的探测方同时失明。 */
@@ -73,8 +74,21 @@ function validate(body: unknown): Registration {
   if (typeof body !== 'object' || body === null) throw new Error('body must be an object');
   const entry = body as Partial<Registration>;
   if (!entry.id?.trim()) throw new Error('missing id');
-  if (typeof entry.port !== 'number' || entry.port < 1 || entry.port > 65535) {
-    throw new Error('port must be 1-65535');
+  if (entry.port !== undefined) {
+    if (typeof entry.port !== 'number' || entry.port < 1 || entry.port > 65535) {
+      throw new Error('port must be 1-65535');
+    }
+  } else if (entry.execution !== 'cli' && !entry.command) {
+    throw new Error('port is required unless execution is "cli" or command is provided');
+  }
+  if (entry.execution !== undefined && !['cli', 'http', 'hybrid'].includes(entry.execution)) {
+    throw new Error('execution must be "cli", "http", or "hybrid"');
+  }
+  if (entry.command !== undefined && (typeof entry.command !== 'string' || !entry.command.trim())) {
+    throw new Error('command must be a non-empty string');
+  }
+  if (entry.lifecycle !== undefined && (typeof entry.lifecycle !== 'object' || entry.lifecycle === null)) {
+    throw new Error('lifecycle must be an object');
   }
   if (entry.capabilities !== undefined && !Array.isArray(entry.capabilities)) {
     throw new Error('capabilities must be an array');
@@ -105,6 +119,164 @@ function validate(body: unknown): Registration {
     }
   }
   return entry as Registration;
+}
+
+interface ExecutionResult {
+  status: number;
+  data: unknown;
+}
+
+async function executeViaCli(
+  command: string,
+  payload: { method: string; capability?: string; params?: unknown },
+  timeoutMs = 120_000,
+): Promise<ExecutionResult> {
+  return new Promise((resolve) => {
+    let resolved = false;
+    const proc = spawn(command, ['invoke'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env },
+    });
+
+    let stdout = '';
+    let stderr = '';
+
+    const timer = setTimeout(() => {
+      if (resolved) return;
+      resolved = true;
+      proc.kill('SIGTERM');
+      resolve({
+        status: 504,
+        data: { error: `CLI command "${command} invoke" timed out after ${timeoutMs}ms` },
+      });
+    }, timeoutMs);
+
+    proc.stdout.on('data', (d) => {
+      stdout += d.toString();
+    });
+    proc.stderr.on('data', (d) => {
+      stderr += d.toString();
+    });
+
+    proc.on('error', (err) => {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timer);
+      resolve({
+        status: 502,
+        data: { error: `Failed to spawn CLI "${command}": ${err.message}` },
+      });
+    });
+
+    proc.on('close', (code) => {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timer);
+
+      if (code !== 0) {
+        try {
+          const parsedErr = JSON.parse(stdout.trim() || stderr.trim());
+          return resolve({ status: 500, data: parsedErr });
+        } catch {
+          return resolve({
+            status: 500,
+            data: { error: `CLI "${command} invoke" exited with code ${code}: ${stderr || stdout}` },
+          });
+        }
+      }
+
+      try {
+        const parsed = JSON.parse(stdout.trim());
+        resolve({ status: 200, data: parsed });
+      } catch {
+        resolve({
+          status: 502,
+          data: {
+            error: `CLI "${command} invoke" output is not valid JSON: ${stdout.slice(0, 500)}`,
+            raw: stdout,
+          },
+        });
+      }
+    });
+
+    proc.stdin.write(JSON.stringify(payload));
+    proc.stdin.end();
+  });
+}
+
+async function executeViaHttp(
+  port: number,
+  payload: unknown,
+  timeoutMs = 15_000,
+): Promise<ExecutionResult> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const forwardRes = await fetch(`http://127.0.0.1:${port}/invoke`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    const forwardText = await forwardRes.text();
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(forwardText);
+    } catch {
+      parsed = forwardText;
+    }
+    return { status: forwardRes.status, data: parsed };
+  } catch (err: unknown) {
+    return {
+      status: 502,
+      data: {
+        error: `failed to reach service at port ${port}: ${err instanceof Error ? err.message : String(err)}`,
+      },
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function executeService(
+  service: RegisteredService,
+  payload: { method: string; capability?: string; params?: unknown },
+): Promise<ExecutionResult> {
+  const mode = service.execution ?? (service.command ? 'hybrid' : 'http');
+
+  // 1. execution === 'cli': 仅本地 CLI
+  if (mode === 'cli') {
+    const cmd = service.command ?? service.id;
+    return executeViaCli(cmd, payload);
+  }
+
+  // 2. execution === 'http': 仅常驻 HTTP
+  if (mode === 'http') {
+    if (!service.port) {
+      return {
+        status: 500,
+        data: { error: `Service "${service.id}" has execution: 'http' but no port specified` },
+      };
+    }
+    return executeViaHttp(service.port, payload);
+  }
+
+  // 3. execution === 'hybrid': 双模兼容，优先 CLI！
+  const cmd = service.command ?? service.id;
+  const cliRes = await executeViaCli(cmd, payload);
+  if (cliRes.status === 200) {
+    return cliRes;
+  }
+
+  // 如果执行 CLI 失败是由于命令不存在/找不到程序 (ENOENT) 且 HTTP 端口有效，则降级为 HTTP
+  const isSpawnNotFound =
+    typeof (cliRes.data as any)?.error === 'string' &&
+    (cliRes.data as any).error.includes('Failed to spawn CLI');
+  if (isSpawnNotFound && service.port && service.liveness !== 'down') {
+    return executeViaHttp(service.port, payload);
+  }
+
+  return cliRes;
 }
 
 export function createAgent(options: AgentOptions = {}): { server: http.Server; registry: ServiceRegistry } {
@@ -211,30 +383,8 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
           }
           const raw = await readBody(req);
           const payload = raw ? JSON.parse(raw) : {};
-          const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), 15_000);
-          try {
-            const forwardRes = await fetch(`http://127.0.0.1:${service.port}/invoke`, {
-              method: 'POST',
-              headers: { 'content-type': 'application/json' },
-              body: JSON.stringify(payload),
-              signal: controller.signal,
-            });
-            const forwardText = await forwardRes.text();
-            let parsed: unknown;
-            try {
-              parsed = JSON.parse(forwardText);
-            } catch {
-              parsed = forwardText;
-            }
-            return json(res, forwardRes.status, parsed);
-          } catch (err: unknown) {
-            return json(res, 502, {
-              error: `failed to reach service "${id}" at port ${service.port}: ${err instanceof Error ? err.message : String(err)}`,
-            });
-          } finally {
-            clearTimeout(timeout);
-          }
+          const result = await executeService(service, payload);
+          return json(res, result.status, result.data);
         }
 
         const invokeCap = /^\/capabilities\/([^/]+)\/invoke$/.exec(pathname);
@@ -251,29 +401,91 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
           }
           const raw = await readBody(req);
           const payload = raw ? JSON.parse(raw) : {};
-          const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), 15_000);
+          const result = await executeService(target, { method: capability, capability, ...payload });
+          return json(res, result.status, result.data);
+        }
+
+        const startService = /^\/services\/([^/]+)\/start$/.exec(pathname);
+        if (req.method === 'POST' && startService) {
+          const id = decodeURIComponent(startService[1]!);
+          const service = registry.get(id);
+          if (!service) {
+            return json(res, 404, { error: `no such service: ${id}` });
+          }
+          if (!service.lifecycle?.can_spawn || !service.lifecycle?.start_command) {
+            return json(res, 400, {
+              error: `service "${id}" cannot be spawned (missing lifecycle.start_command or can_spawn is false)`,
+            });
+          }
+
+          if (service.liveness === 'up' && service.port) {
+            return json(res, 200, { ok: true, status: 'already_running', port: service.port });
+          }
+
+          const child = spawn(service.lifecycle.start_command, {
+            shell: true,
+            detached: true,
+            stdio: 'ignore',
+          });
+          child.unref();
+
+          const port = service.port;
+          const healthPath = service.health ?? '/health';
+          let isUp = false;
+          if (port) {
+            const deadline = Date.now() + 5000;
+            while (Date.now() < deadline) {
+              await new Promise((r) => setTimeout(r, 400));
+              try {
+                const hRes = await fetch(`http://127.0.0.1:${port}${healthPath}`);
+                if (hRes.ok) {
+                  isUp = true;
+                  break;
+                }
+              } catch {}
+            }
+          }
+
+          if (isUp) {
+            service.liveness = 'up';
+            return json(res, 200, { ok: true, status: 'started', port });
+          } else {
+            return json(res, 202, {
+              ok: true,
+              status: 'spawned',
+              port,
+              message: 'service process spawned, health check pending',
+            });
+          }
+        }
+
+        const stopService = /^\/services\/([^/]+)\/stop$/.exec(pathname);
+        if (req.method === 'POST' && stopService) {
+          const id = decodeURIComponent(stopService[1]!);
+          const service = registry.get(id);
+          if (!service) {
+            return json(res, 404, { error: `no such service: ${id}` });
+          }
+          if (!service.lifecycle?.can_shutdown || !service.lifecycle?.stop_endpoint || !service.port) {
+            return json(res, 400, {
+              error: `service "${id}" cannot be stopped via HTTP (missing stop_endpoint, no port, or can_shutdown is false)`,
+            });
+          }
+
           try {
-            const forwardRes = await fetch(`http://127.0.0.1:${target.port}/invoke`, {
+            const stopRes = await fetch(`http://127.0.0.1:${service.port}${service.lifecycle.stop_endpoint}`, {
               method: 'POST',
               headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ method: capability, capability, ...payload }),
-              signal: controller.signal,
             });
-            const forwardText = await forwardRes.text();
-            let parsed: unknown;
-            try {
-              parsed = JSON.parse(forwardText);
-            } catch {
-              parsed = forwardText;
-            }
-            return json(res, forwardRes.status, parsed);
+            service.liveness = 'down';
+            return json(res, 200, { ok: true, status: 'stopped', statusCode: stopRes.status });
           } catch (err: unknown) {
-            return json(res, 502, {
-              error: `failed to reach service "${target.id}" at port ${target.port}: ${err instanceof Error ? err.message : String(err)}`,
+            service.liveness = 'down';
+            return json(res, 200, {
+              ok: true,
+              status: 'stopped',
+              message: `service stopped: ${err instanceof Error ? err.message : String(err)}`,
             });
-          } finally {
-            clearTimeout(timeout);
           }
         }
 

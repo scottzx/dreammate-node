@@ -396,3 +396,71 @@ test('MCP: dreammate_download_skill 能够下载并安装/预览远程技能包'
     });
   });
 });
+
+test('MCP: dreammate_list_services 返回 execution/lifecycle 且 dreammate_manage_service 能管理启停', async () => {
+  const http = await import('node:http');
+
+  let stopped = false;
+  const mockServer = http.createServer((req, res) => {
+    if (req.method === 'POST' && req.url === '/shutdown') {
+      stopped = true;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, message: 'shutting down' }));
+      mockServer.close();
+      return;
+    }
+    res.writeHead(404).end();
+  });
+
+  await new Promise<void>((r) => mockServer.listen(0, '127.0.0.1', r));
+  const port = (mockServer.address() as any).port;
+
+  const registry = new ServiceRegistry();
+  registry.register({
+    id: 'transcribe-svc',
+    name: 'ASR 语音转写服务',
+    port,
+    execution: 'hybrid',
+    command: 'transcribe',
+    lifecycle: {
+      can_shutdown: true,
+      stop_endpoint: '/shutdown',
+      can_spawn: true,
+      start_command: 'transcribe serve',
+    },
+  });
+
+  await withTestAgent(registry, async (agentUrl) => {
+    await withMcpClient(agentUrl, async (client) => {
+      // 1. dreammate_list_services 能看到 execution 与 lifecycle
+      const listRes = await client.callTool({
+        name: 'dreammate_list_services',
+        arguments: { keyword: 'transcribe' },
+      });
+      const listData = JSON.parse((listRes.content as [{ text: string }])[0].text) as {
+        services: any[];
+      };
+      assert.equal(listData.services.length, 1);
+      assert.equal(listData.services[0].execution, 'hybrid');
+      assert.equal(listData.services[0].command, 'transcribe');
+      assert.equal(listData.services[0].lifecycle.can_shutdown, true);
+
+      // 2. dreammate_manage_service: status
+      const statusRes = await client.callTool({
+        name: 'dreammate_manage_service',
+        arguments: { service_id: 'transcribe-svc', action: 'status' },
+      });
+      const statusData = JSON.parse((statusRes.content as [{ text: string }])[0].text) as any;
+      assert.equal(statusData.service_id, 'transcribe-svc');
+      assert.equal(statusData.execution, 'hybrid');
+
+      // 3. dreammate_manage_service: stop
+      const stopRes = await client.callTool({
+        name: 'dreammate_manage_service',
+        arguments: { service_id: 'transcribe-svc', action: 'stop' },
+      });
+      assert.equal(stopRes.isError, undefined);
+      assert.equal(stopped, true);
+    });
+  });
+});
