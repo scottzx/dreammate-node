@@ -464,3 +464,190 @@ test('MCP: dreammate_list_services 返回 execution/lifecycle 且 dreammate_mana
     });
   });
 });
+
+// Deterministic mesh fixtures: no dependency on the developer's DNS or Tailnet.
+const fixturePeer = { node_id: 'peer-1', name: 'peer', dnsName: 'peer.test', ipv4: '100.64.0.2', online: true, is_self: false, type: 'linux' };
+const fixtureService = { id: 'plane-pm', methods: {}, liveness: 'unknown', registeredAt: '2026-01-01T00:00:00Z' };
+const jsonResponse = (data: unknown, status = 200) => new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json' } });
+const toolData = (r: any) => r.structuredContent ?? JSON.parse(r.content[0].text);
+
+async function withMesh(t: any, handler: (url: string, init?: RequestInit) => Promise<Response> | Response, body: (client: Client) => Promise<void>) {
+  const mock = t.mock.method(globalThis, 'fetch', (url: string, init?: RequestInit) => handler(String(url), init));
+  try { await withMcpClient('http://local.test:36908', body); }
+  finally { mock.mock.restore(); }
+}
+
+test('DMN-1/2: all uses registered IP and reports partial discovery', async t => {
+  await withMesh(t, url => {
+    if (url.endsWith('/nodes')) return jsonResponse({ nodes: [fixturePeer, { ...fixturePeer, name: 'broken', ipv4: '100.64.0.3' }] });
+    if (url === 'http://100.64.0.2:36908/services') return jsonResponse({ node: 'peer', services: [fixtureService] });
+    return jsonResponse({ error: 'unavailable' }, 503);
+  }, async client => {
+    const r = await client.callTool({ name: 'dreammate_list_services', arguments: { node: 'all', keyword: 'plane' } });
+    const d = toolData(r);
+    assert.equal(d.total_matched, 1);
+    assert.equal(d.partial, true);
+    assert.deepEqual(d.scans.map((s: any) => s.status), ['ok', 'http_error']);
+    assert.equal(r.isError, undefined);
+  });
+});
+
+test('DMN-1: all failed differs from complete zero matches and topology fallback', async t => {
+  let mode = 'failed';
+  await withMesh(t, url => {
+    if (url.endsWith('/nodes')) return mode === 'fallback' ? jsonResponse({}, 500) : jsonResponse({ nodes: [fixturePeer] });
+    return mode === 'failed' ? jsonResponse({}, 500) : jsonResponse({ services: [] });
+  }, async client => {
+    const call = () => client.callTool({ name: 'dreammate_list_services', arguments: { node: 'all' } });
+    let r = await call(); assert.equal(r.isError, true); assert.equal(toolData(r).partial, true);
+    mode = 'empty'; r = await call(); assert.equal(r.isError, undefined); assert.equal(toolData(r).partial, false);
+    mode = 'fallback'; r = await call(); assert.equal(toolData(r).partial, true); assert.equal(toolData(r).discovery.status, 'failed');
+  });
+});
+
+test('DMN-1: stalled response body times out and is reported', async t => {
+  await withMesh(t, (url, init) => {
+    if (url.endsWith('/nodes')) return jsonResponse({ nodes: [fixturePeer] });
+    const stream = new ReadableStream({ start(controller) {
+      const fail = () => controller.error(new DOMException('Timed out', 'TimeoutError'));
+      if (init?.signal?.aborted) fail(); else init?.signal?.addEventListener('abort', fail, { once: true });
+    } });
+    return new Response(stream);
+  }, async client => {
+    const r = await client.callTool({ name: 'dreammate_list_services', arguments: { node: 'all' } });
+    assert.equal(r.isError, true); assert.equal(toolData(r).scans[0].status, 'timeout');
+  });
+});
+
+test('DMN-2: names, FQDN, IP and explicit URLs route consistently; writes are never retried', async t => {
+  const requests: string[] = [];
+  await withMesh(t, (url, init) => {
+    if (url.endsWith('/nodes')) return jsonResponse({ nodes: [fixturePeer] });
+    requests.push(url);
+    if (init?.method === 'POST') throw new Error('response lost after send');
+    if (url.endsWith('/services')) return jsonResponse({ services: [fixtureService] });
+    return jsonResponse(fixtureService);
+  }, async client => {
+    for (const node of ['peer', 'peer.test', '100.64.0.2']) {
+      await client.callTool({ name: 'dreammate_list_services', arguments: { node } });
+      await client.callTool({ name: 'dreammate_inspect', arguments: { node, service_id: 'plane-pm' } });
+      await client.callTool({ name: 'dreammate_manage_service', arguments: { node, service_id: 'plane-pm', action: 'status' } });
+    }
+    assert.ok(requests.every(u => u.startsWith('http://100.64.0.2:36908/')));
+    await client.callTool({ name: 'dreammate_inspect', arguments: { node: 'http://other.test:1234/', service_id: 'plane-pm' } });
+    assert.equal(requests.at(-1), 'http://other.test:1234/services/plane-pm');
+    const before = requests.length;
+    const r = await client.callTool({ name: 'dreammate_invoke', arguments: { node: 'peer', service_id: 'plane-pm', method: 'create' } });
+    assert.equal(r.isError, true); assert.equal(requests.length - before, 1);
+  });
+});
+
+test('DMN-3: preserve MCP errors, structured data, media and metadata; wrap ordinary JSON', async t => {
+  let value: any = { isError: true, content: [{ type: 'text', text: 'business rejection' }], structuredContent: { error: 'denied' }, _meta: { upstream: true } };
+  let status = 200;
+  await withMesh(t, () => jsonResponse(value, status), async client => {
+    const call = () => client.callTool({ name: 'dreammate_invoke', arguments: { service_id: 's', method: 'read' } });
+    let r = await call(); assert.equal(r.isError, true); assert.deepEqual(r.structuredContent, value.structuredContent); assert.deepEqual(r.content, value.content); assert.equal((r._meta as any).upstream, true);
+    value = { content: [{ type: 'image', data: 'YWJj', mimeType: 'image/png' }, { type: 'resource_link', uri: 'https://example.test/r', name: 'r' }] };
+    r = await call(); assert.deepEqual(r.content, value.content);
+    value = { task_id: 'plain' }; r = await call(); assert.deepEqual(toolData(r), value);
+    value = { task_id: 'ok', content: 'ordinary business field' }; r = await call(); assert.deepEqual(toolData(r), value);
+    value = { content: [], structuredContent: { denied: true } }; status = 403; r = await call(); assert.equal(r.isError, true); assert.equal((r._meta as any).dreammate.http_status, 403);
+  });
+});
+
+test('DMN-5: network online does not imply gateway or service health', async t => {
+  await withMesh(t, url => {
+    if (url.endsWith('/nodes')) return jsonResponse({ node: 'local', nodes: [fixturePeer, { ...fixturePeer, name: 'down', ipv4: '100.64.0.3' }] });
+    if (url === 'http://100.64.0.2:36908/health') return jsonResponse({ status: 'ok', service: 'node-agent' });
+    if (url.endsWith('/services')) return jsonResponse({ services: [fixtureService, { ...fixtureService, id: 'healthy', port: 7792, liveness: 'up', lastProbedAt: '2026-01-02T00:00:00Z' }] });
+    return jsonResponse({}, 503);
+  }, async client => {
+    let d = toolData(await client.callTool({ name: 'dreammate_list_nodes', arguments: {} }));
+    assert.equal(d.nodes[0].network_online, true); assert.equal(d.nodes[0].gateway_reachable, true);
+    assert.equal(d.nodes[1].network_online, true); assert.equal(d.nodes[1].gateway_reachable, false);
+    assert.ok(d.nodes[0].gateway_checked_at);
+    d = toolData(await client.callTool({ name: 'dreammate_list_services', arguments: {} }));
+    assert.equal(d.services[0].service_health.status, 'unknown');
+    assert.equal(d.services[0].service_health.checked_at, null);
+    assert.equal(d.services[1].service_health.status, 'up');
+    assert.equal(d.services[1].method_availability, undefined);
+  });
+});
+
+test('DMN-1: malformed node responses are not empty successful scans', async t => {
+  await withMesh(t, url => url.endsWith('/nodes') ? jsonResponse({ nodes: [fixturePeer] }) : jsonResponse({ unexpected: [] }), async client => {
+    const r = await client.callTool({ name: 'dreammate_list_services', arguments: { node: 'all' } });
+    assert.equal(r.isError, true); assert.equal(toolData(r).scans[0].status, 'invalid_response');
+  });
+});
+
+test('DMN-2/6: skill/lifecycle routes use IP and inspect separates declared from availability', async t => {
+  const requested: string[] = [];
+  const availability = { state: 'unsupported', checked_at: '2026-09-29T00:00:00Z', reason: 'deployment evidence' };
+  await withMesh(t, url => {
+    if (url.endsWith('/nodes')) return jsonResponse({ nodes: [fixturePeer] });
+    requested.push(url);
+    return jsonResponse({ ...fixtureService, methods: { 'plane.page': { description: 'Page', parameters: { type: 'object' } } }, metadata: { method_availability: { 'plane.page': availability } } });
+  }, async client => {
+    const args = { node: 'peer', service_id: 'plane-pm' };
+    const d = toolData(await client.callTool({ name: 'dreammate_inspect', arguments: { ...args, method: 'plane.page' } }));
+    assert.equal(d.declared, true); assert.deepEqual(d.availability, availability);
+    const unknown = toolData(await client.callTool({ name: 'dreammate_inspect', arguments: { ...args, method: 'other' } }));
+    assert.equal(unknown.declared, false); assert.equal(unknown.availability.state, 'unknown');
+    await client.callTool({ name: 'dreammate_download_skill', arguments: { ...args, skill: 's', install: false } });
+    for (const action of ['start', 'stop']) await client.callTool({ name: 'dreammate_manage_service', arguments: { ...args, action } });
+    assert.ok(requested.every(url => url.startsWith('http://100.64.0.2:36908/')));
+    assert.ok(requested.some(url => url.endsWith('/archive')));
+    assert.ok(requested.some(url => url.endsWith('/start')));
+    assert.ok(requested.some(url => url.endsWith('/stop')));
+  });
+});
+
+test('DMN-3: arrays and text are preserved; malformed content does not become an MCP result', async t => {
+  let response = new Response('plain text');
+  await withMesh(t, () => response, async client => {
+    const call = () => client.callTool({ name: 'dreammate_invoke', arguments: { service_id: 's', method: 'read' } });
+    assert.deepEqual((await call()).content, [{ type: 'text', text: 'plain text' }]);
+    response = jsonResponse([1, 2]); assert.deepEqual(toolData(await call()), [1, 2]);
+    response = jsonResponse({ content: [{ wrong: true }] });
+    assert.deepEqual(toolData(await call()), { content: [{ wrong: true }] });
+    response = new Response('denied', { status: 403 });
+    const r = await call(); assert.equal(r.isError, true); assert.equal(toolData(r).http_status, 403);
+  });
+});
+
+test('DMN-4: node HTTP transport distinguishes connection failure and timeout without retry', async t => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  let timeout = false;
+  const mocked = t.mock.method(globalThis, 'fetch', (url: string | URL | Request, init?: RequestInit) => {
+    if (String(url) !== 'http://127.0.0.1:32123/invoke') return originalFetch(url, init);
+    calls++;
+    if (!timeout) return Promise.reject(new Error('connection refused'));
+    return new Promise((_resolve, reject) => init?.signal?.addEventListener('abort', () => reject(init.signal!.reason), { once: true }));
+  });
+  try {
+    const registry = new ServiceRegistry({ storagePath: false });
+    registry.register({ id: 'downstream', execution: 'http', port: 32123 });
+    await withTestAgent(registry, async url => {
+      const invoke = () => originalFetch(`${url}/services/downstream/invoke`, { method: 'POST', body: JSON.stringify({ method: 'create' }) });
+      let response = await invoke(); assert.equal(response.status, 502); assert.equal(((await response.json()) as { kind: string }).kind, 'transport');
+      timeout = true; response = await invoke(); assert.equal(response.status, 504); assert.equal(((await response.json()) as { kind: string }).kind, 'timeout');
+      assert.equal(calls, 2);
+    });
+  } finally { mocked.mock.restore(); }
+});
+
+test('DMN-1: self-only Tailnet fallback is not complete global discovery', async t => {
+  let networkOnline: boolean | null = null;
+  await withMesh(t, url => url.endsWith('/nodes')
+    ? jsonResponse({ nodes: [{ ...fixturePeer, is_self: true, network_online: networkOnline }] })
+    : jsonResponse({ services: [] }), async client => {
+    for (const value of [null, false]) {
+      networkOnline = value;
+      const d = toolData(await client.callTool({ name: 'dreammate_list_services', arguments: { node: 'all' } }));
+      assert.equal(d.partial, true); assert.equal(d.discovery.status, 'partial'); assert.equal(d.total_matched, 0);
+    }
+  });
+});

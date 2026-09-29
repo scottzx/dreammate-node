@@ -17,68 +17,97 @@
 
 ## 2. 核心设计：两阶段渐进式发现（Progressive Discovery）
 
-为杜绝上下文膨胀，大模型侧**永远只暴露 3 个固定元工具（Meta-Tools）**，保持极低且恒定的 Token 占用（约 300 tokens）：
+为杜绝上下文膨胀，大模型侧只暴露一组**稳定的小集合元工具（Meta-Tools）**，保持极低且相对恒定的 Token 占用。原始三条 `list → inspect → invoke` 仍是发现/调用主路径；额外工具覆盖节点发现、技能包分发与部分生命周期，**不会**在启动时把各业务方法的入参 Schema 全量注入上下文。
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                       大模型 / Agent                         │
 └──────────────────────────────┬──────────────────────────────┘
-                               │ 1. 查找能力列表（极低 Token 开销）
+                               │ 0. 可选：先看有哪些节点
                                ▼
-            dreammate_list_capabilities({ keyword })
+            dreammate_list_nodes({ keyword?, online_only? })
+                               │ 1. 查找服务列表（极低 Token 开销）
+                               ▼
+            dreammate_list_services({ keyword })
+            （dreammate_list_capabilities 为向后兼容别名）
                                │ 2. 命中目标服务 (例如: "tingqi-adapter")
                                ▼
-              dreammate_inspect({ service_id, capability })
-                               │ 3. 按需展开具体入参 Schema、使用示例
+              dreammate_inspect({ service_id, method })
+                               │ 3. 按需展开具体入参 Schema、技能指南
                                ▼
-       dreammate_invoke({ service_id, capability, params })
-                               │ 4. 路由并执行
+       dreammate_invoke({ service_id, method, params })
+                               │ 4. 经 :36908 路由，executeService 执行
                                ▼
 ┌─────────────────────────────────────────────────────────────┐
-│        dreammate-node (:36908) -> 本地服务 / 远程网络服务    │
+│   dreammate-node (:36908) -> 本机回环 HTTP / 本地 CLI        │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ### 2.1 元工具（Meta-Tools）契约
 
-#### ① `dreammate_list_capabilities`
-- **功能**：轻量级检索当前节点及网络中已在线的能力列表。
-- **现阶段策略**：不做重量级的向量 Embedding 检索，采用**确定性的关键词与标签过滤**（匹配 `id`、`name`、`capabilities`、`kind`）。
-- **返回结构**（精简卡片，不包含入参 Schema）：
+实现见 `src/mcp.ts` 的 `MCP_TOOLS`。
+
+#### ① `dreammate_list_nodes`
+- **功能**：发现局域网 / Tailnet 中所有已知设备节点（本机与远端 Linux、Windows、Mac、移动设备等），展示在线状态、操作系统与地址。
+- **参数**：`online_only`（默认 true）、`keyword`（模糊匹配节点名称或操作系统）。
+
+#### ② `dreammate_list_services`
+- **功能**：轻量检索本机、指定节点或全网（`node: "all"`）已报备的服务列表与概要（两阶段发现第 1 步）。不包含入参 Schema。
+- **现阶段策略**：不做重量级的向量 Embedding 检索，采用**确定性的关键词与标签过滤**（匹配 `id`、`name`、`kind`、`capabilities`、方法名、技能名）。
+- **别名**：`dreammate_list_capabilities` 为向后兼容别名，推荐使用本工具。
+- **返回结构**（精简卡片，含方法名与技能名，不含入参 Schema）：
   ```json
-  [
-    {
-      "node": "scott-mac",
-      "service_id": "tingqi-adapter",
-      "name": "播客与音频转写服务",
-      "capabilities": ["podcast.latest", "podcast.transcribe"],
-      "status": "up"
-    }
-  ]
+  {
+    "scope": "local",
+    "total_matched": 1,
+    "services": [
+      {
+        "node": "scott-mac",
+        "service_id": "tingqi-adapter",
+        "name": "播客与音频转写服务",
+        "methods": ["podcast.latest", "podcast.transcribe"],
+        "capabilities": ["podcast.latest", "podcast.transcribe"],
+        "execution": "http",
+        "liveness": "up"
+      }
+    ]
+  }
   ```
 
-#### ② `dreammate_inspect`
-- **功能**：当大模型确定需要使用某项能力时，按需请求该能力的具体定义。
+#### ③ `dreammate_inspect`
+- **功能**：按需查看指定服务的方法契约、入参 JSON Schema，或配套业务 SOP / 技能指南（两阶段发现第 2 步）。
+- **参数**：`service_id`（必填）；可选 `method`（`capability` 为别名）、`skill`、`node`。
 - **返回结构**（仅将该方法的入参 Schema 送入当前上下文）：
   ```json
   {
     "service_id": "tingqi-adapter",
-    "capability": "podcast.transcribe",
-    "description": "将本地音频文件转写为字幕文本",
-    "parameters": {
-      "file_path": { "type": "string", "description": "音频绝对路径", "required": true }
+    "method": "podcast.transcribe",
+    "defined": true,
+    "details": {
+      "description": "将本地音频文件转写为字幕文本",
+      "parameters": {
+        "file_path": { "type": "string", "description": "音频绝对路径", "required": true }
+      }
     }
   }
   ```
 
-#### ③ `dreammate_invoke`
+#### ④ `dreammate_invoke`
 - **功能**：通用分布式执行器（Universal RPC Dispatcher）。
-- **参数**：`{ service_id, capability, params, node_id? }`
+- **参数**：`{ service_id, method, params, node? }`（`capability` 为 `method` 的向后兼容别名）。
 - **职责**：
-  - 查询内部注册表，找到目标服务的 `access.base_url`（如 `http://127.0.0.1:7780` 或对端 Tailscale 地址）；
-  - 发送 HTTP 请求并等待响应；
+  - 请求目标节点 `:36908` 的 `POST /services/:id/invoke`；
+  - 本机 `executeService` 按 `execution: cli|http|hybrid` 转发：纯 CLI 走本地命令，纯 HTTP 走回环 `http://127.0.0.1:<port>/invoke`，hybrid 优先 CLI、命令不存在再降级 HTTP；
   - 格式化结果返回给大模型。
   - **天然优势**：无需依赖 MCP 客户端的动态工具热重载（`list_changed`），在所有 MCP 客户端中 100% 稳定兼容。
+
+#### ⑤ `dreammate_download_skill`
+- **功能**：从目标节点下载指定服务的配套技能包（含 `SKILL.md`、脚本与静态资源），可安装到本地技能目录，或以内存预览。
+- **HTTP**：`GET /services/:id/skills/:name/archive`。
+
+#### ⑥ `dreammate_manage_service`
+- **功能**：部分服务的生命周期：`start`（按需拉起常驻 HTTP）、`stop`（优雅停止以释放显存/内存）、`status`。
+- **HTTP**：`POST /services/:id/start|stop`。仅对声明了 `lifecycle.can_spawn` / `can_shutdown` 的服务有效。
 
 ---
 
@@ -120,14 +149,20 @@ await reportAndHoldRegistration({
 - **状态软开关**：服务可通过更新报备将 `metadata.enabled` 设为 `false`，进入维护状态，检索端自动标记不可用。
 - **主动注销**：服务下线时调用 `DELETE /services/:id`，立即从节点清单移除。
 - **被动探活剔除**：若服务异常退出，节点通过 `/health` 探活，连续 5 次失败自动从注册表剔除（EVICT）。
+- **按需启停**：声明了 `lifecycle.start_command` / `stop_endpoint` 的服务，可通过 `POST /services/:id/start|stop` 或 MCP `dreammate_manage_service` 部分启停（例如释放 GPU 显存）。这不替代服务自己的进程管理。
 
 ---
 
 ## 4. 实施阶段规划
 
+> 2026-09-29 个人 Demo 范围决定：上游 API Key 采用执行节点本地配置，DreamMate 层连接管理与细粒度授权暂缓，不作为 Plane MCP 接入前置条件。当前方案与后续需求见 [个人 Demo：凭证配置与授权范围](demo-auth-scope.md)。
+
 ### 阶段 1（当前 MVP 核心路线）
 - [x] **扩展注册表协议**：在 `Registration` 结构中支持 `methods`（包含入参定义）。
-- [x] **实现 MCP 网关子命令**：`dreammate-node mcp`，提供 `dreammate_list_capabilities`、`dreammate_inspect`、`dreammate_invoke` 三个元工具。
+- [x] **实现 MCP 网关子命令**：`dreammate-node mcp`。原始三条 `list → inspect → invoke` 仍是发现/调用主路径（`dreammate_list_services`，`list_capabilities` 为别名）。
+- [x] **节点发现**：`dreammate_list_nodes` / `GET /nodes`。
+- [x] **技能包分发**：`dreammate_download_skill` / `GET /services/:id/skills/:name/archive`。
+- [x] **部分生命周期**：`dreammate_manage_service` / `POST /services/:id/start|stop`。
 - [x] **服务开关与过滤**：支持 `metadata.enabled` 过滤与关键词列表匹配。
 
 ### 阶段 2（零信任双向通信与能力租约 - 详见 [安全架构规范](./security-architecture.md)）

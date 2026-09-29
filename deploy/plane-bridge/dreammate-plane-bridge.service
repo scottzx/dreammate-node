@@ -1,0 +1,21 @@
+[Unit]
+Description=DreamMate bridge to official Plane MCP
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=scott
+Environment=HOME=/home/scott
+Environment=PLANE_APP_URL=http://100.125.201.118:8082
+EnvironmentFile=/home/scott/.config/dreammate/plane.env
+WorkingDirectory=/home/scott/.local/share/dreammate-plane/bridge
+ExecStart=/usr/local/bin/node bridge.mjs
+Restart=always
+RestartSec=10
+KillMode=control-group
+TimeoutStopSec=10
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

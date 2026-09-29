@@ -18,8 +18,8 @@ export const NODE_AGENT_PORT: number = DEFAULT_PORTS['node-agent'];
 export interface AgentOptions {
   port?: number;
   /**
-   * 默认 0.0.0.0：agent 的存在意义就是让别的节点找到这台机器。它本身只暴露
-   * 服务清单（不暴露服务内容），敏感数据仍由各服务自己把关。
+   * 默认 0.0.0.0：agent 的存在意义就是让别的节点找到这台机器并经由它调用。
+   * 服务内容仍由各服务自己把关；agent 只做发现与代理，不承担业务逻辑。
    */
   host?: string;
   registry?: ServiceRegistry;
@@ -236,10 +236,14 @@ async function executeViaHttp(
     }
     return { status: forwardRes.status, data: parsed };
   } catch (err: unknown) {
+    const timedOut = controller.signal.aborted;
     return {
-      status: 502,
+      status: timedOut ? 504 : 502,
       data: {
         error: `failed to reach service at port ${port}: ${err instanceof Error ? err.message : String(err)}`,
+        kind: timedOut ? 'timeout' : 'transport',
+        upstream_status: null,
+        retryable: false,
       },
     };
   } finally {
