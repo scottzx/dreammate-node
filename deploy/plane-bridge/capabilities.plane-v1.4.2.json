@@ -1,0 +1,11 @@
+{
+  "methods": {
+    "plane.page": {
+      "state": "unsupported",
+      "checked_at": "2026-09-29T03:00:28.296956+00:00",
+      "reason": "2026-09-29 已在当前 makeplane/plane-backend:v1.4.2 容器核查：plane.api.urls 未注册 Pages；Django resolve 对 /api/v1/workspaces/yijie/pages/ 和项目级 pages/ 均返回 NO_ROUTE。官方 plane-sdk 0.3.1 使用 /api/v1。网页端 /api/workspaces/.../pages/ 属于独立接口，不能据此认定 API Key 可用。",
+      "fallback": "PRD 保存至 plane.workitem 的 description_html，完成后 retrieve 回读；或在 Plane 网页端维护独立页面。",
+      "deployment": "yijie / makeplane/plane-backend:v1.4.2 / plane-mcp-server 0.3.3 / plane-sdk 0.3.1"
+    }
+  }
+}

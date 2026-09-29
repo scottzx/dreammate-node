@@ -1,27 +1,34 @@
 # @1agents/dreammate-node
 
-> DreamMate Network 的**本机 node agent**：节点身份、服务报备、探活。
-> 固定监听 **36908**。零运行时依赖（除了 L0 协议包）。
+> DreamMate Network 的**本机 node agent**：让设备和软件向智能体公开自己的能力，并提供统一的发现与调用入口。
+> 固定监听 **36908**。运行时依赖 L0 协议包与 MCP SDK。
 
-一台机器跑一个。它是这台机器对网络的唯一入口——外部节点探这一个端口，
-就能知道这台机器上有什么：
+一台机器跑一个。它是这台机器对网络的唯一入口，负责**登记、发现、执行**——
+外部节点探这一个端口，就能知道这台机器上有什么，并经由它发起调用。
+它不承担业务流程：什么时候处理新录音、如何判断客户、如何生成跟进事项，仍需要业务流程或智能体承担。
 
 ```
-        Control Plane / 任意节点
+        Control Plane / 任意节点 / 智能体
                   │  探 36908（每台机器只探一个端口）
                   ▼
         node-agent :36908
-         ├─ GET  /manifest      本机聚合视图：节点身份 + 所有已报备的服务
+         ├─ GET  /manifest                      本机聚合视图：节点身份 + 已报备服务
          ├─ GET  /health
-         ├─ GET  /services      各服务的存活与可达性
-         ├─ POST /services      服务报备（**仅接受 localhost**）
-         └─ DELETE /services/:id
+         ├─ GET  /nodes                         本 tailnet 内的设备节点
+         ├─ GET  /services                      各服务的存活与可达性
+         ├─ POST /services                      服务报备（**仅接受 localhost**）
+         ├─ DELETE /services/:id
+         ├─ POST /services/:id/invoke           统一调用（转发到本机 HTTP 或 CLI）
+         ├─ POST /capabilities/:name/invoke
+         ├─ POST /services/:id/start|stop       部分服务的启停
+         └─ GET  /services/:id/skills/:name/archive
                   ▲
       ┌───────────┴───────────┐  localhost 报备
  session-reader :7777    task-service :xxxx
 ```
 
-这把 pull 探测的成本从「N 个节点 × M 个端口」降到「N × 1」。
+这把 pull 探测的成本从「N 个节点 × M 个端口」降到「N × 1」，
+并把「找到能力」和「执行调用」收成同一个入口。
 
 ## 跑起来
 
@@ -71,9 +78,27 @@ await reportAndHoldRegistration({
 了它照样报在线。所以 agent 必须自己定期探各服务的 `/health`，连续失败 5 次
 才移除——抖一下不该被清掉。
 
-**agent 不做代理。** `reachability: 'localhost'` 的服务，manifest 里如实写
-`http://127.0.0.1:<port>`，让调用方一眼看出连不上，而不是给一个看着能连、
-连上却超时的地址。要对外服务就自己监听 `0.0.0.0`。
+**reachability 不是「能不能被调用」。** `localhost` 表示服务只监听回环，远端调用方**不能直接**连那个端口；`network` 表示服务可被直连。manifest 仍然如实报告可达性，避免给一个看着能连、连上却超时的地址。
+
+但 node agent **会做代理**：跨节点调用走 `:36908` 的 `POST /services/:id/invoke`（或 MCP `dreammate_invoke`），再转发到本机回环 HTTP 或本地 CLI（`execution: cli|http|hybrid`）。因此 `reachability: localhost` 的服务仍然可以被远端智能体使用——只是不能绕过 agent 直连那个端口。
+
+## 智能体怎么发现和调用
+
+智能体不需要直连各服务端口。本机跑 `dreammate-node mcp` 后，暴露一组**稳定的元工具**：先 list，再 inspect，再 invoke；方法契约与技能指南按需展开，避免上下文溢出。
+
+| 工具 | 作用 |
+|------|------|
+| `dreammate_list_nodes` | 发现 Tailnet / 局域网中的设备节点 |
+| `dreammate_list_services` | 轻量检索本机、指定节点或全网（`node: "all"`）已报备服务 |
+| `dreammate_list_capabilities` | `list_services` 的向后兼容别名 |
+| `dreammate_inspect` | 按需查看方法契约、入参 Schema 或配套技能指南 |
+| `dreammate_invoke` | 经本机或对端 `:36908` 代理执行（HTTP 或本地 CLI） |
+| `dreammate_download_skill` | 下载并安装/预览服务配套技能包 |
+| `dreammate_manage_service` | 部分服务的生命周期：`start` / `stop` / `status` |
+
+HTTP 侧对应 `GET /nodes`、`POST /services/:id/invoke`、`POST /capabilities/:name/invoke`、`GET /services/:id/skills/:name/archive`、`POST /services/:id/start|stop`。
+
+渐进式发现的设计说明见 [docs/architecture-mcp-mesh.md](docs/architecture-mcp-mesh.md)。
 
 ## 为什么报备只认回环（与安全模型）
 
@@ -116,3 +141,13 @@ node 注册与探活是从 Control Plane 里**领出来**的——原本设想�
 任何一个服务挂掉也不会让整个控制面消失。
 
 协议定义见 [`@1agents/dreammate-network`](https://github.com/scottzx/dreammate-network)（L0）。
+
+### 发现与调用的诊断字段
+
+- 节点名按本机 `/nodes` 清单解析，优先使用已登记的 Tailscale IP；本机、显式 IP 和带端口的 URL 保持可用。所有 MCP 路由共用解析逻辑，写请求不因网络错误自动重放。
+- `dreammate_list_services(node="all")` 返回 `scans`（每个节点的地址、状态、时间与 HTTP/连接错误）、`discovery` 和 `partial`。部分节点失败时仍返回成功结果；全部扫描失败会设置 `isError:true`，不能把零匹配解释为全网无服务。节点清单读取失败时，本机降级会显式标注。
+- `dreammate_list_nodes` 保留旧 `online` 字段，增加 `network_online`、`network_checked_at`、`gateway_reachable` 与 `gateway_checked_at`。网关探测针对 `/health`，不代表业务服务可用。旧节点没有可靠网络检查时间时返回 null。
+- 服务摘要、inspect 和生命周期 status 返回 `service_health`，包含最后探测时间、探测范围；未探测为 unknown，`methods_verified:false`。方法 inspect 的 `declared`/旧 `defined` 仅指契约声明，`availability` 表示部署证据和调用观测，不能混用。
+- `dreammate_invoke` 原样保留有效 MCP 结果的内容块、结构化数据和错误状态；普通业务 JSON 作为结构化结果返回。HTTP 200 仍可能包含 `isError:true`，调用方必须检查它。HTTP 转发超时返回 504，传输失败返回 502，均不自动重试写操作。
+
+Plane 的错误分类、方法观测和当前部署的 Pages 限制见 [bridge 说明](deploy/plane-bridge/README.md)。`npm test` 同时执行 Node 与 Plane bridge 回归测试。

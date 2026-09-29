@@ -53,6 +53,9 @@ export interface NetworkNode {
   name: string;
   type: string;
   online: boolean;
+  /** Explicit network presence; null means Tailscale status could not be read. */
+  network_online?: boolean | null;
+  network_checked_at?: string;
   is_self: boolean;
   dnsName?: string;
   ipv4?: string;
@@ -220,6 +223,9 @@ export async function listNetworkNodes(options: { timeoutMs?: number; force?: bo
   ];
 
   const status = await readStatus(options.timeoutMs ?? 2_000);
+  const checkedAt = new Date().toISOString();
+  nodes[0]!.network_online = status ? status.BackendState === 'Running' && status.Self?.Online !== false : null;
+  nodes[0]!.network_checked_at = checkedAt;
   if (!status || status.BackendState !== 'Running' || !status.Peer) {
     return nodes;
   }
@@ -234,6 +240,8 @@ export async function listNetworkNodes(options: { timeoutMs?: number; force?: bo
       name,
       type: nodeTypeOf(peer.OS ?? ''),
       online: Boolean(peer.Online),
+      network_online: Boolean(peer.Online),
+      network_checked_at: checkedAt,
       is_self: false,
       dnsName,
       ipv4,
