@@ -4,6 +4,7 @@ from pathlib import Path
 import socket
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -90,6 +91,20 @@ class AdapterTest(unittest.TestCase):
         self.assertTrue(responded, "health must not wait for an in-flight CPU encode")
         self.assertEqual(providers[0]["model"], "qwen3")
         self.assertTrue(providers[0]["ready"])
+
+    def test_cpu_inference_uses_one_document_per_batch_unless_explicitly_overridden(self):
+        snapshot = Path(self.directory.name) / "qwen3"
+        snapshot.mkdir()
+        (snapshot / "config.json").write_text("{}")
+        self.fake.tokenizer = SimpleNamespace()
+        for requested, expected in ((None, 1), (2, 2)):
+            with self.subTest(batch_size=requested), mock.patch.dict("sys.modules", {
+                "torch": SimpleNamespace(float32="fp32"),
+                "sentence_transformers": SimpleNamespace(SentenceTransformer=lambda *_args, **_kwargs: self.fake),
+            }):
+                encoder = Encoder(self.manifest_path, "cpu", requested, 512)
+                encoder.encode("qwen3", ["first", "second"], "document")
+                self.assertEqual(self.fake.options["batch_size"], expected)
 
     def test_failed_initial_encoding_never_advertises_readiness(self):
         self.use_fake()

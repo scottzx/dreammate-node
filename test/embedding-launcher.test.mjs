@@ -39,7 +39,8 @@ test('launcher rejects nonloopback agents and invalid flags before creating a ch
   assert.equal(localAgentUrl('http://localhost:36908'), 'http://127.0.0.1:36908');
   assert.equal(localAgentUrl('http://[::1]:36908'), 'http://[::1]:36908');
   for (const args of [['--model', 'cloud'], ['--model', 'embeddinggemma2'], ['--port', '0'], ['--port', '65536'], ['--port', '1e3'],
-    ['--priority', '1.2'], ['--python', ' '], ['--manifest', ''], ['--unknown']]) assert.throws(() => parseOptions(args));
+    ['--priority', '1.2'], ['--batch-size', '0'], ['--batch-size', '65'], ['--batch-size', '1.5'],
+    ['--python', ' '], ['--manifest', ''], ['--unknown']]) assert.throws(() => parseOptions(args));
 });
 
 test('ready descriptor must come from the owned child and retain encoding compatibility fields', () => {
@@ -80,12 +81,12 @@ test('priority and descriptor boundaries remain discoverable without silently ch
 test('launcher warms one offline child, advertises only readiness, refreshes and withdraws once', async () => {
   const child = new FakeChild(), requests = [], logs = [], scheduled = [], canceled = [];
   let warmed = false, agentOffline = true;
-  const options = parseOptions(['--model', 'qwen3', '--port', '8777', '--priority', '2']);
+  const options = parseOptions(['--model', 'qwen3', '--port', '8777', '--priority', '2', '--batch-size', '1']);
   const provider = launchProvider(options, {
     spawn(command, args, spawnOptions) {
       assert.equal(command, options.python);
       assert.deepEqual(args.slice(1), ['--manifest', options.manifest, '--host', '127.0.0.1',
-        '--port', '8777', '--serve-model', 'qwen3', '--warmup', 'qwen3']);
+        '--port', '8777', '--serve-model', 'qwen3', '--warmup', 'qwen3', '--batch-size', '1']);
       assert.equal(spawnOptions.shell, false);
       assert.equal(spawnOptions.cwd, REPO_ROOT);
       return child;

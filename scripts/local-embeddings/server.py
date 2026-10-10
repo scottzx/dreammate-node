@@ -38,7 +38,7 @@ socket.getaddrinfo = deny_outbound
 
 
 class Encoder:
-    def __init__(self, manifest: Path, device: str, batch_size: int, max_length: int,
+    def __init__(self, manifest: Path, device: str, batch_size: int | None, max_length: int,
                  serve_model: str | None = None):
         self.manifest = json.loads(manifest.read_text())
         prepared = self.manifest["models"]
@@ -50,6 +50,7 @@ class Encoder:
         self.serve_model = serve_model
         self.device = device
         self.batch_size = batch_size
+        self.effective_batch_size = batch_size or 1
         self.max_length = max_length
         self.lock = threading.Lock()
         self.current = None
@@ -81,6 +82,7 @@ class Encoder:
         device = self.device
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+        self.effective_batch_size = self.batch_size or (1 if device == "cpu" else 8)
         kwargs = {"device": device, "local_files_only": True,
                   "trust_remote_code": False, "model_kwargs": {"torch_dtype": torch.float32}}
         self.encoder = SentenceTransformer(str(model_path), **kwargs)
@@ -136,7 +138,7 @@ class Encoder:
         # Explicit prefixes avoid dependency on changing default prompts.
         prefix = "Instruct: Given a user task, retrieve relevant tool descriptions that can accomplish the task\nQuery: "
         inputs = [prefix + text for text in texts] if input_type == "query" else texts
-        vectors = self.encoder.encode(inputs, prompt="", batch_size=self.batch_size,
+        vectors = self.encoder.encode(inputs, prompt="", batch_size=self.effective_batch_size,
                                       normalize_embeddings=True, show_progress_bar=False,
                                       convert_to_numpy=True)
         return self.validate_vectors(model_version, vectors.tolist(), len(texts))
@@ -190,14 +192,14 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8766)
     parser.add_argument("--device", choices=("auto", "cpu", "mps", "cuda"), default="auto")
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, help="Inference batch size (default CPU: 1, GPU: 8)")
     parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument("--warmup", choices=("qwen3",), help="Load the chosen model before accepting HTTP")
     parser.add_argument("--serve-model", choices=("qwen3",),
                         help="Serve only this alias, default requests to it and warm it before HTTP")
     parser.add_argument("--self-test", action="store_true", help="Encode one pair per model without starting HTTP")
     args = parser.parse_args()
-    if not 1 <= args.batch_size <= 64 or not 64 <= args.max_length <= 8192 or not 1 <= args.port <= 65535:
+    if (args.batch_size is not None and not 1 <= args.batch_size <= 64) or not 64 <= args.max_length <= 8192 or not 1 <= args.port <= 65535:
         parser.error("Invalid batch-size, max-length or port")
     if args.serve_model and args.warmup and args.warmup != args.serve_model:
         parser.error("--serve-model and --warmup must select the same alias")
@@ -246,6 +248,7 @@ def main():
                 return self.send_json(404, {"error": "Not found"})
             self.send_json(200, {"status": "ok", "models": list(encoder.models),
                                  "loaded_model": encoder.current, "pid": os.getpid(),
+                                 "batch_size": encoder.effective_batch_size,
                                  "embedding_provider": encoder.embedding_provider(),
                                  "outbound_network": "blocked"})
 

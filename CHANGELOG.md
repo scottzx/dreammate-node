@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.2 — 2026-10-10
+
+- Default CPU document inference to one item per batch and expose `--batch-size` on the model launcher to bound indexing allocations on devices with limited memory.
+
 ## 0.9.1 — 2026-10-10
 
 - Keep offline model health responses available during CPU encoding so registration refreshes and agent probes do not misclassify a busy provider as down.

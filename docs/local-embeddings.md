@@ -32,6 +32,8 @@ node scripts/local-embeddings/serve.mjs --model qwen3 --port 8766 --agent http:/
 
 可用 `--priority N` 设置选择优先级，默认 0；自动发现接受 -1000–1000。`--python PATH` 和 `--manifest PATH` 可指定已有运行环境与权重清单。启动器只运行现成依赖和权重，不安装系统服务、不自动下载，也不部署到其他设备。
 
+CPU 默认逐条编码文档，GPU 默认批量 8 条；可用启动器的 `--batch-size 1..64` 显式设置。客户端每次提交的 16 张卡片仍会在适配器内部拆分，不能把请求条数当作实际推理批量。内存有限的 CPU 节点先用 `--batch-size 1` 建立缓存，再验证默认预算下的热查询；`/health` 会报告实际 `batch_size`。
+
 Python 进程在导入模型库前设置 `HF_HUB_OFFLINE=1`、`TRANSFORMERS_OFFLINE=1` 并关闭遥测，加载时强制 `local_files_only=True` 与 `trust_remote_code=False`，禁止主动 socket 连接和 DNS 查询。Node 启动器只向本机 loopback 检查健康、登记与注销；远端请求通过 node-agent 接入，无需开放模型端口。默认日志不记录请求文本。
 
 `GET /health` 的 HTTP 成功只证明适配器响应；自动登记要求 `embedding_provider.ready: true`，且包含模型别名、精确 revision、维度和编码配置指纹。`loaded_model: null` 不能证明模型已就绪。直接运行 Python 服务适合诊断，不会代为注册：

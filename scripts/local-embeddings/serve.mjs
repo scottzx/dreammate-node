@@ -30,6 +30,7 @@ export function parseOptions(argv, cwd = process.cwd()) {
     model: { type: 'string', default: 'qwen3' }, port: { type: 'string', default: '8766' },
     agent: { type: 'string', default: 'http://127.0.0.1:36908' },
     priority: { type: 'string', default: '0' }, python: { type: 'string' }, manifest: { type: 'string' },
+    'batch-size': { type: 'string' },
   } });
   if (!MODELS.has(values.model)) throw new Error('--model must be qwen3');
   const port = Number(values.port), priority = Number(values.priority);
@@ -41,9 +42,14 @@ export function parseOptions(argv, cwd = process.cwd()) {
   }
   if (values.python !== undefined && !values.python.trim()) throw new Error('--python cannot be empty');
   if (values.manifest !== undefined && !values.manifest.trim()) throw new Error('--manifest cannot be empty');
+  const batchSize = values['batch-size'] === undefined ? undefined : Number(values['batch-size']);
+  if (batchSize !== undefined && (!/^\d+$/.test(values['batch-size']) || !Number.isSafeInteger(batchSize) || batchSize < 1 || batchSize > 64)) {
+    throw new Error('--batch-size must be an integer from 1 to 64');
+  }
   return { model: values.model, port, priority, agent: localAgentUrl(values.agent),
     python: values.python ?? path.join(REPO_ROOT, '.local/tool-search/venv/bin/python'),
-    manifest: values.manifest ? path.resolve(cwd, values.manifest) : path.join(REPO_ROOT, '.local/tool-search/manifest.json') };
+    manifest: values.manifest ? path.resolve(cwd, values.manifest) : path.join(REPO_ROOT, '.local/tool-search/manifest.json'),
+    ...(batchSize === undefined ? {} : { batchSize }) };
 }
 
 /** Direct HTTP(S): ignores all proxy variables and never follows redirects. */
@@ -106,7 +112,8 @@ export function registrationPayload(options, provider) {
 export function launchProvider(options, deps = {}) {
   const agent = localAgentUrl(options.agent);
   if (!MODELS.has(options.model) || !Number.isSafeInteger(options.port) || options.port < 1 || options.port > 65535
-    || !Number.isSafeInteger(options.priority) || options.priority < -1000 || options.priority > 1000) {
+    || !Number.isSafeInteger(options.priority) || options.priority < -1000 || options.priority > 1000
+    || (options.batchSize !== undefined && (!Number.isSafeInteger(options.batchSize) || options.batchSize < 1 || options.batchSize > 64))) {
     throw new Error('Invalid provider options');
   }
   const spawnChild = deps.spawn ?? spawn, send = deps.requestJson ?? requestJson;
@@ -114,7 +121,8 @@ export function launchProvider(options, deps = {}) {
   const sleep = deps.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
   const now = deps.now ?? Date.now, log = deps.log ?? (message => process.stderr.write(`${message}\n`));
   const child = spawnChild(options.python, [SERVER_PATH, '--manifest', options.manifest, '--host', '127.0.0.1',
-    '--port', String(options.port), '--serve-model', options.model, '--warmup', options.model],
+    '--port', String(options.port), '--serve-model', options.model, '--warmup', options.model,
+    ...(options.batchSize === undefined ? [] : ['--batch-size', String(options.batchSize)])],
   { cwd: REPO_ROOT, stdio: ['ignore', 'inherit', 'inherit'], shell: false });
   const healthUrl = `http://127.0.0.1:${options.port}/health`;
   let stopped = false, childExited = false, childFailure, registrationAttempted = false;
