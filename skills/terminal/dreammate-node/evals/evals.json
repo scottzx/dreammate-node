@@ -1,0 +1,27 @@
+{
+  "skill_name": "dreammate-node",
+  "evals": [
+    {
+      "id": 3,
+      "prompt": "我用 Mac 终端，只想调用 http://100.64.0.8:36908 上的服务，不需要本机接收请求。已经 npm 安装 dreammate-node。下一步怎么找到笔记服务并查看参数？本轮只生成可执行命令，不实际运行，也不要假定服务 ID。",
+      "expected_output": "使用一次性 CLI 指定远端入口，发现真实 ID 后 inspect，不把 npm 安装当成服务已启动，也不强迫 install。",
+      "files": [],
+      "assertions": [
+        "给出 dreammate-node cli services，显式指定 http://100.64.0.8:36908。",
+        "发现真实服务 ID 后使用 cli inspect 查询契约，不编造 ID。",
+        "远程客户端任务不要求安装本机守护进程。"
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "我希望这台 Mac 把本机 HTTP 服务提供给其他设备，服务还没报备。我已经 npm 安装了 dreammate-node。请说明先检查什么、怎样安装和验证本机网关、由哪里报备，以及未来如何接入 MCP。本轮只制定步骤，不启动或写入真实环境。",
+      "expected_output": "先 status，再按已授权 install 和验证；本机 loopback 报备；MCP 是连接现有网关的 stdio 适配，不自动启动 HTTP 网关。",
+      "files": [],
+      "assertions": [
+        "先 dreammate-node status，再按需求 install，并再次 status 验证。",
+        "报备从网关所在 Mac 通过 loopback POST /services 完成，禁止远端报备。",
+        "说明 MCP stdio 适配连接既有网关，npm 安装与 MCP 命令均不能证明 HTTP 网关已运行。"
+      ]
+    }
+  ]
+}

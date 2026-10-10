@@ -3,7 +3,8 @@
  *
  * 采用「两阶段渐进式发现（Progressive Discovery）」与全网分布式节点拓扑架构：
  * 1. dreammate_list_nodes: 列出局域网/Tailnet 内所有在线设备节点（设备级发现）；
- * 2. dreammate_list_services: 轻量检索本机或指定远端节点上的服务与能力概况（推荐）；
+ * 2. dreammate_search_tools: 按用户意图检索少量具体方法摘要（推荐）；
+ *    dreammate_list_services: 有界分页浏览本机或远端节点上的服务概况；
  *    dreammate_list_capabilities 为其向后兼容别名；
  * 3. dreammate_inspect: 按需获取目标节点上特定服务的方法契约与参数 Schema；
  * 4. dreammate_invoke: 通用分布式执行器，透明跨节点路由并执行服务；
@@ -18,14 +19,25 @@ import {
   CallToolResultSchema,
   ListToolsRequestSchema,
   type Tool,
+  type CallToolResult,
 } from '@modelcontextprotocol/sdk/types.js';
 import { DEFAULT_PORTS } from '@1agents/dreammate-network';
 import type { RegisteredService } from './registry.js';
 import type { NetworkNode } from './identity.js';
+import { directoryNodeUrl, findDirectoryNode, type NodeDirectory } from './node-directory.js';
 import { installSkillPackage, listSkillArchive } from './skills.js';
+import { withRequestTimeout } from './request-timeout.js';
+import { pageResponse, parsePageOptions, searchTools } from './tool-search.js';
+import { discoverEmbeddingProviders } from './embedding-providers.js';
 
 export interface McpOptions {
   agentUrl?: string;
+  /** Explicitly imported address snapshot. No live topology queries in this mode. */
+  nodeDirectory?: NodeDirectory;
+  /** Optional local embedding endpoint, shared by all method searches. */
+  embeddingUrl?: string;
+  embeddingModel?: string;
+  embeddingTimeoutMs?: number;
 }
 
 const DEFAULT_AGENT_URL = `http://127.0.0.1:${DEFAULT_PORTS['node-agent']}`;
@@ -35,12 +47,17 @@ function nodeBaseUrl(localAgentUrl: string, node: NetworkNode): string {
 }
 
 /** Resolve before sending a request. Never replay a mutation after a network error. */
-async function resolveNodeBaseUrl(localAgentUrl: string, node?: string): Promise<string> {
+async function resolveNodeBaseUrl(localAgentUrl: string, node?: string, directory?: NodeDirectory): Promise<string> {
   if (!node || node === 'localhost' || node === '127.0.0.1') return localAgentUrl;
   if (/^https?:\/\//.test(node)) return node.replace(/\/+$/, '');
+  const cached = directory ? findDirectoryNode(directory, node) : undefined;
+  if (cached) return directoryNodeUrl(cached);
   if (isIP(node)) return `http://${isIP(node) === 6 ? `[${node}]` : node}:${DEFAULT_PORTS['node-agent']}`;
   // Preserve an explicitly supplied host:port.
   if (node.includes(':')) return `http://${node}`;
+  if (directory) {
+    throw new Error(`节点不在导入的地址簿中: ${node}；请重新导入、指定完整 URL 或使用 --live`);
+  }
   const wanted = node.toLowerCase().replace(/\.$/, '');
   let nodes: NetworkNode[] = [];
   try {
@@ -66,7 +83,7 @@ function serviceHealth(service: RegisteredService) {
 }
 
 function jsonResult(data: Record<string, unknown>, isError = false) {
-  return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
+  return { content: [{ type: 'text' as const, text: JSON.stringify(data) }],
     structuredContent: data, ...(isError ? { isError: true } : {}) };
 }
 
@@ -86,18 +103,21 @@ interface NodeScan {
 
 async function scanServices(url: string, node: string) {
   const scan: NodeScan = { node, url, status: 'ok', checked_at: new Date().toISOString() };
-  let services: (RegisteredService & { node: string })[] = [];
+  let services: (RegisteredService & { node: string; gateway_url: string })[] = [];
   try {
-    const res = await fetch(`${url}/services`, { signal: AbortSignal.timeout(3000) });
+    const res = await withRequestTimeout(async signal => {
+      const response = await fetch(`${url}/services`, { signal });
+      const data = response.ok ? await response.json() : await response.body?.cancel();
+      return { status: response.status, ok: response.ok, data };
+    }, 3000);
     scan.http_status = res.status;
     if (!res.ok) {
       scan.status = 'http_error';
-      await res.body?.cancel();
     } else {
-      const data = await res.json() as { node?: string; services: RegisteredService[] };
-      if (!Array.isArray(data.services) || data.services.some(s => !s || typeof s.id !== 'string')) {
+      const data = res.data as { node?: string; services: RegisteredService[] } | null;
+      if (!data || !Array.isArray(data.services) || data.services.some(s => !s || typeof s.id !== 'string')) {
         scan.status = 'invalid_response';
-      } else services = data.services.map(s => ({ ...s, node: data.node ?? node }));
+      } else services = data.services.map(s => ({ ...s, node: data.node ?? node, gateway_url: url }));
     }
   } catch (error) {
     scan.status = timedOut(error) ? 'timeout' : error instanceof SyntaxError ? 'invalid_response' : 'unreachable';
@@ -142,7 +162,107 @@ function extractSkillsMap(service: RegisteredService): Record<string, unknown> {
   return result;
 }
 
+/** Shared discovery preserves failed scans even when a search has no matches. */
+async function discoverServices(agentUrl: string, node: string | undefined, options: McpOptions) {
+  let discovery: { status: string; error?: string; exported_at?: string; scope?: string } = { status: 'ok' };
+  let targets: { url: string; name: string }[];
+  if (node === 'all' && options.nodeDirectory) {
+    discovery = { status: 'cached', exported_at: options.nodeDirectory.exported_at, scope: 'imported_nodes_only' };
+    targets = options.nodeDirectory.nodes.map(n => ({ url: directoryNodeUrl(n), name: n.name }));
+  } else if (node === 'all') {
+    try {
+      const response = await fetch(`${agentUrl}/nodes`, { signal: AbortSignal.timeout(3000) });
+      if (!response.ok) { await response.body?.cancel(); throw new Error(`HTTP ${response.status}`); }
+      const data = await response.json() as { nodes: NetworkNode[] };
+      if (!Array.isArray(data.nodes) || data.nodes.length === 0) throw new Error('Invalid or empty node topology');
+      const self = data.nodes.find(n => n.is_self);
+      if (self && self.network_online !== undefined && self.network_online !== true) {
+        discovery = { status: 'partial', error: 'Tailnet 状态不可用，节点清单可能仅包含本机' };
+      }
+      targets = data.nodes.filter(n => n.online || n.is_self).map(n => ({ url: nodeBaseUrl(agentUrl, n), name: n.name }));
+    } catch (error) {
+      discovery = { status: 'failed', error: `节点发现失败，仅扫描本机: ${error instanceof Error ? error.message : String(error)}` };
+      targets = [{ url: agentUrl, name: 'local' }];
+    }
+  } else targets = [{ url: await resolveNodeBaseUrl(agentUrl, node, options.nodeDirectory), name: node || 'local' }];
+  const batches = await Promise.all(targets.map(t => scanServices(t.url, t.name)));
+  const scans = batches.map(b => b.scan);
+  return {
+    services: batches.flatMap(b => b.services),
+    evidence: {
+      scope: node || 'local',
+      partial: discovery.status !== 'ok' || scans.length === 0 || scans.some(s => s.status !== 'ok'),
+      discovery,
+      scans,
+    },
+    allFailed: scans.length === 0 || scans.every(s => s.status !== 'ok'),
+  };
+}
+
+const PAGE_PROPERTIES = {
+  limit: { type: 'integer', minimum: 1, maximum: 20, description: '每页最多返回条数（浏览默认 10，上限 20）' },
+  offset: { type: 'integer', minimum: 0, description: '分页起始位置（默认 0）；优先细化查询，需要更多候选时使用 next_offset' },
+  max_chars: { type: 'integer', minimum: 1000, maximum: 12000, description: '返回摘要的字符预算（默认 6000，上限 12000）' },
+};
+
+function shortText(value: unknown, max = 240): string {
+  const text = typeof value === 'string' ? value : '';
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+function methodNames(service: RegisteredService) {
+  return [...new Set([...Object.keys(service.methods ?? {}), ...(service.capabilities ?? [])])];
+}
+
+function boundedEvidence(evidence: Awaited<ReturnType<typeof discoverServices>>['evidence'], args: Record<string, unknown>) {
+  const { maxChars } = parsePageOptions(args);
+  const scanLimit = Math.min(4, Math.max(1, Math.floor(maxChars / 2000)));
+  const scans = evidence.scans.length > scanLimit
+    ? [...evidence.scans.filter(s => s.status !== 'ok'), ...evidence.scans.filter(s => s.status === 'ok')].slice(0, scanLimit)
+    : evidence.scans;
+  const result = {
+    scope: shortText(evidence.scope, 40), partial: evidence.partial,
+    discovery: { ...evidence.discovery, ...(evidence.discovery.error ? { error: shortText(evidence.discovery.error, 80) } : {}) },
+    scan_count: evidence.scans.length,
+    scans_omitted: evidence.scans.length - scans.length,
+    scan_status_counts: Object.fromEntries([...new Set(evidence.scans.map(s => s.status))]
+      .map(status => [status, evidence.scans.filter(s => s.status === status).length])),
+    scans: scans.map(s => ({ node: shortText(s.node, 40), url: shortText(s.url, 160),
+      status: s.status, checked_at: s.checked_at,
+      ...(s.http_status ? { http_status: s.http_status } : {}),
+      ...(s.error ? { error: shortText(s.error, 60) } : {}),
+      ...(s.error_code ? { error_code: shortText(s.error_code, 40) } : {}),
+    })),
+  };
+  // Reserve most of even the smallest budget for method/service results and paging metadata.
+  const evidenceBudget = Math.min(1000, Math.max(500, maxChars - 500));
+  while (result.scans.length > 1 && JSON.stringify(result, null, 2).length > evidenceBudget) {
+    result.scans.pop();
+    result.scans_omitted++;
+  }
+  return result;
+}
+
 export const MCP_TOOLS: Tool[] = [
+  {
+    name: 'dreammate_search_tools',
+    description:
+      '首选工具发现入口：默认跨节点搜索具体方法，最多返回 15 条相关方法摘要，并遵守字符预算；相关性允许时优先覆盖 2–3 个工具集。支持本地语义检索，未配置或不可用时降级为有界词法检索。先搜索，再对选中的方法 dreammate_inspect 获取 Schema；低匹配时细化 query 或分页。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', minLength: 1, maxLength: 2000, description: '要完成的具体任务或工具名称；应描述动作和对象，不能为空' },
+        node: { type: 'string', default: 'all', description: '默认 all：扫描全网已发现节点（导入目录模式扫描目录中的全部节点）；指定 localhost 只查本机，也可指定节点名/IP/URL' },
+        kind: { type: 'string', description: '可选服务类型过滤' },
+        service_id: { type: 'string', description: '可选：仅搜索指定服务的方法' },
+        include_disabled: { type: 'boolean', description: '是否包含禁用服务（默认 false）' },
+        ...PAGE_PROPERTIES,
+        limit: { ...PAGE_PROPERTIES.limit, default: 15, description: '每页最多返回条数（默认 15，上限 20）；字符预算不足时可能更少' },
+        max_chars: { ...PAGE_PROPERTIES.max_chars, default: 12000, description: '搜索摘要的字符预算（默认及上限 12000）；可调小以节省上下文，返回条数可能相应减少' },
+      },
+      required: ['query'],
+    },
+  },
   {
     name: 'dreammate_list_nodes',
     description:
@@ -164,7 +284,7 @@ export const MCP_TOOLS: Tool[] = [
   {
     name: 'dreammate_list_services',
     description:
-      '轻量检索指定节点（或本机、或全网 "all"）中已报备的服务列表与概要（两阶段发现第 1 步）。不包含庞大的入参 Schema，避免上下文溢出。支持关键词模糊匹配。',
+      '分页浏览已注册服务的短摘要；寻找具体任务的方法时优先使用 dreammate_search_tools。默认最多 10 个服务，每个服务最多 6 项方法名；支持描述关键词，不返回入参 Schema。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -174,7 +294,7 @@ export const MCP_TOOLS: Tool[] = [
         },
         keyword: {
           type: 'string',
-          description: '可选关键词（模糊匹配服务 ID、名称、分类、方法契约或技能名称）',
+          description: '可选关键词（匹配服务 ID、名称、分类、方法名称和描述、技能名称和描述）',
         },
         kind: {
           type: 'string',
@@ -184,13 +304,14 @@ export const MCP_TOOLS: Tool[] = [
           type: 'boolean',
           description: '是否包含已被软禁用的服务（默认 false）',
         },
+        ...PAGE_PROPERTIES,
       },
     },
   },
   {
     name: 'dreammate_list_capabilities',
     description:
-      '(向后兼容别名，推荐使用 dreammate_list_services) 轻量检索指定节点中已报备的服务与能力概要。',
+      'dreammate_list_services 的分页浏览兼容别名。寻找具体任务的方法时优先使用 dreammate_search_tools。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -210,13 +331,14 @@ export const MCP_TOOLS: Tool[] = [
           type: 'boolean',
           description: '是否包含已禁用服务',
         },
+        ...PAGE_PROPERTIES,
       },
     },
   },
   {
     name: 'dreammate_inspect',
     description:
-      '按需查看指定服务的方法契约、详细描述与入参 JSON Schema，或查看其附带的业务 SOP / 技能指南（两阶段发现第 2 步）。在准备调用具体工具前使用。',
+      '搜索选定方法后，指定 service_id 和 method 获取该方法完整 Schema；省略 method 仅返回分页方法描述目录（默认 10 项），不会展开整个服务的参数。也可指定 skill 查看业务 SOP。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -240,6 +362,7 @@ export const MCP_TOOLS: Tool[] = [
           type: 'string',
           description: '可选（向后兼容别名，同 method）：指定要查询的方法名',
         },
+        ...PAGE_PROPERTIES,
       },
       required: ['service_id'],
     },
@@ -333,12 +456,10 @@ export const MCP_TOOLS: Tool[] = [
 ];
 
 export function createMcpServer(options: McpOptions = {}): Server {
-  const agentUrl = (options.agentUrl ?? DEFAULT_AGENT_URL).replace(/\/+$/, '');
-
   const server = new Server(
     {
       name: 'dreammate-mcp',
-      version: '0.7.2',
+      version: '0.8.1',
     },
     {
       capabilities: {
@@ -351,13 +472,38 @@ export function createMcpServer(options: McpOptions = {}): Server {
     return { tools: MCP_TOOLS };
   });
 
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const { name, arguments: args = {} } = request.params;
+  server.setRequestHandler(CallToolRequestSchema, async (request) =>
+    callDreammateTool(request.params.name, request.params.arguments ?? {}, options),
+  );
+
+  return server;
+}
+
+/** One request, no listener, registration, identity file or background probe. */
+export async function callDreammateTool(
+  name: string,
+  args: Record<string, unknown> = {},
+  options: McpOptions = {},
+): Promise<CallToolResult> {
+  const agentUrl = (options.agentUrl ?? DEFAULT_AGENT_URL).replace(/\/+$/, '');
 
     try {
       if (name === 'dreammate_list_nodes') {
         const onlineOnly = args.online_only !== false;
         const keyword = (args.keyword as string | undefined)?.toLowerCase().trim();
+
+        if (options.nodeDirectory) {
+          const directory = options.nodeDirectory;
+          const nodes = directory.nodes.filter(n => !keyword || [n.node_id, n.name, n.type]
+            .some(v => v.toLowerCase().includes(keyword))).map(n => ({
+              ...n, gateway_url: n.agent_url, online: null, network_online: null,
+              network_checked_at: null, gateway_reachable: null, gateway_checked_at: null,
+              service_health: 'unknown',
+            }));
+          return jsonResult({ source: 'imported', exported_at: directory.exported_at,
+            imported_at: directory.imported_at ?? null, default_node: directory.default_node,
+            live_status: false, online_filter_applied: false, total_matched: nodes.length, nodes });
+        }
 
         let res: Response;
         try {
@@ -367,7 +513,7 @@ export function createMcpServer(options: McpOptions = {}): Server {
             content: [
               {
                 type: 'text',
-                text: `无法连接到 DreamMate node-agent (${agentUrl})。请确认本地 dreammate-node 守护进程是否已启动。`,
+                text: `无法连接到 DreamMate node-agent (${agentUrl})。请确认该网关可达且 dreammate-node 已启动。`,
               },
             ],
             isError: true,
@@ -432,80 +578,71 @@ export function createMcpServer(options: McpOptions = {}): Server {
         };
       }
 
+      if (name === 'dreammate_search_tools') {
+        // Reject empty queries before discovery, so they cannot become a full listing.
+        if (typeof args.query !== 'string' || !args.query.trim()) {
+          return jsonResult({ error: '缺少非空必填参数: query；请描述要完成的任务' }, true);
+        }
+        if (args.query.length > 2000) {
+          return jsonResult({ error: 'query 最多允许 2000 个字符，请缩短任务描述' }, true);
+        }
+        const searchArgs = { ...args, limit: args.limit ?? 15, max_chars: args.max_chars ?? 12000 };
+        parsePageOptions(searchArgs);
+        const node = (args.node as string | undefined) ?? 'all';
+        const found = await discoverServices(agentUrl, node, options);
+        const embeddingProviders = discoverEmbeddingProviders(found.services, options.embeddingModel ?? process.env.DREAMMATE_EMBEDDING_MODEL);
+        const result = await searchTools(found.services, searchArgs, { ...options, embeddingProviders, responseBase: {
+          ...boundedEvidence(found.evidence, searchArgs),
+          ...(found.allFailed ? { error: '无法连接到任何可查询节点，不能据此判断工具不存在' } : {}),
+        } });
+        return jsonResult(result, found.allFailed);
+      }
+
       if (name === 'dreammate_list_services' || name === 'dreammate_list_capabilities') {
+        parsePageOptions(args, { limit: 10 });
         const node = args.node as string | undefined;
-        const keyword = (args.keyword as string | undefined)?.toLowerCase().trim();
+        const keyword = typeof args.keyword === 'string' ? args.keyword.toLowerCase().trim() : '';
         const kind = args.kind as string | undefined;
-        const includeDisabled = Boolean(args.include_disabled);
-
-        let discovery: { status: string; error?: string } = { status: 'ok' };
-        let targets: { url: string; name: string }[];
-        if (node === 'all') {
-          try {
-            const response = await fetch(`${agentUrl}/nodes`, { signal: AbortSignal.timeout(3000) });
-            if (!response.ok) { await response.body?.cancel(); throw new Error(`HTTP ${response.status}`); }
-            const data = await response.json() as { nodes: NetworkNode[] };
-            if (!Array.isArray(data.nodes) || data.nodes.length === 0) throw new Error('Invalid or empty node topology');
-            const self = data.nodes.find(n => n.is_self);
-            if (self && self.network_online !== undefined && self.network_online !== true) {
-              discovery = { status: 'partial', error: 'Tailnet 状态不可用，节点清单可能仅包含本机' };
-            }
-            targets = data.nodes.filter(n => n.online || n.is_self).map(n => ({ url: nodeBaseUrl(agentUrl, n), name: n.name }));
-          } catch (error) {
-            discovery = { status: 'failed', error: `节点发现失败，仅扫描本机: ${error instanceof Error ? error.message : String(error)}` };
-            targets = [{ url: agentUrl, name: 'local' }];
-          }
-        } else targets = [{ url: await resolveNodeBaseUrl(agentUrl, node), name: node || 'local' }];
-        const batches = await Promise.all(targets.map(t => scanServices(t.url, t.name)));
-        const scans = batches.map(b => b.scan);
-        const rawServices = batches.flatMap(b => b.services);
-        const partial = discovery.status !== 'ok' || scans.length === 0 || scans.some(s => s.status !== 'ok');
-        const allFailed = scans.length === 0 || scans.every(s => s.status !== 'ok');
-
-        let services = rawServices;
-        if (!includeDisabled) {
-          services = services.filter((s) => s.metadata?.enabled !== false);
-        }
-        if (kind) {
-          services = services.filter((s) => s.kind === kind);
-        }
-        if (keyword) {
-          services = services.filter((s) => {
-            const skillsMap = extractSkillsMap(s);
-            const matchId = s.id.toLowerCase().includes(keyword);
-            const matchName = s.name ? s.name.toLowerCase().includes(keyword) : false;
-            const matchKind = s.kind ? s.kind.toLowerCase().includes(keyword) : false;
-            const matchCaps = (s.capabilities ?? []).some((c) => c.toLowerCase().includes(keyword));
-            const matchMethods = s.methods
-              ? Object.keys(s.methods).some((m) => m.toLowerCase().includes(keyword))
-              : false;
-            const matchSkills = Object.keys(skillsMap).some((k) => k.toLowerCase().includes(keyword));
-            return matchId || matchName || matchKind || matchCaps || matchMethods || matchSkills;
-          });
-        }
-
-        const summary = services.map((s) => {
+        const found = await discoverServices(agentUrl, node, options);
+        const matches = (value: unknown) => typeof value === 'string' && value.toLowerCase().includes(keyword);
+        const services = found.services.filter(s => (args.include_disabled === true || s.metadata?.enabled !== false)
+          && (!kind || s.kind === kind));
+        const summary = services.flatMap(s => {
           const skillsMap = extractSkillsMap(s);
-          return {
-            node: s.node, service_id: s.id, name: s.name ?? s.id,
+          const allMethods = methodNames(s);
+          const matchedMethods = keyword ? allMethods.filter(m => matches(m) || matches(s.methods?.[m]?.description)) : allMethods;
+          const matchedSkills = keyword ? Object.entries(skillsMap).filter(([name, definition]) => matches(name)
+            || matches((definition as { description?: string } | null)?.description)).map(([name]) => name) : Object.keys(skillsMap);
+          const serviceMatch = !keyword || [s.id, s.name, s.kind, s.metadata?.description].some(matches);
+          if (!serviceMatch && matchedMethods.length === 0 && matchedSkills.length === 0) return [];
+          const visibleMethods = (keyword && matchedMethods.length ? matchedMethods : allMethods).slice(0, 6);
+          const visibleSkills = (keyword && matchedSkills.length ? matchedSkills : Object.keys(skillsMap)).slice(0, 6);
+          const availability = s.metadata?.method_availability as Record<string, { state?: string; checked_at?: string }> | undefined;
+          return [{
+            node: s.node, service_id: s.id, name: shortText(s.name ?? s.id, 160),
             kind: s.kind ?? 'generic', execution: s.execution ?? (s.command ? 'hybrid' : 'http'),
-            command: s.command, lifecycle: s.lifecycle,
-            methods: s.methods ? Object.keys(s.methods) : [], skills: Object.keys(skillsMap),
-            capabilities: s.capabilities ?? [], liveness: s.liveness,
-            service_health: serviceHealth(s),
-            ...(s.metadata?.method_availability ? { method_availability: Object.fromEntries(
-              Object.entries(s.metadata.method_availability as Record<string, { state?: string; checked_at?: string }>).map(
-                ([method, availability]) => [method, { state: availability.state ?? 'unknown', checked_at: availability.checked_at ?? null }],
-              ),
-            ) } : {}),
+            command: s.command ? shortText(s.command, 160) : undefined,
+            lifecycle: s.lifecycle ? {
+              can_shutdown: s.lifecycle.can_shutdown, can_spawn: s.lifecycle.can_spawn,
+            } : undefined,
+            methods: visibleMethods,
+            method_count: allMethods.length,
+            methods_omitted: (keyword && matchedMethods.length ? matchedMethods : allMethods).length - visibleMethods.length,
+            method_descriptions: Object.fromEntries(visibleMethods.map(m => [m, shortText(s.methods?.[m]?.description)])),
+            skills: visibleSkills, skills_omitted: Object.keys(skillsMap).length - visibleSkills.length,
+            capabilities: (s.capabilities ?? []).filter(m => visibleMethods.includes(m)).slice(0, 6),
+            liveness: s.liveness, service_health: serviceHealth(s),
+            ...(availability ? { method_availability: Object.fromEntries(visibleMethods.filter(m => availability[m]).map(m => [m, {
+              state: shortText(availability[m]?.state ?? 'unknown', 40), checked_at: availability[m]?.checked_at ?? null,
+            }])) } : {}),
             enabled: s.metadata?.enabled !== false, reachability: s.reachability ?? 'network',
-          };
+          }];
         });
-        return jsonResult({
-          scope: node || 'local', total_matched: summary.length, services: summary,
-          partial, discovery, scans,
-          ...(allFailed ? { error: '无法连接到任何可查询节点，不能据此判断服务不存在' } : {}),
-        }, allFailed);
+        return jsonResult(pageResponse(summary, { ...args, limit: args.limit ?? 10 }, {
+          ...boundedEvidence(found.evidence, args),
+          next_step: '按任务使用 dreammate_search_tools；选定方法后指定 method 调用 dreammate_inspect',
+          ...(found.allFailed ? { error: '无法连接到任何可查询节点，不能据此判断服务不存在' } : {}),
+        }, 'services'), found.allFailed);
       }
 
       if (name === 'dreammate_inspect') {
@@ -521,7 +658,9 @@ export function createMcpServer(options: McpOptions = {}): Server {
           };
         }
 
-        const targetUrl = await resolveNodeBaseUrl(agentUrl, node);
+        if (!method && !skill) parsePageOptions(args, { limit: 10 });
+
+        const targetUrl = await resolveNodeBaseUrl(agentUrl, node, options.nodeDirectory);
         let res: Response;
         try {
           res = await fetch(`${targetUrl}/services/${encodeURIComponent(serviceId)}`, { signal: AbortSignal.timeout(5000) });
@@ -601,34 +740,26 @@ export function createMcpServer(options: McpOptions = {}): Server {
           };
         }
 
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(
-                {
-                  node: node || 'local',
-                  service_id: service.id,
-                  name: service.name,
-                  kind: service.kind,
-                  execution: service.execution ?? (service.command ? 'hybrid' : 'http'),
-                  command: service.command,
-                  lifecycle: service.lifecycle,
-                  methods: service.methods ?? {},
-                  skills: Object.keys(skillsMap),
-                  capabilities: service.capabilities ?? [],
-                  reachability: service.reachability,
-                  liveness: service.liveness,
-                  service_health: serviceHealth(service),
-                  method_availability: service.metadata?.method_availability,
-                  enabled: service.metadata?.enabled !== false,
-                },
-                null,
-                2,
-              ),
-            },
-          ],
-        };
+        const directory = methodNames(service).map(methodName => ({
+          method: methodName,
+          description: shortText(service.methods?.[methodName]?.description),
+          declared: Boolean(service.methods?.[methodName]),
+          ...(() => {
+            const availability = (service.metadata?.method_availability as Record<string, { state?: string; checked_at?: string }> | undefined)?.[methodName];
+            return availability ? { availability: { state: shortText(availability.state ?? 'unknown', 40), checked_at: availability.checked_at ?? null } } : {};
+          })(),
+        }));
+        const paged = pageResponse(directory, { ...args, limit: args.limit ?? 10 }, {
+          node: node || 'local', service_id: service.id, name: shortText(service.name),
+          kind: service.kind, execution: service.execution ?? (service.command ? 'hybrid' : 'http'),
+          skills: Object.keys(skillsMap).slice(0, 6), skills_omitted: Math.max(0, Object.keys(skillsMap).length - 6),
+          reachability: service.reachability, liveness: service.liveness, service_health: serviceHealth(service),
+          enabled: service.metadata?.enabled !== false,
+          schema_loaded: false,
+          next_step: '指定 method 调用 dreammate_inspect，仅加载选中方法的完整 Schema',
+        }, 'methods');
+        const entries = paged.methods as typeof directory;
+        return jsonResult({ ...paged, methods: Object.fromEntries(entries.map(({ method: methodName, ...details }) => [methodName, details])) });
       }
 
       if (name === 'dreammate_invoke') {
@@ -644,7 +775,7 @@ export function createMcpServer(options: McpOptions = {}): Server {
           };
         }
 
-        const targetUrl = await resolveNodeBaseUrl(agentUrl, node);
+        const targetUrl = await resolveNodeBaseUrl(agentUrl, node, options.nodeDirectory);
         let res: Response;
         try {
           res = await fetch(`${targetUrl}/services/${encodeURIComponent(serviceId)}/invoke`, {
@@ -703,7 +834,7 @@ export function createMcpServer(options: McpOptions = {}): Server {
           };
         }
 
-        const targetUrl = await resolveNodeBaseUrl(agentUrl, node);
+        const targetUrl = await resolveNodeBaseUrl(agentUrl, node, options.nodeDirectory);
         let res: Response;
         try {
           res = await fetch(
@@ -826,7 +957,7 @@ export function createMcpServer(options: McpOptions = {}): Server {
           };
         }
 
-        const targetUrl = await resolveNodeBaseUrl(agentUrl, node);
+        const targetUrl = await resolveNodeBaseUrl(agentUrl, node, options.nodeDirectory);
 
         if (action === 'status') {
           let res: Response;
@@ -944,9 +1075,6 @@ export function createMcpServer(options: McpOptions = {}): Server {
         isError: true,
       };
     }
-  });
-
-  return server;
 }
 
 export async function runMcpServer(options: McpOptions = {}): Promise<void> {

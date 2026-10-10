@@ -1,0 +1,23 @@
+name: dsh-plugin
+on:
+  push:
+    paths: ['packages/dsh-plugin/**', '.github/workflows/dsh-plugin.yml']
+  pull_request:
+    paths: ['packages/dsh-plugin/**', '.github/workflows/dsh-plugin.yml']
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '11.14.0'
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+        working-directory: packages/dsh-plugin
+      - run: pnpm test
+        working-directory: packages/dsh-plugin
+      - run: pnpm pack
+        working-directory: packages/dsh-plugin

@@ -1,0 +1,6 @@
+- insert:
+    - id: dreammate-node
+      name: '@1agents/dsh-dreammate-node'
+      config:
+        serviceMode: auto
+        serviceUrl: http://127.0.0.1:36908

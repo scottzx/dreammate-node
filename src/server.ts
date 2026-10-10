@@ -11,6 +11,8 @@ import { DEFAULT_PORTS, PROTOCOL_VERSION, type NodeManifest, type MethodDescript
 import { nodeIdentity } from './identity.js';
 import { ServiceRegistry, type Registration, type RegisteredService } from './registry.js';
 import { archiveSkill, type SkillDescriptorWithSource } from './skills.js';
+import { parseEmbeddingAdvertisement } from './embedding-providers.js';
+import { withRequestTimeout } from './request-timeout.js';
 
 /** 固定端口。改它等于让全网的探测方同时失明。 */
 export const NODE_AGENT_PORT: number = DEFAULT_PORTS['node-agent'];
@@ -68,6 +70,110 @@ function readBody(req: http.IncomingMessage, limitBytes = 64 * 1024): Promise<st
     req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
     req.on('error', reject);
   });
+}
+
+class EmbeddingRequestError extends Error {
+  constructor(message: string, readonly status: number) { super(message); }
+}
+
+/** Bound this protocol separately from generic business-method request bodies. */
+function readEmbeddingBody(req: http.IncomingMessage): Promise<string> {
+  const limit = 256 * 1024;
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks: Buffer[] = [];
+    const cleanup = () => {
+      req.off('data', data);
+      req.off('end', end);
+      req.off('error', error);
+      req.off('aborted', aborted);
+    };
+    const error = (cause: Error) => { cleanup(); reject(cause); };
+    const aborted = () => error(new Error('Embedding client disconnected'));
+    const data = (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > limit) {
+        chunks.length = 0;
+        cleanup();
+        req.resume();
+        reject(new EmbeddingRequestError('Embedding request exceeds 256 KiB', 413));
+      } else chunks.push(chunk);
+    };
+    const end = () => { cleanup(); resolve(Buffer.concat(chunks).toString('utf8')); };
+    req.on('data', data);
+    req.on('end', end);
+    req.on('error', error);
+    req.on('aborted', aborted);
+  });
+}
+
+function embeddingPayload(raw: string, model: string): { model: string; texts: string[]; input_type: 'query' | 'document' } {
+  let body: unknown;
+  try { body = JSON.parse(raw); } catch { throw new EmbeddingRequestError('Embedding request must be valid JSON', 400); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw new EmbeddingRequestError('Embedding request must be an object', 400);
+  const entry = body as Record<string, unknown>;
+  if (Object.keys(entry).some(key => !['model', 'texts', 'input_type'].includes(key))) {
+    throw new EmbeddingRequestError('Embedding request only accepts model, texts and input_type', 400);
+  }
+  if (entry.model !== undefined && entry.model !== model) throw new EmbeddingRequestError('Requested model does not match the registered provider', 400);
+  if (!Array.isArray(entry.texts) || entry.texts.length < 1 || entry.texts.length > 64
+    || entry.texts.some(text => typeof text !== 'string' || !text.trim() || text.length > 8192)) {
+    throw new EmbeddingRequestError('texts must contain 1..64 non-empty strings of at most 8192 characters', 400);
+  }
+  if (entry.input_type !== 'query' && entry.input_type !== 'document') throw new EmbeddingRequestError('input_type must be query or document', 400);
+  return { model, texts: entry.texts as string[], input_type: entry.input_type };
+}
+
+async function proxyEmbedding(req: http.IncomingMessage, res: http.ServerResponse, service: RegisteredService): Promise<void> {
+  if (service.metadata?.enabled === false || service.liveness === 'down') {
+    return json(res, 503, { error: 'Embedding provider is disabled or down' });
+  }
+  if (!Number.isInteger(service.port) || service.port! < 1 || service.port! > 65535
+    || (service.execution !== undefined && service.execution !== 'http') || service.command !== undefined) {
+    return json(res, 503, { error: 'Embedding provider requires a registered local HTTP port without a CLI command' });
+  }
+  const rawAdvertisement = service.metadata?.embedding_provider;
+  if (rawAdvertisement === undefined) return json(res, 404, { error: 'Service does not advertise an embedding provider' });
+  const advertisement = parseEmbeddingAdvertisement(service);
+  if (!advertisement) {
+    const notReady = rawAdvertisement && typeof rawAdvertisement === 'object' && (rawAdvertisement as { ready?: unknown }).ready === false;
+    return json(res, notReady ? 503 : 400, { error: notReady ? 'Embedding provider is not ready' : 'Invalid embedding provider advertisement' });
+  }
+  const disconnected = new AbortController();
+  const abort = () => disconnected.abort(new DOMException('Embedding client disconnected', 'AbortError'));
+  const close = () => { if (!res.writableEnded) abort(); };
+  req.on('aborted', abort);
+  res.on('close', close);
+  try {
+    if (req.aborted || res.destroyed) return;
+    const payload = embeddingPayload(await readEmbeddingBody(req), advertisement.model);
+    if (disconnected.signal.aborted || req.aborted || res.destroyed) return;
+    const result = await withRequestTimeout(async deadline => {
+      const response = await fetch(`http://127.0.0.1:${service.port}/embed`, {
+        method: 'POST', redirect: 'error', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload), signal: AbortSignal.any([deadline, disconnected.signal]),
+      });
+      if (!response.ok) {
+        await response.body?.cancel();
+        throw new Error(`Embedding upstream returned HTTP ${response.status}`);
+      }
+      const data = await response.json() as { model?: unknown; embeddings?: unknown; encoding?: unknown } | null;
+      if (!data || data.model !== `${advertisement.model}@${advertisement.revision}` || data.encoding !== advertisement.encoding
+        || !Array.isArray(data.embeddings) || data.embeddings.length !== payload.texts.length) {
+        throw new Error('Embedding upstream response does not match the registered model, encoding or batch size');
+      }
+      return { model: data.model, embeddings: data.embeddings, encoding: data.encoding };
+    }, 60000);
+    if (!disconnected.signal.aborted && !res.destroyed) json(res, 200, result);
+  } catch (error) {
+    if (disconnected.signal.aborted || res.destroyed) return;
+    const timeout = error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError');
+    const status = error instanceof EmbeddingRequestError ? error.status : timeout ? 504 : 502;
+    json(res, status, { error: error instanceof Error ? error.message : String(error), kind: timeout ? 'timeout' : status >= 500 ? 'upstream' : 'request' });
+  } finally {
+    req.off('aborted', abort);
+    res.off('close', close);
+  }
 }
 
 function validate(body: unknown): Registration {
@@ -365,6 +471,14 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
             cleanup();
           });
           return;
+        }
+
+        const embedService = /^\/services\/([^/]+)\/embed$/.exec(pathname);
+        if (req.method === 'POST' && embedService) {
+          const id = decodeURIComponent(embedService[1]!);
+          const service = registry.get(id);
+          return service ? proxyEmbedding(req, res, service)
+            : json(res, 404, { error: `no such service: ${id}` });
         }
 
         const getSingle = /^\/services\/([^/]+)$/.exec(pathname);

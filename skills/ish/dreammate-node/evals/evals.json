@@ -1,0 +1,27 @@
+{
+  "skill_name": "dreammate-node",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "我在 iPhone 的 iSH，只能执行短命令，网关是 http://100.64.0.8:36908。帮我查询 Mac 上的笔记服务并读取笔记 123。当前没有服务名和方法名。请给出你现在可以运行的发现命令，以及拿到结果后的下一步；本轮只生成步骤，不联网或启动进程。",
+      "expected_output": "使用明确远程入口执行一次性发现，先 inspect 再按真实契约 invoke；不编造服务方法，不启动本机守护进程。",
+      "files": [],
+      "assertions": [
+        "给出 dreammate-node cli nodes 或 services，且显式使用已知网关 http://100.64.0.8:36908。",
+        "先发现真实服务 ID，再 inspect 方法契约；不把占位方法/服务当成真实已知值。",
+        "使用短命令，不建议在 iSH 启动或安装本机常驻网关。"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "iSH 里 services --node all 的 partial=true，scans 中一台网关 timeout；另一台发现了笔记服务。之前一次写笔记调用也超时了。是不是全网没有服务？要不要重试写入或在手机安装 daemon？请解释并给出下一步，本轮不执行任何命令。",
+      "expected_output": "解释部分发现和写入状态不确定，不自动重试写操作、不装本机 daemon，建议核实目标与只读查询。",
+      "files": [],
+      "assertions": [
+        "明确 partial=true 不能推出全网没有服务，并说明已发现服务与失败节点。",
+        "写操作超时后不自动重试，先只读核实是否生效。",
+        "不通过在 iSH 安装 daemon 来修复远端问题。"
+      ]
+    }
+  ]
+}

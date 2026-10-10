@@ -138,6 +138,17 @@ export interface InstallResult {
 export async function installService(options: InstallOptions = {}, defaultScript = ''): Promise<InstallResult> {
   const platform = platformOf();
   const r = resolve(options, defaultScript);
+  // Check before writing a unit: Linux does not imply a usable systemd user manager.
+  if (platform === 'systemd') {
+    if (/(?:^|[^a-z])ish(?:[^a-z]|$)/i.test(os.release()) || fs.existsSync('/proc/ish')) {
+      throw new Error('iSH 不支持此常驻服务安装方式；请使用 dreammate-node cli nodes import 和 dreammate-node cli services');
+    }
+    try {
+      await run('systemctl', ['--user', 'show-environment'], { timeout: 3000 });
+    } catch {
+      throw new Error('当前环境没有可用的 systemd 用户管理器；未写入服务文件。请使用 dreammate-node cli，或由已有进程管理器运行前台 agent');
+    }
+  }
   fs.mkdirSync(logDir(), { recursive: true });
   const notes: string[] = [];
 

@@ -1,0 +1,30 @@
+{
+  "name": "@1agents/dsh-dreammate-node",
+  "version": "0.1.0",
+  "description": "DreamMate Network discovery and invocation tools for DeepSeek Harness, with automatic local node startup",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": ["src", "cordis.patch.yml", "README.md", "LICENSE"],
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "prepack": "node --check src/index.js && node --check src/service-process.js && node --check src/service-worker.js"
+  },
+  "engines": { "node": ">=22.19.0" },
+  "dependencies": {
+    "@1agents/dreammate-node": "~0.7.1",
+    "@modelcontextprotocol/sdk": "^1.30.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/scottzx/dreammate-node.git",
+    "directory": "packages/dsh-plugin"
+  },
+  "keywords": ["dsh-plugin", "deepseek", "dreammate", "tools", "service-discovery"],
+  "license": "MIT",
+  "publishConfig": { "access": "public", "registry": "https://registry.npmjs.org" }
+}

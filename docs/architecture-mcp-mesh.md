@@ -17,7 +17,7 @@
 
 ## 2. 核心设计：两阶段渐进式发现（Progressive Discovery）
 
-为杜绝上下文膨胀，大模型侧只暴露一组**稳定的小集合元工具（Meta-Tools）**，保持极低且相对恒定的 Token 占用。原始三条 `list → inspect → invoke` 仍是发现/调用主路径；额外工具覆盖节点发现、技能包分发与部分生命周期，**不会**在启动时把各业务方法的入参 Schema 全量注入上下文。
+大模型侧只暴露一组**稳定的小集合元工具（Meta-Tools）**，业务主路径为 `search → inspect(method) → invoke`。搜索直接定位具体方法，服务列表用于显式浏览。搜索和目录统一施加分页及文本预算，无方法的 inspect 不再全量展开 Schema，堵住使用时重新灌入整个工具目录的路径。额外工具覆盖节点发现、技能包分发与部分生命周期。
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -26,11 +26,12 @@
                                │ 0. 可选：先看有哪些节点
                                ▼
             dreammate_list_nodes({ keyword?, online_only? })
-                               │ 1. 查找服务列表（极低 Token 开销）
+                               │ 1. 用非空任务描述查找少量方法摘要
                                ▼
-            dreammate_list_services({ keyword })
-            （dreammate_list_capabilities 为向后兼容别名）
-                               │ 2. 命中目标服务 (例如: "tingqi-adapter")
+            dreammate_search_tools({ query })
+            （默认跨已知节点，最多 15 条相关方法摘要）
+            （list_services 仅在需要浏览目录时调用）
+                               │ 2. 选中节点、服务和具体方法
                                ▼
               dreammate_inspect({ service_id, method })
                                │ 3. 按需展开具体入参 Schema、技能指南
@@ -51,10 +52,13 @@
 - **功能**：发现局域网 / Tailnet 中所有已知设备节点（本机与远端 Linux、Windows、Mac、移动设备等），展示在线状态、操作系统与地址。
 - **参数**：`online_only`（默认 true）、`keyword`（模糊匹配节点名称或操作系统）。
 
-#### ② `dreammate_list_services`
-- **功能**：轻量检索本机、指定节点或全网（`node: "all"`）已报备的服务列表与概要（两阶段发现第 1 步）。不包含入参 Schema。
-- **现阶段策略**：不做重量级的向量 Embedding 检索，采用**确定性的关键词与标签过滤**（匹配 `id`、`name`、`kind`、`capabilities`、方法名、技能名）。
-- **别名**：`dreammate_list_capabilities` 为向后兼容别名，推荐使用本工具。
+#### ② `dreammate_search_tools` / `dreammate_list_services`
+- **业务搜索**：`dreammate_search_tools` 要求 1–2000 字符的非空 `query`，默认跨已知节点搜索；`node: "localhost"` 限定入口网关所在设备，也支持指定节点、`service_id` 与 `kind` 过滤，`include_disabled` 可显式包含禁用服务。返回 `results` 数组，每项是具体方法的 `node`、`service_id`、`method`、简短 `description` 和 `score`，不包含参数 Schema。
+- **搜索策略**：从本次节点扫描的全部服务中自动发现就绪的 embedding provider，`service_id` 与 `kind` 只限制业务工具候选；无可见就绪 provider 或模型失败时使用有界词法检索。完整方法名精确匹配优先，其余先按语义相似度排序，再在相关候选中平衡工具集，词法候选作为补充。没有匹配时改写查询或扩大候选，禁止自动全量展开。
+- **工具集覆盖**：按 `service_id` 分组，跨节点相同 ID 视为同一工具集。在相关性门槛内选择最多 3 个优先代表组，保留排名首位与前 3 种不同动作后补充组代表，对同组数量和同方法跨节点重复施加折扣。强相关的第 4 个集仍可进入结果。尽量让结果覆盖 2–3 个相关工具集；不强求节点数量，没有足够相关组时不凑数，显式 `service_id` 过滤保持单集。
+- **分数语义**：`score` 只是排序信号，不代表可执行性或置信概率；当前没有拒识分类器。候选说明与任务相符才 inspect，否则继续改写查询，不能因有返回结果就调用。
+- **目录浏览**：`dreammate_list_services` 返回服务摘要；`dreammate_list_capabilities` 为其向后兼容别名。没有关键词也必须分页，不能一次返回整个目录。
+- **摘要预算**：搜索、服务列表、inspect 接受 `limit`（1–20）、`offset`（0–1000000）、`max_chars`（1000–12000）。搜索默认最多 15 条、12000 字符；目录默认 10 条、6000 字符。预算按摘要 JSON 字符计，并非 token 估计；无效参数在任何节点或模型请求前拒绝。相关候选不足或预算不够时可返回更少条数，后续通过返回的续页信息显式查询。指定方法的完整 Schema 与单独请求的技能指南按需读取，不使用目录分页。
 - **返回结构**（精简卡片，含方法名与技能名，不含入参 Schema）：
   ```json
   {
@@ -75,8 +79,8 @@
   ```
 
 #### ③ `dreammate_inspect`
-- **功能**：按需查看指定服务的方法契约、入参 JSON Schema，或配套业务 SOP / 技能指南（两阶段发现第 2 步）。
-- **参数**：`service_id`（必填）；可选 `method`（`capability` 为别名）、`skill`、`node`。
+- **功能**：省略 `method` 时只返回分页的方法摘要目录，不返回整个服务的完整契约。指定 `method` 才读取该方法的参数 Schema；配套业务 SOP / 技能指南通过 `skill` 单独读取。
+- **参数**：`service_id`（必填）；可选 `method`（`capability` 为别名）、`skill`、`node`，以及统一分页和文本预算参数。
 - **返回结构**（仅将该方法的入参 Schema 送入当前上下文）：
   ```json
   {
@@ -108,6 +112,20 @@
 #### ⑥ `dreammate_manage_service`
 - **功能**：部分服务的生命周期：`start`（按需拉起常驻 HTTP）、`stop`（优雅停止以释放显存/内存）、`status`。
 - **HTTP**：`POST /services/:id/start|stop`。仅对声明了 `lifecycle.can_spawn` / `can_shutdown` 的服务有效。
+
+### 2.2 可选的本地语义检索
+
+模型节点运行 `node scripts/local-embeddings/serve.mjs --model qwen3 --port 8766 --agent http://127.0.0.1:36908`。启动器只在本机 loopback 启动已准备权重的适配器，完成真实编码并确认就绪后，向本机 agent 报备 `metadata.embedding_provider`：`protocol: "dreammate.embedding.v1"`、模型别名、精确 revision、向量维度、编码配置指纹、`ready: true` 与优先级。登记每 15 秒刷新，正常退出注销；适配器本身禁止主动外联。模型权重和依赖需事先显式下载，搜索不会自动安装或部署模型。
+
+客户端复用本次节点扫描发现的 provider，按 priority 高优先、健康状态和稳定 URL 选择。`node` 限定工具与模型来源的节点范围；默认跨已知节点，显式 `localhost` 只看入口设备。`service_id` 仅筛业务方法，同一节点范围内其他服务报备的模型仍可使用。找不到可见且就绪的 provider 时，返回 `search.semantic_status: "no_provider"` 与原有分页/文本预算下的词法结果；扫描部分失败或只使用导入目录时，保留范围不完整证据，不能断言全网没有模型。
+
+调用端直连所选节点的 `POST /services/<id>/embed`，该网关只转发到本机注册端口的 `127.0.0.1:<port>/embed`，不会从入口网关中继到另一节点，也不采用 metadata 中的任意 URL。代理仅接受已启用的本机 HTTP provider、固定编码字段与已登记模型，拒绝重定向。模型服务可以只驻留一台设备，其他节点无需加载权重；调用端仍需能直连目标网关。
+
+自动发现路径下，一次语义尝试固定 provider、revision、维度与编码配置，query 和全部 document 向量必须一致。最多尝试两个 provider，共享默认 5000 ms 的总语义预算；切换备用时重新计算该 provider 所需的查询和文档，不混用向量空间。客户端缓存按 provider 地址、模型版本、维度、编码配置和卡片内容隔离；经校验的批次可保留进度。目录扫描不计入该语义预算。
+
+显式 `DREAMMATE_EMBEDDING_URL` 优先于自动发现，固定地址失败时直接词法降级；`DREAMMATE_EMBEDDING_MODEL` 可限制自动发现的模型别名。地址只接受 localhost 或私网 IP 的 `/embed`、固定服务编码路由，拒绝公网与重定向。没有全局 leader、中心搜索 API、自动模型部署或持久化全网向量索引；目录扫描与结果排序仍在 CLI/MCP 进程完成。
+
+当前本地向量模型只保留 Qwen3-Embedding-0.6B，Gemma 已移除。索引单位是具体方法，参数 Schema 留到 inspect 阶段；比较召回、调用成功率、上下文字符/token 与延迟，不能只看模型排行榜。安装、离线运行和评测说明见 [本地 embedding 方案](local-embeddings.md)。
 
 ---
 
@@ -159,7 +177,8 @@ await reportAndHoldRegistration({
 
 ### 阶段 1（当前 MVP 核心路线）
 - [x] **扩展注册表协议**：在 `Registration` 结构中支持 `methods`（包含入参定义）。
-- [x] **实现 MCP 网关子命令**：`dreammate-node mcp`。原始三条 `list → inspect → invoke` 仍是发现/调用主路径（`dreammate_list_services`，`list_capabilities` 为别名）。
+- [x] **实现 MCP 网关子命令**：`dreammate-node mcp`。业务主路径为 `search → inspect(method) → invoke`；服务目录保留分页浏览与兼容别名。
+- [x] **有界工具发现**：方法级搜索、统一分页/文本预算、无方法 inspect 只返回摘要，模型失败仍有界降级。
 - [x] **节点发现**：`dreammate_list_nodes` / `GET /nodes`。
 - [x] **技能包分发**：`dreammate_download_skill` / `GET /services/:id/skills/:name/archive`。
 - [x] **部分生命周期**：`dreammate_manage_service` / `POST /services/:id/start|stop`。

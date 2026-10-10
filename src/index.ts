@@ -27,11 +27,21 @@ export {
   type ReportOptions,
 } from './client.js';
 export {
+  callDreammateTool,
   createMcpServer,
   runMcpServer,
   MCP_TOOLS,
   type McpOptions,
 } from './mcp.js';
+export { exportDirectory, loadDirectory, parseDirectory, saveDirectory, validateDirectory,
+  type NodeDirectory, type DirectoryNode } from './node-directory.js';
+export {
+  EMBEDDING_PROTOCOL,
+  discoverEmbeddingProviders,
+  parseEmbeddingAdvertisement,
+  type EmbeddingAdvertisement,
+  type EmbeddingProvider,
+} from './embedding-providers.js';
 export {
   loadSkillsFromDir,
   parseSkillMarkdown,
@@ -40,4 +50,3 @@ export {
   listSkillArchive,
   type SkillDescriptorWithSource,
 } from './skills.js';
-

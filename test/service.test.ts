@@ -67,6 +67,29 @@ test('入口脚本不存在就报错，而不是装一个永远起不来的服�
   await assert.rejects(() => installService({ script: missing }, missing), /入口脚本不存在/);
 });
 
+for (const release of ['iSH 1.3', '6.1-linux']) {
+  test(`install leaves no service files when manager is unavailable (${release})`, async t => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dreammate-no-systemd-'));
+    const script = path.join(home, 'entry.js');
+    fs.writeFileSync(script, '');
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    const previousHome = process.env.HOME;
+    const previousPath = process.env.PATH;
+    t.after(() => {
+      Object.defineProperty(process, 'platform', platform);
+      if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+      if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
+      fs.rmSync(home, { recursive: true, force: true });
+    });
+    Object.defineProperty(process, 'platform', { value: 'linux' });
+    t.mock.method(os, 'release', () => release);
+    process.env.HOME = home;
+    process.env.PATH = '';
+    await assert.rejects(() => installService({ script }), /iSH 不支持|没有可用的 systemd/);
+    assert.deepEqual(fs.readdirSync(home), ['entry.js']);
+  });
+}
+
 test('路径约定落在用户目录下，不需要 sudo', () => {
   const home = os.homedir();
   assert.ok(plistPath().startsWith(path.join(home, 'Library', 'LaunchAgents')));

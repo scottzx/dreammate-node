@@ -1,7 +1,7 @@
 {
   "name": "@1agents/dreammate-node",
-  "version": "0.7.2",
-  "description": "DreamMate Network 的本机 node agent：节点身份、服务报备、探活。固定监听 36908。",
+  "version": "0.9.0",
+  "description": "DreamMate Network 的设备网关与一次性 CLI：服务发现、调用与可导入的设备地址簿。",
   "keywords": [
     "dreammate",
     "node-agent",
@@ -32,14 +32,27 @@
     "dreammate-node": "dist/bin/dreammate-node.js"
   },
   "files": [
-    "dist",
+    "dist/bin/*.js",
+    "dist/bin/*.d.ts",
+    "dist/src/*.js",
+    "dist/src/*.d.ts",
+    "scripts/install-skills.mjs",
+    "scripts/local-embeddings/*.mjs",
+    "scripts/local-embeddings/*.py",
+    "scripts/local-embeddings/requirements.txt",
+    "docs/local-embeddings.md",
+    "docs/tool-search-evaluation.md",
+    "skills/ish/dreammate-node/SKILL.md",
+    "skills/terminal/dreammate-node/SKILL.md",
     "README.md"
   ],
   "sideEffects": false,
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --import tsx --test test/*.test.ts deploy/plane-bridge/bridge.test.mjs",
+    "test": "node --import tsx --test test/*.test.ts test/*.test.mjs deploy/plane-bridge/bridge.test.mjs",
+    "postinstall": "node scripts/install-skills.mjs --postinstall",
+    "skills:install": "node scripts/install-skills.mjs",
     "prepack": "npm run build"
   },
   "engines": {
