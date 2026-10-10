@@ -93,15 +93,17 @@ class Encoder:
         return f"dreammate.tool-search.v1:fp32:max{self.max_length}:dim{dimensions}"
 
     def embedding_provider(self):
-        with self.lock:
-            if self.current is not None and self.encoder is not None:
-                revision = self.models[self.current].get("revision")
-                dimensions = self.dimensions.get(f"{self.current}@{revision}")
-                if dimensions is not None:
-                    return {"protocol": "dreammate.embedding.v1", "model": self.current,
-                            "revision": revision, "dimensions": dimensions,
-                            "encoding": self.encoding_profile(dimensions), "ready": True}
-            return {"protocol": "dreammate.embedding.v1", "ready": False}
+        # Inference can take longer than the agent's health deadline on a CPU.
+        # Read the fixed model's published state without queueing behind its lock.
+        current, encoder = self.current, self.encoder
+        if current is not None and encoder is not None:
+            revision = self.models[current].get("revision")
+            dimensions = self.dimensions.get(f"{current}@{revision}")
+            if dimensions is not None and self.current == current and self.encoder is encoder:
+                return {"protocol": "dreammate.embedding.v1", "model": current,
+                        "revision": revision, "dimensions": dimensions,
+                        "encoding": self.encoding_profile(dimensions), "ready": True}
+        return {"protocol": "dreammate.embedding.v1", "ready": False}
 
     def validate_vectors(self, model_version: str, rows, count: int) -> list[array]:
         if not isinstance(rows, list) or len(rows) != count:

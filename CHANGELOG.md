@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.1 — 2026-10-10
+
+- Keep offline model health responses available during CPU encoding so registration refreshes and agent probes do not misclassify a busy provider as down.
+
 ## 0.9.0 — 2026-10-10
 
 - Search concrete tool methods across known nodes by default, returning at most 15 summaries within a 12000-character JSON budget; keep explicit node/service filters and paginated inspection.

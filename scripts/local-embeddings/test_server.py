@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import socket
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -72,6 +73,23 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual(len(self.fake.calls), 1)
         with self.assertRaisesRegex(ValueError, "Unknown prepared serving model"):
             Encoder(self.manifest_path, "cpu", 8, 512, serve_model="cloud")
+
+    def test_health_remains_available_while_inference_holds_the_encoding_lock(self):
+        self.use_fake()
+        self.encoder.encode("qwen3", ["warmup"], "query")
+        completed = threading.Event()
+        providers = []
+        def probe():
+            providers.append(self.encoder.embedding_provider())
+            completed.set()
+        with self.encoder.lock:
+            worker = threading.Thread(target=probe)
+            worker.start()
+            responded = completed.wait(1)
+        worker.join(1)
+        self.assertTrue(responded, "health must not wait for an in-flight CPU encode")
+        self.assertEqual(providers[0]["model"], "qwen3")
+        self.assertTrue(providers[0]["ready"])
 
     def test_failed_initial_encoding_never_advertises_readiness(self):
         self.use_fake()
