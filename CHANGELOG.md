@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.10.0 — 2026-10-17
+
+- Add persistent custom MCP sources from pasted JSON, files or stdin, supporting local stdio and remote Streamable HTTP / SSE, automatic paginated discovery, reconnection and loopback-only management commands and APIs.
+- Refresh existing OAuth grants automatically, persist rotated credentials in an owner-readable file, and keep source credentials out of public service metadata.
+- Discover connected Activepieces action catalogs automatically and support a vendor-neutral catalog declaration for other meta-tool servers; search child actions directly and load their schemas only on inspection or first invocation.
+- Generate stable names scoped by source and toolset, preserve original names as aliases, and return candidates for ambiguous short names instead of choosing an unrelated tool.
+- Route child action calls through the existing gateway with schema validation and explicit connection selection when several accounts are available, preserving MCP results without automatically replaying calls.
+- Fix selected-method inspection returning only a summary, report schema loading explicitly, and support reloading resident stdio handlers without replacing the client connection or replaying in-flight requests.
+- Verify the live GitHub child-tool search, paginated read calls and lazy parameter inspection through DreamMate MCP.
+
 ## 0.9.2 — 2026-10-10
 
 - Default CPU document inference to one item per batch and expose `--batch-size` on the model launcher to bound indexing allocations on devices with limited memory.

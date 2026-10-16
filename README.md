@@ -285,6 +285,25 @@ HTTP 侧对应 `GET /nodes`、`POST /services/:id/invoke`、`POST /capabilities/
 
 渐进式发现的设计说明见 [docs/architecture-mcp-mesh.md](docs/architecture-mcp-mesh.md)。
 
+## 添加自定义 MCP
+
+在运行网关的机器上粘贴标准 `mcpServers` JSON，即可连接本地 stdio 或远程 Streamable HTTP / SSE MCP，自动发现工具并接入现有搜索、inspect 和调用：
+
+```bash
+dreammate-node mcp add --config '{"mcpServers":{"demo":{"command":"npx","args":["-y","your-mcp-server"]}}}'
+dreammate-node mcp add --file ./mcp.json
+cat ./mcp.json | dreammate-node mcp add --file -
+dreammate-node mcp list
+dreammate-node mcp refresh mcp-demo
+dreammate-node mcp remove mcp-demo
+```
+
+原有 `dreammate-node mcp --agent ...` 仍用于启动面向客户端的 MCP 网关。添加后服务 ID 为 `mcp-<配置名>`，方法为 `mcp-<配置名>.<上游工具名>`。源配置持久化到本机 `~/.1agents/mcp-sources.json`（权限 600），网关重启后自动恢复，连接断开后自动重连。管理入口仅接受本机回环请求；工具仍可由其他节点发现与调用。
+
+添加时自动遍历标准工具目录；支持子动作目录的来源会进一步展开工具集。Activepieces 自动识别已连接应用，GitHub 等内部动作直接进入搜索，选中后按需加载参数，再通过原有调用入口执行。完整方法名包含来源、工具集和稳定标识；特殊字符自动转换，唯一简称可自动匹配，重名简称会返回候选名称供选择。
+
+远程凭证可通过 `headers` 提供，本地进程可通过 `env` 提供，支持 `${ENV_VAR}` 在网关进程中解析。已有 OAuth 授权可通过 `oauth` 配置 refresh token 自动续期；当前不提供浏览器首次登录。完整配置、HTTP 接口与 Activepieces 示例见 [自定义 MCP 接入](docs/custom-mcp.md)。
+
 搜索自动从本次扫描到的服务中发现已就绪的本地模型，无需为每个 CLI/MCP 客户端填写模型 URL。模型可只运行在一台内网设备上，其他设备无需安装权重。先显式准备离线权重，然后在模型设备的本仓库根目录启动：
 
 ```sh

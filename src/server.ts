@@ -13,6 +13,9 @@ import { ServiceRegistry, type Registration, type RegisteredService } from './re
 import { archiveSkill, type SkillDescriptorWithSource } from './skills.js';
 import { parseEmbeddingAdvertisement } from './embedding-providers.js';
 import { withRequestTimeout } from './request-timeout.js';
+import { McpSourceError, McpSourceManager, type McpSourceManagerOptions } from './mcp-sources.js';
+import { CatalogError } from './mcp-catalogs.js';
+import { ToolNameError } from './mcp-tool-names.js';
 
 /** 固定端口。改它等于让全网的探测方同时失明。 */
 export const NODE_AGENT_PORT: number = DEFAULT_PORTS['node-agent'];
@@ -27,6 +30,8 @@ export interface AgentOptions {
   registry?: ServiceRegistry;
   /** 关掉启动时的注册表重建（测试用）。 */
   rediscover?: boolean;
+  /** Custom MCP connections are owned by this node, separately from the public registry. */
+  mcpSources?: McpSourceManagerOptions;
 }
 
 const json = (res: http.ServerResponse, status: number, body: unknown): void => {
@@ -42,7 +47,7 @@ const json = (res: http.ServerResponse, status: number, body: unknown): void => 
  * 报备只接受来自回环的请求。
  *
  * 否则网络上任何人都能往你的节点里塞一个假服务，把调用方引到别处去——
- * 这是整个 agent 唯一的写入口，也是唯一值得守的地方。
+ * 服务报备和 MCP 数据源管理都沿用这个本机写入边界。
  */
 function isLoopback(req: http.IncomingMessage): boolean {
   const address = req.socket.remoteAddress ?? '';
@@ -398,8 +403,11 @@ async function executeService(
   return cliRes;
 }
 
-export function createAgent(options: AgentOptions = {}): { server: http.Server; registry: ServiceRegistry } {
+export function createAgent(options: AgentOptions = {}): { server: http.Server; registry: ServiceRegistry; mcpSources: McpSourceManager } {
   const registry = options.registry ?? new ServiceRegistry();
+  const mcpSources = new McpSourceManager(registry, options.mcpSources);
+  const execute = (service: RegisteredService, payload: { method: string; capability?: string; params?: unknown }): Promise<ExecutionResult> =>
+    mcpSources.owns(service.id) ? mcpSources.invoke(service.id, payload) : executeService(service, payload);
 
   const server = http.createServer((req, res) => {
     void (async () => {
@@ -439,6 +447,41 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
           const { listNetworkNodes } = await import('./identity.js');
           const nodes = await listNetworkNodes();
           return json(res, 200, { node: identity.name, nodes });
+        }
+
+        // Connecting an MCP may spawn a local program or read local credentials.
+        // Only the owning machine can configure sources; discovered tools remain
+        // callable through the normal network gateway.
+        if (pathname === '/mcp/sources' || pathname.startsWith('/mcp/sources/')) {
+          if (!isLoopback(req)) return json(res, 403, { error: 'MCP source management is loopback-only' });
+          if (pathname === '/mcp/sources' && req.method === 'GET') {
+            return json(res, 200, { sources: mcpSources.list() });
+          }
+          if (pathname === '/mcp/sources' && req.method === 'POST') {
+            let body: unknown;
+            try { body = JSON.parse(await readBody(req, 256 * 1024)); }
+            catch { return json(res, 400, { error: 'MCP source request must be valid JSON within 256 KiB' }); }
+            const wrapped = body && typeof body === 'object' && !Array.isArray(body) && Object.hasOwn(body, 'config');
+            const request = body as { config?: unknown; name?: unknown };
+            if (wrapped && request.name !== undefined && typeof request.name !== 'string') {
+              return json(res, 400, { error: 'name must be a string' });
+            }
+            const result = await mcpSources.import(wrapped ? request.config : body, wrapped ? request.name as string | undefined : undefined);
+            return json(res, 201, result);
+          }
+          const sourceRoute = /^\/mcp\/sources\/([^/]+)(\/refresh)?$/.exec(pathname);
+          if (sourceRoute) {
+            const id = decodeURIComponent(sourceRoute[1]!);
+            if (!mcpSources.owns(id)) return json(res, 404, { error: 'no such MCP source' });
+            if (!sourceRoute[2] && req.method === 'DELETE') {
+              await mcpSources.remove(id);
+              return json(res, 200, { removed: id });
+            }
+            if (sourceRoute[2] && req.method === 'POST') {
+              return json(res, 200, await mcpSources.refresh(id));
+            }
+          }
+          return json(res, 404, { error: 'no such MCP source route' });
         }
 
         const getSkillArchive = /^\/services\/([^/]+)\/skills\/([^/]+)\/archive$/.exec(pathname);
@@ -481,6 +524,13 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
             : json(res, 404, { error: `no such service: ${id}` });
         }
 
+        const getMethod = /^\/services\/([^/]+)\/methods\/([^/]+)$/.exec(pathname);
+        if (req.method === 'GET' && getMethod) {
+          const id = decodeURIComponent(getMethod[1]!);
+          if (!mcpSources.owns(id)) return json(res, 404, { error: 'no such managed MCP source' });
+          return json(res, 200, await mcpSources.describe(id, decodeURIComponent(getMethod[2]!)));
+        }
+
         const getSingle = /^\/services\/([^/]+)$/.exec(pathname);
         if (req.method === 'GET' && getSingle) {
           const id = decodeURIComponent(getSingle[1]!);
@@ -495,6 +545,9 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
             return json(res, 403, { error: 'registration is loopback-only' });
           }
           const entry = validate(JSON.parse(await readBody(req)));
+          if (mcpSources.owns(entry.id) || entry.metadata?.mcp_source !== undefined) {
+            return json(res, 409, { error: 'managed MCP services must be configured through /mcp/sources' });
+          }
           return json(res, 201, registry.register(entry));
         }
 
@@ -510,7 +563,7 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
           }
           const raw = await readBody(req);
           const payload = raw ? JSON.parse(raw) : {};
-          const result = await executeService(service, payload);
+          const result = await execute(service, payload);
           return json(res, result.status, result.data);
         }
 
@@ -528,7 +581,7 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
           }
           const raw = await readBody(req);
           const payload = raw ? JSON.parse(raw) : {};
-          const result = await executeService(target, { method: capability, capability, ...payload });
+          const result = await execute(target, { method: capability, capability, ...payload });
           return json(res, result.status, result.data);
         }
 
@@ -622,6 +675,9 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
             return json(res, 403, { error: 'deregistration is loopback-only' });
           }
           const id = decodeURIComponent(remove[1]!);
+          if (mcpSources.owns(id)) {
+            return json(res, 409, { error: 'remove managed MCP services through /mcp/sources/:id' });
+          }
           return registry.deregister(id)
             ? json(res, 200, { removed: id })
             : json(res, 404, { error: `no such service: ${id}` });
@@ -629,18 +685,23 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
 
         json(res, 404, { error: `no route: ${req.method} ${pathname}` });
       } catch (error: unknown) {
-        json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        json(res, error instanceof McpSourceError || error instanceof CatalogError || error instanceof ToolNameError ? error.status : 400,
+          { error: error instanceof Error ? error.message : String(error), ...(error instanceof ToolNameError ? { candidates: error.candidates } : {}) });
       }
     })();
   });
 
-  return { server, registry };
+  server.on('close', () => {
+    registry.stop();
+    void mcpSources.stop();
+  });
+  return { server, registry, mcpSources };
 }
 
 export async function serveAgent(
   options: AgentOptions = {},
-): Promise<{ server: http.Server; registry: ServiceRegistry; port: number; rebuilt: number }> {
-  const { server, registry } = createAgent(options);
+): Promise<{ server: http.Server; registry: ServiceRegistry; mcpSources: McpSourceManager; port: number; rebuilt: number }> {
+  const { server, registry, mcpSources } = createAgent(options);
   const host = options.host ?? '0.0.0.0';
   const port = options.port ?? NODE_AGENT_PORT;
   await new Promise<void>((resolve) => server.listen(port, host, resolve));
@@ -654,5 +715,6 @@ export async function serveAgent(
     : await rediscover(registry, { ...(identity.ipv4 ? { ipv4: identity.ipv4 } : {}) }).catch(() => 0);
 
   registry.start();
-  return { server, registry, port: (server.address() as AddressInfo).port, rebuilt };
+  await mcpSources.start();
+  return { server, registry, mcpSources, port: (server.address() as AddressInfo).port, rebuilt };
 }

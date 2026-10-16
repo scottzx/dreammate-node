@@ -19,6 +19,11 @@ export {
   type MethodDescriptor,
 } from './registry.js';
 export { createAgent, serveAgent, NODE_AGENT_PORT, type AgentOptions } from './server.js';
+export { McpSourceError, McpSourceManager, type McpSourceManagerOptions,
+  type McpSourceStatus, type McpSourceImportResult } from './mcp-sources.js';
+export { parseMcpSourceConfig, type McpSourceConfig } from './mcp-source-config.js';
+export { ToolNameError, ToolNameIndex, type ToolIdentity, type NamedTool } from './mcp-tool-names.js';
+export { CatalogError, detectCatalogAdapters, type CatalogAdapter, type CatalogCall, type CatalogTool } from './mcp-catalogs.js';
 export { rediscover, type RediscoverOptions } from './rediscover.js';
 export {
   reportToAgent,

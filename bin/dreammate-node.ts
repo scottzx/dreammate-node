@@ -24,6 +24,8 @@ const USAGE = `dreammate-node — DreamMate Network 本机 node agent
   dreammate-node [--host 0.0.0.0] [--port ${NODE_AGENT_PORT}]   前台跑
   dreammate-node cli <nodes|search|services|inspect|invoke|manage|tools>  一次性调用，可导入地址簿（cli --help）
   dreammate-node mcp [--agent http://127.0.0.1:${NODE_AGENT_PORT}] 作为 MCP Stdio Server 运行供大模型消费
+  dreammate-node mcp add --config JSON | --file PATH|-        添加本地/远程 MCP，自动发现工具
+  dreammate-node mcp list|remove ID|refresh ID                管理本机自定义 MCP 数据源
   dreammate-node install [--host ...] [--port ...]          装成常驻服务（开机自启）
   dreammate-node status                                     服务与端口状态
   dreammate-node uninstall                                  卸载
@@ -39,7 +41,8 @@ const USAGE = `dreammate-node — DreamMate Network 本机 node agent
 端口 ${NODE_AGENT_PORT} 是协议固定的：外部节点靠探这一个端口，就能知道这台机器上有什么。
 install 在 macOS 上装 launchd LaunchAgent、Linux 上装 systemd user unit，都不需要 sudo。`;
 
-if (!['cli', 'skills'].includes(command) && (argv.includes('--help') || argv.includes('-h') || command === 'help')) {
+const sourceCommand = command === 'mcp' && ['add', 'list', 'remove', 'refresh'].includes(argv[1] ?? '');
+if (!['cli', 'skills'].includes(command) && !sourceCommand && (argv.includes('--help') || argv.includes('-h') || command === 'help')) {
   console.log(USAGE);
   process.exit(0);
 }
@@ -69,6 +72,14 @@ try {
     }
 
     case 'mcp': {
+      if (sourceCommand) {
+        const { runMcpSourceCli } = await import('../src/mcp-source-cli.js');
+        process.exitCode = await runMcpSourceCli(argv.slice(1));
+        break;
+      }
+      if (argv[1] && !argv[1].startsWith('-')) {
+        throw new Error('MCP 子命令必须是 add、list、remove 或 refresh；不带子命令启动 Stdio 网关');
+      }
       const { runMcpServer } = await import('../src/mcp.js');
       const agentUrl = flag('agent') ?? `http://127.0.0.1:${port}`;
       await runMcpServer({ agentUrl });
@@ -110,7 +121,21 @@ try {
     case 'run': {
       const { serveAgent } = await import('../src/server.js');
       const { nodeIdentity } = await import('../src/identity.js');
-      const { registry, rebuilt } = await serveAgent({ port, host });
+      const { server, registry, mcpSources, rebuilt } = await serveAgent({ port, host });
+      let stopping = false;
+      const shutdown = (): void => {
+        if (stopping) return;
+        stopping = true;
+        registry.stop();
+        const deadline = setTimeout(() => process.exit(1), 5000);
+        deadline.unref();
+        void mcpSources.stop().finally(() => {
+          server.close(() => { clearTimeout(deadline); });
+          server.closeIdleConnections();
+        });
+      };
+      process.once('SIGINT', shutdown);
+      process.once('SIGTERM', shutdown);
       const identity = await nodeIdentity();
       console.log(`dreammate-node — ${identity.name} (${identity.node_id})  [${identity.source}]`);
       console.log(`  http://${host}:${port}/manifest`);

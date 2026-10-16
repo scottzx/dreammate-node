@@ -256,6 +256,9 @@ export class ServiceRegistry {
     const probe = this.#options.probe ?? httpProbe;
     await Promise.all(
       this.list().map(async (service) => {
+        // MCP connections have no independent HTTP health port. Their manager
+        // owns liveness and reconnects; probing must not mark them up or evict them.
+        if (service.metadata?.mcp_source !== undefined) return;
         if (service.port === undefined) {
           // 纯 CLI 服务，无 HTTP 端口，始终标记 up
           const current = this.#services.get(service.id);
@@ -266,7 +269,7 @@ export class ServiceRegistry {
         const url = `http://127.0.0.1:${service.port}${service.health ?? '/health'}`;
         const alive = await probe(url, this.#options.probeTimeoutMs);
         const current = this.#services.get(service.id);
-        if (!current) return; // 探测期间被注销了
+        if (!current || current !== service) return; // 探测期间被注销或替换了
         current.liveness = alive ? 'up' : 'down';
         current.lastProbedAt = new Date().toISOString();
         current.failures = alive ? 0 : current.failures + 1;

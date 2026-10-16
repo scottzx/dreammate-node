@@ -187,6 +187,34 @@ test('inspect without method only returns a paged description directory; exact i
   assert.equal(exact.method, 'method.10');
 });
 
+test('managed MCP inspect rejects summary-only responses instead of claiming the schema loaded', async t => {
+  const method = 'mcp-example.actions.github.list';
+  const summary = { description: 'GitHub list', schema_loaded: false };
+  const registered = { ...service('mcp-example', { [method]: summary }), metadata: { mcp_source: 'mcp-example' } };
+  let contract: unknown = { method, details: { description: 'Summary', schema_loaded: false } };
+  const requested: string[] = [];
+  t.mock.method(globalThis, 'fetch', (rawUrl: string) => {
+    const url = String(rawUrl);
+    requested.push(url);
+    return Promise.resolve(jsonResponse(url.includes('/methods/') ? contract : registered));
+  });
+  for (const details of [{ description: 'Summary' }, { parameters: { type: 'object' }, schema_loaded: false }, { parameters: [] }]) {
+    contract = { method, details };
+    const result = await callDreammateTool('dreammate_inspect', { service_id: 'mcp-example', method }, options);
+    assert.equal(result.isError, true);
+    assert.equal(dataOf(result).schema_loaded, false);
+    assert.equal(dataOf(result).http_status, 502);
+  }
+  contract = { method, details: { parameters: schema, schema_loaded: true } };
+  const result = await callDreammateTool('dreammate_inspect', { service_id: 'mcp-example', method: 'github.list' }, options);
+  assert.equal(result.isError, undefined);
+  assert.equal(dataOf(result).method, method);
+  assert.equal(dataOf(result).requested_method, 'github.list');
+  assert.equal(dataOf(result).schema_loaded, true);
+  assert.deepEqual(dataOf(result).details.parameters, schema);
+  assert.ok(requested.includes('http://local.test:36908/services/mcp-example/methods/github.list'));
+});
+
 test('method search preserves mesh failure evidence even when no tools match', async t => {
   t.mock.method(globalThis, 'fetch', (url: string) => {
     if (String(url).endsWith('/nodes')) return Promise.resolve(jsonResponse({ nodes: [

@@ -54,6 +54,8 @@ export interface ToolCard {
   service_id: string;
   method: string;
   description: string;
+  original_name?: string;
+  toolset?: string;
 }
 
 interface IndexedCard { card: ToolCard; text: string; fields: [string, number][] }
@@ -74,14 +76,18 @@ function indexCards(services: readonly DiscoveredService[], includeDisabled = fa
       if (seen.has(key)) continue;
       seen.add(key);
       const definition = service.methods?.[method];
+      const discovery = definition as { original_name?: string; toolset?: string; aliases?: string[] } | undefined;
       const description = clip(definition?.description, 480);
       const properties = definition?.parameters?.properties;
       const params = properties && typeof properties === 'object' && !Array.isArray(properties)
         ? Object.keys(properties).slice(0, 64).join(' ').slice(0, 600) : '';
       const fields: [string, number][] = [[method, 4], [service.id, 3], [service.name ?? '', 2],
-        [description, 2], [service.kind ?? '', 0.5], [params, 0.5]];
-      const card = { node: service.node, service_id: service.id, method, description };
-      result.push({ card, fields, text: `Service: ${clip(service.name ?? service.id, 160)}\nMethod: ${method}\nPurpose: ${description}\nParameters: ${params}` });
+        [description, 2], [service.kind ?? '', 0.5], [params, 0.5], [discovery?.original_name ?? '', 4],
+        [discovery?.toolset ?? '', 3], [(discovery?.aliases ?? []).slice(0, 8).join(' '), 2]];
+      const card = { node: service.node, service_id: service.id, method, description,
+        ...(discovery?.original_name ? { original_name: clip(discovery.original_name, 160) } : {}),
+        ...(discovery?.toolset ? { toolset: clip(discovery.toolset, 160) } : {}) };
+      result.push({ card, fields, text: `Service: ${clip(service.name ?? service.id, 160)}\nMethod: ${method}${card.toolset ? `\nToolset: ${card.toolset}` : ''}${card.original_name ? `\nOriginal name: ${card.original_name}` : ''}\nPurpose: ${description}\nParameters: ${params}` });
     }
   }
   return result.sort((a, b) => JSON.stringify(a.card).localeCompare(JSON.stringify(b.card)));
@@ -377,7 +383,7 @@ export async function searchTools(services: readonly DiscoveredService[], args: 
     const kr = keywordRanks.get(i);
     const semanticMatch = semantic !== undefined && semantic[i]! > minSimilarity;
     if (!kr && !semanticMatch) return [];
-    const exact = item.card.method.toLowerCase() === query.toLowerCase();
+    const exact = item.card.method.toLowerCase() === query.toLowerCase() || item.card.original_name?.toLowerCase() === query.toLowerCase();
     // Reserve disjoint score ranges for semantic matches and lexical supplements.
     // A weak shared token must not outrank stronger cross-language similarity.
     const score = semantic ? semanticMatch ? 1 + semantic[i]! : 1 / (60 + kr!) : lexical[i]!;

@@ -22,13 +22,14 @@ import {
   type CallToolResult,
 } from '@modelcontextprotocol/sdk/types.js';
 import { DEFAULT_PORTS } from '@1agents/dreammate-network';
-import type { RegisteredService } from './registry.js';
+import type { RegisteredService, MethodDescriptor } from './registry.js';
 import type { NetworkNode } from './identity.js';
 import { directoryNodeUrl, findDirectoryNode, type NodeDirectory } from './node-directory.js';
 import { installSkillPackage, listSkillArchive } from './skills.js';
 import { withRequestTimeout } from './request-timeout.js';
 import { pageResponse, parsePageOptions, searchTools } from './tool-search.js';
 import { discoverEmbeddingProviders } from './embedding-providers.js';
+import { installMcpReload } from './mcp-runtime.js';
 
 export interface McpOptions {
   agentUrl?: string;
@@ -459,7 +460,7 @@ export function createMcpServer(options: McpOptions = {}): Server {
   const server = new Server(
     {
       name: 'dreammate-mcp',
-      version: '0.8.1',
+      version: '0.10.0',
     },
     {
       capabilities: {
@@ -713,7 +714,26 @@ export async function callDreammateTool(
         }
 
         if (method) {
-          const methodDef = service.methods?.[method];
+          let methodDef = service.methods?.[method];
+          let resolvedMethod = method;
+          if (service.metadata?.mcp_source) {
+            const details = await withRequestTimeout(async signal => {
+              const response = await fetch(`${targetUrl}/services/${encodeURIComponent(serviceId)}/methods/${encodeURIComponent(method)}`, { signal });
+              return { ok: response.ok, status: response.status, data: await response.json() };
+            }, 35000);
+            if (details.ok) {
+              const data = details.data as { method?: string; details?: MethodDescriptor & { schema_loaded?: boolean } };
+              if (typeof data?.method !== 'string' || !data.details?.parameters || data.details.schema_loaded === false
+                || typeof data.details.parameters !== 'object' || Array.isArray(data.details.parameters)) {
+                return jsonResult({ error: 'MCP method schema is unavailable; received a summary instead of full parameters',
+                  service_id: serviceId, method, schema_loaded: false, http_status: 502 }, true);
+              }
+              methodDef = data.details;
+              resolvedMethod = data.method;
+            } else if (details.status !== 404 || !methodDef || (methodDef as { schema_loaded?: boolean }).schema_loaded === false) {
+              return jsonResult({ error: details.data, service_id: serviceId, method, schema_loaded: false, http_status: details.status }, true);
+            }
+          }
           return {
             content: [
               {
@@ -723,9 +743,11 @@ export async function callDreammateTool(
                     node: node || 'local',
                     service_id: service.id,
                     name: service.name,
-                    method,
+                    method: resolvedMethod,
+                    ...(resolvedMethod !== method ? { requested_method: method } : {}),
                     defined: Boolean(methodDef),
                     declared: Boolean(methodDef),
+                    schema_loaded: Boolean(methodDef?.parameters),
                     availability: (service.metadata?.method_availability as Record<string, unknown> | undefined)?.[method]
                       ?? { state: 'unknown', checked_at: null, observations: [] },
                     details: methodDef ?? {
@@ -1079,6 +1101,9 @@ export async function callDreammateTool(
 
 export async function runMcpServer(options: McpOptions = {}): Promise<void> {
   const server = createMcpServer(options);
+  const removeReloadHandler = installMcpReload(server, options);
+  server.onclose = removeReloadHandler;
   const transport = new StdioServerTransport();
-  await server.connect(transport);
+  try { await server.connect(transport); }
+  catch (error) { removeReloadHandler(); throw error; }
 }
