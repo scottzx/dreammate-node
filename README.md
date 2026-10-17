@@ -23,8 +23,8 @@
          ├─ POST /services/:id/start|stop       部分服务的启停
          └─ GET  /services/:id/skills/:name/archive
                   ▲
-      ┌───────────┴───────────┐  localhost 报备
- session-reader :7777    task-service :xxxx
+      ┌───────────┼──────────────────────┐  localhost 报备
+ session-reader :7777   skill-manager :36909   task-service :xxxx
 ```
 
 这把 pull 探测的成本从「N 个节点 × M 个端口」降到「N × 1」，
@@ -102,6 +102,154 @@ DREAMMATE_SKIP_SKILLS=1 npm i -g @1agents/dreammate-node
 源码目录尚未构建时可用 `npm run skills:install -- --profile ish`。安装/同步后由智能体重新
 加载技能；已打开的会话是否立即更新取决于宿主。`npm --ignore-scripts` 或安装脚本策略可阻止
 自动执行，此时使用手动补装命令。`dreammate-node uninstall` 仅卸载守护进程，保留 skill。
+
+### 让项目里的 Skill 可以被搜索和使用
+
+本机技能目录发现、来源配置、包版本和资源读取由独立包
+[`@1agents/skill-manager`](packages/skill-manager/README.md) 负责。它是独立服务，
+通过本机 HTTP 向 Node 报备技能管理能力；Node 发现并调用该服务，提供 HTTP/MCP、跨节点发现与检索。
+两者位于同一个仓库，npm workspace 仅用于共同开发；生产安装时双方没有彼此的 npm 依赖，
+分别维护版本、测试、构建和发布。Skill Manager 核心可脱离网关使用，
+接入层使用 Node 的通用报备协议；session-reader 仅是可选的项目目录提供者。
+
+```text
+智能体 → Node :36908 → Skill Manager 127.0.0.1:36909 → 技能原目录
+                     ↑ 本机服务报备
+```
+
+在保存技能原件的设备上安装并运行 Skill Manager：
+
+```sh
+npm i -g @1agents/skill-manager
+dreammate-skills serve --agent http://127.0.0.1:36908
+# macOS / Linux systemd user 长期托管
+dreammate-skills install --agent http://127.0.0.1:36908
+dreammate-skills status
+```
+
+默认只监听 `127.0.0.1:36909`。`serve` 可指定 `--port`、`--config`，
+`--no-projects` 关闭项目目录枚举，`--no-register` 仅运行本地服务。
+它每 15 秒向 Node 重报备，网关尚未启动或暂时离线不影响本地 CLI、目录读取和服务运行。
+Node 重启后由下一轮报备恢复接入；两个守护进程分别安装、检查和卸载。
+
+```sh
+npm ci
+npm run build                          # 只构建 Node，无需构建 Skill Manager
+npm run typecheck && npm test           # 只检查 Node
+npm run skill-manager:check            # 独立类型检查、测试和构建
+npm run test:packages                   # 在临时目录验证两个发布包的独立安装与消费
+npm run check:all                       # 全仓检查及两个服务的集成验收
+```
+
+独立版本与发布方式见 [Skill Manager 开发与发布说明](packages/skill-manager/README.md)，双方发布没有先后依赖。
+Node 自带指南的 `postinstall` 仍由 Node 维护，它属于该产品的安装流程。
+历史 `service.skills` 随服务附带的 SOP 及归档接口保留原有轻量兼容实现；
+项目来源发现、来源配置和版本化资源读取只由 Skill Manager 实现。
+
+Skill Manager 启动时自动发现常见共享目录，随后在后台通过可选的 `1session projects --global --json`
+补充项目技能，每五分钟刷新候选来源。普通搜索只读取已知来源，不启动会话枚举。
+也可立即触发一次自动登记：
+
+```sh
+dreammate-node skills discover
+dreammate-node skills discover --no-projects
+```
+
+共享目录采用已知约定：`~/.agents/skills`、Claude、Codex、Gemini、Antigravity、Grok、DSH
+的用户目录及相应环境变量；系统目录包括 `/etc/codex/skills` 和平台对应的 1agents 共享目录。
+只登记本机实际存在的目录，现有链接技能按目标真实路径去重，手工登记的来源优先。
+session-reader 提供会话记录的工作目录及归并后的项目路径；历史路径需先在本机核验，
+并补充最近 Git 根目录，不扫描整个磁盘。它记录的是会话工作目录，不保证包含每次命令切换过的全部 PWD。
+没有安装 reader 或枚举失败时，返回独立诊断，共享目录和手工来源仍然可用。
+移除自动来源会记录排除项，后续自动刷新不会重新加回；源技能文件始终保留。
+
+在保存技能原件的设备上登记来源。项目模式扫描 `.agents/skills`、`.claude/skills` 和
+其他常见智能体约定的技能目录；也可以直接登记一个技能包或技能集合目录。登记操作通过本机 loopback
+网关转发到已报备的 Skill Manager，配置保存在 `~/.1agents/skill-sources.json`；服务重启后恢复。
+独立 CLI 改写配置后，Skill Manager 会在后续读取时自动加载。并发写入以同目录 `.lock` 文件互斥，冲突返回 409，重试即可；
+异常退出遗留锁时，先检查锁记录中的 PID 已停止，再删除该锁文件并重试，正常写入会自动清理锁。
+
+```sh
+dreammate-node skills add --name my-project --project /absolute/path/to/project
+dreammate-node skills add --name my-skills --dir /absolute/path/to/skills
+dreammate-node skills list
+dreammate-node skills refresh skills-my-project
+dreammate-node skills remove skills-my-project
+```
+
+只登记需要发布的目录：目录中的技能指南和未排除的配套文件可经网关读取。
+单个技能包需要 `SKILL.md`（优先使用 `SKILL.remote.md`）及非空名称、用途说明。
+正文、脚本、参考资料和素材保留在原目录；只持久保存来源配置，不复制到各宿主的技能目录。
+每次查询从源端重新扫描，新增、修改和删除自动反映到目录，缺失或无效来源有独立诊断。
+包内符号链接、隐藏文件、`node_modules` 和凭据文件不发布，扫描有数量、深度和大小上界。
+
+任意可达的客户端先搜索摘要，再用结果中的 `node`、`id`、`revision` 读取完整指南：
+
+```sh
+dreammate-node cli search-skills --agent http://GATEWAY:36908 --query '改进三维场景的灯光和材质'
+dreammate-node cli search-skills --agent http://GATEWAY:36908 --query 'CAD 提取' --source skills-my-skills
+dreammate-node cli read-skill --agent http://GATEWAY:36908 --node DEVICE --skill SKILL_ID --revision HASH
+dreammate-node cli read-skill --agent http://GATEWAY:36908 --node DEVICE --skill SKILL_ID --revision HASH --resource references/stages.md
+```
+
+`DEVICE`、`SKILL_ID`、`HASH` 都取真实搜索结果；资源路径不含 Markdown 的 `#锚点`。
+搜索默认跨已知节点，支持 `--node localhost`、`--limit`、`--offset`、`--max-chars`。
+关键词与可选向量检索复用现有模型发现及预算策略；结果只含技能摘要，不携带正文或脚本。
+向量是可重建的检索索引，不承担内容存储；按需模型可持久保存文档向量，原技能仍在来源目录。来源不在线时无法读取其技能。
+语义检索默认共享 5 秒模型预算，超时仍返回关键词结果。CPU 模型响应较慢时可显式设置
+`DREAMMATE_EMBEDDING_TIMEOUT_MS=15000`，并让 CLI 的 `--timeout-ms` 覆盖节点发现及模型预算。
+
+正文加载后可直接供当前会话使用。返回的资源清单只含相对路径与文件大小，配套资源按需读取，
+二进制以 base64 返回。整个发布包的内容哈希作为 `revision`，脚本或文档变化时旧版本读取
+返回 HTTP 409 / `SKILL_REVISION_CHANGED`，需要重新搜索并读取。读取不执行脚本；设备软件、
+图纸及运行依赖属于实际执行节点，远程读取指南不等于具备在客户端运行脚本的环境。
+`revision` 是 Skill Manager 计算的整包版本令牌；业务工件合同里的 `skill.sha256` 若另有计算规范，仍按其规范生成，二者不直接互换。
+
+MCP 对应 `dreammate_search_skills` → `dreammate_read_skill`。HTTP 为分页
+`GET /skills?limit=100&offset=0`、`GET /skills/:id?revision=HASH&resource=PATH`；
+来源管理为仅 loopback 的 `GET|POST /skills/sources`、`DELETE /skills/sources/:id`、
+`POST /skills/sources/discover`、`POST /skills/sources/:id/refresh`（或 `/skills/sources/refresh` 刷新全部）。
+这些路径是 Node 的协议适配层，只代理已报备且声明
+`metadata.skill_provider.protocol = "dreammate.skills.v1"` 的服务。
+没有已报备的技能服务时返回 HTTP 503，表示服务未接入；Node 不会扫描目录或自行启动 Manager。
+来源管理方法同时受 Node 通用 `metadata.local_only_methods` 限制，仅允许 loopback 调用。
+旧网关未提供目录接口时，
+跨节点搜索保留 `unsupported` 扫描诊断与 `partial`，不能把它解释为节点没有技能。
+
+### Mac 按需使用本地向量模型
+
+已准备本地 Python 环境和 Qwen 权重后，可以安装轻量启动器。下面在已准备模型的仓库根目录执行：
+
+```sh
+dreammate-node embedding install \
+  --python "$PWD/.local/tool-search/venv/bin/python" \
+  --manifest "$PWD/.local/tool-search/manifest.json" \
+  --device mps --batch-size 8 --idle-timeout-ms 300000 --priority 100 --sharing local
+dreammate-node embedding status
+dreammate-node embedding uninstall
+```
+
+优先级和共享范围可持久配置：`dreammate-node embedding config` 查看，
+`dreammate-node embedding config --priority 100 --sharing local` 修改。
+默认文件 `~/.1agents/embedding-config.json` 的 `priority` 覆盖安装时的 `--priority` 兜底值，数值越大越优先。
+运行中的启动器每 15 秒重读并更新报备，无需重启模型或 MCP；配置变更不延长模型空闲时间。
+详细格式和异常处理见 [本地模型配置](docs/local-embeddings.md#通过配置调整优先级)。
+
+macOS launchd 只保持轻量 HTTP 启动器在线；首次实际编码请求才启动 Python 和模型。
+最后一个编码请求结束后连续空闲 5 分钟，退出 Python 释放模型内存；下一次检索重新加载。
+健康检查和每 15 秒的服务报备不会加载模型或重置空闲时间，多个 CLI/MCP 共用同一个模型进程。
+`status` 的 `loaded`、`loading`、`worker_pid`、`idle_timeout_ms` 分别报告模型状态，启动器在线不等于模型已加载。
+按需运行器将文档文本哈希及向量保存在 `~/.1agents/cache/embeddings/`，不保存原文或查询。
+模型卸载后保留该缓存，下一次启动按模型版本和编码配置校验恢复，避免反复编码整个目录。
+
+默认服务优先级为 100，高于普通远端模型的 0；默认全网搜索会先尝试本机这个服务，失败时仍按现有预算尝试备用。
+`sharing: local` 仅允许本机 Agent 发现和使用模型，其他设备不能经网关调用；
+本机仍可使用网络共享的远端备用模型。`network` 才会向其他设备开放本模型，旧配置省略时保持网络共享行为。
+显式 `--node localhost` 没有远端回退，与模型共享范围分别配置。
+不设置固定 `DREAMMATE_EMBEDDING_URL`，已有 MCP 可在后续搜索中自动发现新服务。
+首次模型加载和未缓存的目录编码都计入语义预算；当前 Mac 的 MCP 配置为 30 秒，独立 CLI 需显式传
+`DREAMMATE_EMBEDDING_TIMEOUT_MS=30000`，并以 `--timeout-ms 60000` 为整条命令预留发现时间。
+这一步不下载模型，安装路径、完整生命周期及故障说明见 [本地模型文档](docs/local-embeddings.md)。
 
 ## iSH / 无常驻进程的客户端
 
@@ -274,6 +422,8 @@ await reportAndHoldRegistration({
 |------|------|
 | `dreammate_list_nodes` | 发现 Tailnet / 局域网中的设备节点 |
 | `dreammate_search_tools` | 必填 `query`，默认跨已知节点检索，最多 15 条方法摘要；相关性允许时尽量覆盖 2–3 个工具集 |
+| `dreammate_search_skills` | 必填 `query`，跨节点检索项目或独立目录发布的技能摘要，返回来源和内容版本 |
+| `dreammate_read_skill` | 按搜索返回的节点、技能 ID 和 revision 读取完整指南或一个配套资源 |
 | `dreammate_list_services` | 分页浏览本机、指定节点或全网（`node: "all"`）已报备服务摘要 |
 | `dreammate_list_capabilities` | `list_services` 的向后兼容别名 |
 | `dreammate_inspect` | 无 `method` 时分页看摘要目录；指定方法时读取该方法 Schema，或按需读技能指南 |
@@ -287,6 +437,12 @@ HTTP 侧对应 `GET /nodes`、`POST /services/:id/invoke`、`POST /capabilities/
 
 ## 添加自定义 MCP
 
+按客户端 Token 隔离权限时，将标准 `mcpServers` 配置保存为权限 600 的
+`~/.1agents/mcp-client.json`，由 DreamMate CLI/Stdio MCP 私有加载。通过
+`--mcp-config PATH` 选择其他身份；`--node @client` 仅发现和调用当前进程的私有工具。
+这些来源不导入共享网关，身份不能通过工具参数切换。配置及 ERP 双 Token 示例见
+[客户端私有配置](docs/custom-mcp.md#客户端私有配置独立-token-身份)。
+
 在运行网关的机器上粘贴标准 `mcpServers` JSON，即可连接本地 stdio 或远程 Streamable HTTP / SSE MCP，自动发现工具并接入现有搜索、inspect 和调用：
 
 ```bash
@@ -294,11 +450,17 @@ dreammate-node mcp add --config '{"mcpServers":{"demo":{"command":"npx","args":[
 dreammate-node mcp add --file ./mcp.json
 cat ./mcp.json | dreammate-node mcp add --file -
 dreammate-node mcp list
+dreammate-node mcp share mcp-demo --scope local
+dreammate-node mcp share mcp-demo --scope network
 dreammate-node mcp refresh mcp-demo
 dreammate-node mcp remove mcp-demo
 ```
 
-原有 `dreammate-node mcp --agent ...` 仍用于启动面向客户端的 MCP 网关。添加后服务 ID 为 `mcp-<配置名>`，方法为 `mcp-<配置名>.<上游工具名>`。源配置持久化到本机 `~/.1agents/mcp-sources.json`（权限 600），网关重启后自动恢复，连接断开后自动重连。管理入口仅接受本机回环请求；工具仍可由其他节点发现与调用。
+原有 `dreammate-node mcp --agent ...` 仍用于启动面向客户端的 MCP 网关。添加后服务 ID 为 `mcp-<配置名>`，方法为 `mcp-<配置名>.<上游工具名>`。源配置持久化到本机 `~/.1agents/mcp-sources.json`（权限 600），网关重启后自动恢复，连接断开后自动重连。管理入口仅接受本机回环请求。
+
+MCP 接入与共享独立设置：每个来源的 `sharing` 支持 `local` / `network`，省略时默认 `network`，已有配置继续网络内共用。`local` 仅允许通过本网关的回环入口发现、读取契约和调用；远端即使知道服务或方法名也不能访问。可在源 JSON 中设置 `"sharing":"local"`，或用 `mcp share` 单独切换，即时生效并持久保存，无需重连上游。`mcp list` 显示当前共享范围。`reachability: localhost` 只描述上游直连地址，不代表仅本机可调用。
+
+`network` 延续可信网络共用模式，不增加按设备或 Agent 的身份鉴权；允许访问该来源的调用方共用上游凭据。细粒度授权后续再做。
 
 添加时自动遍历标准工具目录；支持子动作目录的来源会进一步展开工具集。Activepieces 自动识别已连接应用，GitHub 等内部动作直接进入搜索，选中后按需加载参数，再通过原有调用入口执行。完整方法名包含来源、工具集和稳定标识；特殊字符自动转换，唯一简称可自动匹配，重名简称会返回候选名称供选择。
 
@@ -318,7 +480,7 @@ node scripts/local-embeddings/serve.mjs --model qwen3 --port 8766 --agent http:/
 
 ## 为什么报备只认回环（与安全模型）
 
-`POST /services` 是整个 agent 唯一的写入口。限制回环（`127.0.0.1`）是为了阻断**外部网络**直接往你的节点里塞假服务或恶意摘除服务。
+服务报备、MCP 来源配置和技能来源管理入口限制回环（`127.0.0.1`），阻断**外部网络**直接往节点里塞假服务、改动来源或摘除服务。
 
 > ⚠️ **澄清认知误区：回环 ≠ 100% 绝对安全。**  
 > `127.0.0.1` 只能防止外部网络机器直连，但**不防同机其他非受信任进程**——任何本地进程都能向 `POST /services` 报备。当前 MVP 基于**受信任主机（Trusted Host）威胁模型**。  

@@ -4,6 +4,7 @@
  * 采用「两阶段渐进式发现（Progressive Discovery）」与全网分布式节点拓扑架构：
  * 1. dreammate_list_nodes: 列出局域网/Tailnet 内所有在线设备节点（设备级发现）；
  * 2. dreammate_search_tools: 按用户意图检索少量具体方法摘要（推荐）；
+ *    dreammate_search_skills / dreammate_read_skill: 独立项目技能的检索与固定版本按需读取；
  *    dreammate_list_services: 有界分页浏览本机或远端节点上的服务概况；
  *    dreammate_list_capabilities 为其向后兼容别名；
  * 3. dreammate_inspect: 按需获取目标节点上特定服务的方法契约与参数 Schema；
@@ -27,15 +28,20 @@ import type { NetworkNode } from './identity.js';
 import { directoryNodeUrl, findDirectoryNode, type NodeDirectory } from './node-directory.js';
 import { installSkillPackage, listSkillArchive } from './skills.js';
 import { withRequestTimeout } from './request-timeout.js';
-import { pageResponse, parsePageOptions, searchTools } from './tool-search.js';
+import { pageResponse, parsePageOptions, searchTools, searchSkills, type DiscoveredSkill } from './tool-search.js';
 import { discoverEmbeddingProviders } from './embedding-providers.js';
 import { installMcpReload } from './mcp-runtime.js';
+import { loadPrivateMcpSources, type PrivateMcpSources } from './mcp-client-sources.js';
 
 export interface McpOptions {
   agentUrl?: string;
+  /** Startup-only private sources. Never registered with an HTTP node or selected by tool arguments. */
+  privateMcpSources?: PrivateMcpSources;
+  /** Private client configuration file; used by the stdio entry point only. */
+  mcpConfig?: string;
   /** Explicitly imported address snapshot. No live topology queries in this mode. */
   nodeDirectory?: NodeDirectory;
-  /** Optional local embedding endpoint, shared by all method searches. */
+  /** Optional local embedding endpoint, shared by method and skill searches. */
   embeddingUrl?: string;
   embeddingModel?: string;
   embeddingTimeoutMs?: number;
@@ -49,6 +55,7 @@ function nodeBaseUrl(localAgentUrl: string, node: NetworkNode): string {
 
 /** Resolve before sending a request. Never replay a mutation after a network error. */
 async function resolveNodeBaseUrl(localAgentUrl: string, node?: string, directory?: NodeDirectory): Promise<string> {
+  if (node === '@client') throw new Error('@client 仅支持当前进程私有 MCP 的 search/services/inspect/invoke，不是网络节点');
   if (!node || node === 'localhost' || node === '127.0.0.1') return localAgentUrl;
   if (/^https?:\/\//.test(node)) return node.replace(/\/+$/, '');
   const cached = directory ? findDirectoryNode(directory, node) : undefined;
@@ -95,7 +102,7 @@ function timedOut(error: unknown): boolean {
 interface NodeScan {
   node: string;
   url: string;
-  status: 'ok' | 'http_error' | 'timeout' | 'unreachable' | 'invalid_response';
+  status: 'ok' | 'http_error' | 'timeout' | 'unreachable' | 'invalid_response' | 'unsupported';
   checked_at: string;
   http_status?: number;
   error?: string;
@@ -103,7 +110,8 @@ interface NodeScan {
 }
 
 async function scanServices(url: string, node: string) {
-  const scan: NodeScan = { node, url, status: 'ok', checked_at: new Date().toISOString() };
+  const networkNode = node === '@client' ? url : node;
+  const scan: NodeScan = { node: networkNode, url, status: 'ok', checked_at: new Date().toISOString() };
   let services: (RegisteredService & { node: string; gateway_url: string })[] = [];
   try {
     const res = await withRequestTimeout(async signal => {
@@ -118,7 +126,7 @@ async function scanServices(url: string, node: string) {
       const data = res.data as { node?: string; services: RegisteredService[] } | null;
       if (!data || !Array.isArray(data.services) || data.services.some(s => !s || typeof s.id !== 'string')) {
         scan.status = 'invalid_response';
-      } else services = data.services.map(s => ({ ...s, node: data.node ?? node, gateway_url: url }));
+      } else services = data.services.map(s => ({ ...s, node: data.node === '@client' ? networkNode : data.node ?? networkNode, gateway_url: url }));
     }
   } catch (error) {
     scan.status = timedOut(error) ? 'timeout' : error instanceof SyntaxError ? 'invalid_response' : 'unreachable';
@@ -164,7 +172,7 @@ function extractSkillsMap(service: RegisteredService): Record<string, unknown> {
 }
 
 /** Shared discovery preserves failed scans even when a search has no matches. */
-async function discoverServices(agentUrl: string, node: string | undefined, options: McpOptions) {
+async function discoverTargets(agentUrl: string, node: string | undefined, options: McpOptions) {
   let discovery: { status: string; error?: string; exported_at?: string; scope?: string } = { status: 'ok' };
   let targets: { url: string; name: string }[];
   if (node === 'all' && options.nodeDirectory) {
@@ -186,7 +194,22 @@ async function discoverServices(agentUrl: string, node: string | undefined, opti
       targets = [{ url: agentUrl, name: 'local' }];
     }
   } else targets = [{ url: await resolveNodeBaseUrl(agentUrl, node, options.nodeDirectory), name: node || 'local' }];
+  return { targets, discovery };
+}
+
+async function discoverServices(agentUrl: string, node: string | undefined, options: McpOptions) {
+  const { targets, discovery } = node === '@client' ? { targets: [], discovery: { status: 'ok' } }
+    : await discoverTargets(agentUrl, node, options);
   const batches = await Promise.all(targets.map(t => scanServices(t.url, t.name)));
+  if (node === undefined || node === 'all' || node === '@client') {
+    if (options.privateMcpSources) batches.push({
+      scan: { node: '@client', url: 'client-private:', status: 'ok', checked_at: new Date().toISOString() },
+      services: options.privateMcpSources.list().map(service => ({ ...service,
+        node: '@client', gateway_url: 'client-private:', metadata: { ...service.metadata, client_private: true } })),
+    });
+    else if (node === '@client') batches.push({ scan: { node: '@client', url: 'client-private:',
+      status: 'unsupported', checked_at: new Date().toISOString(), error: '未配置当前进程私有 MCP' }, services: [] });
+  }
   const scans = batches.map(b => b.scan);
   return {
     services: batches.flatMap(b => b.services),
@@ -197,6 +220,77 @@ async function discoverServices(agentUrl: string, node: string | undefined, opti
       scans,
     },
     allFailed: scans.length === 0 || scans.every(s => s.status !== 'ok'),
+  };
+}
+
+/** Bound network work independently from the small, paginated result sent to the model. */
+async function scanSkills(url: string, node: string) {
+  const scan: NodeScan & { catalog_truncated?: boolean; diagnostics_count?: number } = {
+    node, url, status: 'ok', checked_at: new Date().toISOString(),
+  };
+  let skills: DiscoveredSkill[] = [];
+  try {
+    skills = await withRequestTimeout(async signal => {
+      const result: DiscoveredSkill[] = [];
+      let offset = 0;
+      for (let page = 0; page < 5; page++) {
+        const response = await fetch(`${url}/skills?limit=200&offset=${offset}`, { signal, redirect: 'error' });
+        scan.http_status = response.status;
+        if (!response.ok) {
+          await response.body?.cancel();
+          scan.status = response.status === 404 ? 'unsupported' : 'http_error';
+          return result;
+        }
+        const data = await response.json() as { node?: unknown; skills?: unknown; has_more?: unknown; next_offset?: unknown; diagnostics?: unknown };
+        if (!data || !Array.isArray(data.skills) || data.skills.length > 200) throw new SyntaxError('Invalid skill catalog');
+        for (const raw of data.skills) {
+          const skill = raw as Record<string, unknown> | null;
+          if (!skill || typeof skill.id !== 'string' || !skill.id || skill.id.length > 256
+            || typeof skill.source_id !== 'string' || !/^skills-[A-Za-z0-9_-]{1,64}$/.test(skill.source_id)
+            || typeof skill.name !== 'string' || !skill.name || skill.name.length > 128
+            || typeof skill.description !== 'string' || !skill.description || skill.description.length > 4096
+            || typeof skill.revision !== 'string' || !/^[a-f0-9]{64}$/.test(skill.revision)
+            || (skill.scope !== undefined && !['user', 'system', 'project'].includes(String(skill.scope)))
+            || (skill.compatibility !== undefined && (typeof skill.compatibility !== 'string' || skill.compatibility.length > 1024))) {
+            throw new SyntaxError('Invalid skill summary');
+          }
+          result.push({ id: skill.id, source_id: skill.source_id, name: skill.name, description: skill.description,
+            revision: skill.revision, node,
+            ...(skill.scope !== undefined ? { scope: skill.scope as DiscoveredSkill['scope'] } : {}),
+            ...(typeof skill.compatibility === 'string' ? { compatibility: skill.compatibility } : {}) });
+        }
+        if (Array.isArray(data.diagnostics) && data.diagnostics.length) scan.diagnostics_count = data.diagnostics.length;
+        if (!data.has_more) return result;
+        if (typeof data.next_offset !== 'number' || !Number.isSafeInteger(data.next_offset) || data.next_offset <= offset) {
+          throw new SyntaxError('Invalid skill catalog cursor');
+        }
+        offset = data.next_offset;
+      }
+      scan.catalog_truncated = true;
+      return result;
+    }, 3000);
+  } catch (error) {
+    scan.status = timedOut(error) ? 'timeout' : error instanceof SyntaxError ? 'invalid_response' : 'unreachable';
+    scan.error = error instanceof Error ? error.message : String(error);
+  }
+  return { scan, skills };
+}
+
+async function discoverSkills(agentUrl: string, node: string, options: McpOptions) {
+  const { targets, discovery } = await discoverTargets(agentUrl, node, options);
+  const batches = await Promise.all(targets.map(async target => {
+    const [catalog, services] = await Promise.all([scanSkills(target.url, target.name), scanServices(target.url, target.name)]);
+    return { ...catalog, services: services.services, providerScan: services.scan };
+  }));
+  const scans = batches.map(batch => batch.scan);
+  return {
+    skills: batches.flatMap(batch => batch.skills), services: batches.flatMap(batch => batch.services),
+    providerDiscoveryPartial: batches.some(batch => batch.providerScan.status !== 'ok'),
+    evidence: { scope: node, discovery, scans,
+      partial: discovery.status !== 'ok' || scans.length === 0
+        || scans.some(scan => scan.status !== 'ok' || scan.catalog_truncated || scan.diagnostics_count),
+    },
+    allFailed: scans.length === 0 || scans.every(scan => scan.status !== 'ok'),
   };
 }
 
@@ -233,6 +327,8 @@ function boundedEvidence(evidence: Awaited<ReturnType<typeof discoverServices>>[
       ...(s.http_status ? { http_status: s.http_status } : {}),
       ...(s.error ? { error: shortText(s.error, 60) } : {}),
       ...(s.error_code ? { error_code: shortText(s.error_code, 40) } : {}),
+      ...('catalog_truncated' in s && s.catalog_truncated ? { catalog_truncated: true } : {}),
+      ...('diagnostics_count' in s && s.diagnostics_count ? { diagnostics_count: s.diagnostics_count } : {}),
     })),
   };
   // Reserve most of even the smallest budget for method/service results and paging metadata.
@@ -246,6 +342,28 @@ function boundedEvidence(evidence: Awaited<ReturnType<typeof discoverServices>>[
 
 export const MCP_TOOLS: Tool[] = [
   {
+    name: 'dreammate_search_skills',
+    description: '按任务跨节点检索项目或独立目录发布的 Skill，只返回名称、用途、来源和内容版本；关键词检索可用时结合已发现的本地向量模型。选中后用 dreammate_read_skill 读取完整指南及按需资源。搜索不会安装技能或执行脚本。',
+    inputSchema: { type: 'object', properties: {
+      query: { type: 'string', minLength: 1, maxLength: 2000, description: '任务描述或技能名称，不能为空' },
+      node: { type: 'string', default: 'all', description: '默认跨已知节点；localhost 限定入口网关，也可指定节点名、IP 或 URL' },
+      source_id: { type: 'string', description: '可选技能来源 ID，来自搜索结果或本机 skills list' },
+      ...PAGE_PROPERTIES,
+      limit: { ...PAGE_PROPERTIES.limit, default: 15 },
+      max_chars: { ...PAGE_PROPERTIES.max_chars, default: 12000 },
+    }, required: ['query'] },
+  },
+  {
+    name: 'dreammate_read_skill',
+    description: '从搜索结果指定的节点读取完整 Skill 指南，或按相对路径读取一个配套资源。必须带搜索返回的 revision；源文件变化会返回版本冲突，应重新检索。内容来自源节点，路径和运行依赖属于该节点；读取不会安装技能或执行脚本。',
+    inputSchema: { type: 'object', properties: {
+      skill_id: { type: 'string', description: '搜索结果中的技能 id' },
+      revision: { type: 'string', pattern: '^[a-f0-9]{64}$', description: '搜索结果中的整包内容哈希，保证指南与资源版本一致' },
+      node: { type: 'string', description: '搜索结果中的节点名、IP 或 URL；省略时读取入口网关' },
+      resource: { type: 'string', description: '可选技能包内相对文件路径，例如 references/stages.md；省略时返回完整指南和资源清单' },
+    }, required: ['skill_id', 'revision'] },
+  },
+  {
     name: 'dreammate_search_tools',
     description:
       '首选工具发现入口：默认跨节点搜索具体方法，最多返回 15 条相关方法摘要，并遵守字符预算；相关性允许时优先覆盖 2–3 个工具集。支持本地语义检索，未配置或不可用时降级为有界词法检索。先搜索，再对选中的方法 dreammate_inspect 获取 Schema；低匹配时细化 query 或分页。',
@@ -253,7 +371,7 @@ export const MCP_TOOLS: Tool[] = [
       type: 'object',
       properties: {
         query: { type: 'string', minLength: 1, maxLength: 2000, description: '要完成的具体任务或工具名称；应描述动作和对象，不能为空' },
-        node: { type: 'string', default: 'all', description: '默认 all：扫描全网已发现节点（导入目录模式扫描目录中的全部节点）；指定 localhost 只查本机，也可指定节点名/IP/URL' },
+        node: { type: 'string', default: 'all', description: '默认 all：扫描已知节点与本进程私有来源；@client 仅查私有 MCP，localhost 仅查入口网关，也可指定节点名/IP/URL' },
         kind: { type: 'string', description: '可选服务类型过滤' },
         service_id: { type: 'string', description: '可选：仅搜索指定服务的方法' },
         include_disabled: { type: 'boolean', description: '是否包含禁用服务（默认 false）' },
@@ -291,7 +409,7 @@ export const MCP_TOOLS: Tool[] = [
       properties: {
         node: {
           type: 'string',
-          description: '可选：指定设备节点名称或 IP（例如 "spark-e72e" 或 "all" 扫描全网）。省略时默认查询本机。',
+          description: '指定设备名/IP 或 all；@client 仅查本进程私有 MCP。省略时查询入口网关与私有来源。',
         },
         keyword: {
           type: 'string',
@@ -318,7 +436,7 @@ export const MCP_TOOLS: Tool[] = [
       properties: {
         node: {
           type: 'string',
-          description: '可选：指定设备节点名称或 IP（省略时默认本机）',
+          description: '指定设备名/IP；@client 仅查私有 MCP。省略时查询入口网关与私有来源。',
         },
         keyword: {
           type: 'string',
@@ -345,7 +463,7 @@ export const MCP_TOOLS: Tool[] = [
       properties: {
         node: {
           type: 'string',
-          description: '可选：目标服务所在的设备节点名称或 IP（省略时为本机）',
+          description: '使用搜索结果的 node；@client 表示本进程私有 MCP。省略时为入口网关。',
         },
         service_id: {
           type: 'string',
@@ -377,7 +495,7 @@ export const MCP_TOOLS: Tool[] = [
       properties: {
         node: {
           type: 'string',
-          description: '可选：目标服务所在的设备节点名称或 IP（省略时为本机）',
+          description: '使用搜索结果的 node；@client 表示本进程私有 MCP。省略时为入口网关。',
         },
         service_id: {
           type: 'string',
@@ -489,6 +607,61 @@ export async function callDreammateTool(
   const agentUrl = (options.agentUrl ?? DEFAULT_AGENT_URL).replace(/\/+$/, '');
 
     try {
+      if (name === 'dreammate_search_skills') {
+        if (typeof args.query !== 'string' || !args.query.trim() || args.query.length > 2000) {
+          return jsonResult({ error: 'query 必须是 1–2000 字符的非空任务描述' }, true);
+        }
+        if (args.source_id !== undefined && (typeof args.source_id !== 'string' || !/^skills-[A-Za-z0-9_-]{1,64}$/.test(args.source_id))) {
+          return jsonResult({ error: 'source_id 必须是有效的 skills- 来源 ID' }, true);
+        }
+        if (args.node !== undefined && (typeof args.node !== 'string' || !args.node.trim())) return jsonResult({ error: 'node 必须是非空字符串' }, true);
+        const searchArgs = { ...args, limit: args.limit ?? 15, max_chars: args.max_chars ?? 12000 };
+        parsePageOptions(searchArgs);
+        const found = await discoverSkills(agentUrl, (args.node as string | undefined) ?? 'all', options);
+        const embeddingProviders = discoverEmbeddingProviders(found.services, options.embeddingModel ?? process.env.DREAMMATE_EMBEDDING_MODEL);
+        const result = await searchSkills(found.skills, searchArgs, { ...options, embeddingProviders, responseBase: {
+          ...boundedEvidence(found.evidence, searchArgs),
+          provider_discovery_partial: found.providerDiscoveryPartial,
+          ...(found.allFailed ? { error: '未能读取任何节点的技能目录；请核对网关连通性和技能目录接口版本' } : {}),
+        } });
+        return jsonResult(result, found.allFailed);
+      }
+
+      if (name === 'dreammate_read_skill') {
+        const skillId = args.skill_id;
+        const revision = args.revision;
+        const resource = args.resource;
+        if (typeof skillId !== 'string' || !skillId.trim() || skillId.length > 256 || skillId.includes('\0')
+          || typeof revision !== 'string' || !/^[a-f0-9]{64}$/.test(revision)) {
+          return jsonResult({ error: 'skill_id 和搜索返回的 64 位 revision 必填' }, true);
+        }
+        if (args.node !== undefined && (typeof args.node !== 'string' || !args.node.trim() || args.node === 'all')) {
+          return jsonResult({ error: '读取技能必须指定单个节点，不能使用 node: all' }, true);
+        }
+        if (resource !== undefined && (typeof resource !== 'string' || !resource || resource.length > 1024
+          || resource.startsWith('/') || resource.includes('\\') || resource.includes('\0') || resource.split('/').some(part => part === '..' || part === '.' || part === '')
+          || /^[A-Za-z]:/.test(resource))) return jsonResult({ error: 'resource 必须是技能包内的相对文件路径' }, true);
+        const node = args.node as string | undefined;
+        const target = await resolveNodeBaseUrl(agentUrl, node, options.nodeDirectory);
+        const url = new URL(`${target}/skills/${encodeURIComponent(skillId)}`);
+        url.searchParams.set('revision', revision);
+        if (typeof resource === 'string') url.searchParams.set('resource', resource);
+        const response = await withRequestTimeout(async signal => {
+          const res = await fetch(url, { signal, redirect: 'error' });
+          return { status: res.status, ok: res.ok, data: await res.json() as Record<string, unknown> };
+        }, 5000);
+        if (!response.ok) return jsonResult({ ...response.data, http_status: response.status,
+          ...(response.status === 409 ? { code: 'SKILL_REVISION_CHANGED', next_action: '重新检索技能并使用新 revision 读取指南和资源' } : {}),
+        }, true);
+        if (!response.data || response.data.id !== skillId || response.data.revision !== revision
+          || typeof response.data.content !== 'string' || !['utf8', 'base64'].includes(String(response.data.encoding))) {
+          return jsonResult({ error: '技能接口返回了无效内容或不同版本', code: 'INVALID_SKILL_RESPONSE' }, true);
+        }
+        return jsonResult({ ...response.data, node: node || 'local', origin_gateway: target,
+          execution: { performed: false, note: '内容来自来源节点；相对资源通过同一技能接口读取，脚本执行位置和依赖需按指南确定' },
+        });
+      }
+
       if (name === 'dreammate_list_nodes') {
         const onlineOnly = args.online_only !== false;
         const keyword = (args.keyword as string | undefined)?.toLowerCase().trim();
@@ -661,31 +834,40 @@ export async function callDreammateTool(
 
         if (!method && !skill) parsePageOptions(args, { limit: 10 });
 
-        const targetUrl = await resolveNodeBaseUrl(agentUrl, node, options.nodeDirectory);
-        let res: Response;
-        try {
-          res = await fetch(`${targetUrl}/services/${encodeURIComponent(serviceId)}`, { signal: AbortSignal.timeout(5000) });
-        } catch {
-          return {
-            content: [{ type: 'text', text: `无法连接到目标节点 (${targetUrl})。` }],
-            isError: true,
-          };
-        }
+        const privateSource = node === '@client' ? options.privateMcpSources : undefined;
+        let service: RegisteredService;
+        let targetUrl = '';
+        if (node === '@client') {
+          const found = privateSource?.get(serviceId);
+          if (!found) return jsonResult({ node, service_id: serviceId, error: '当前私有 MCP 配置中没有此服务' }, true);
+          service = found;
+        } else {
+          targetUrl = await resolveNodeBaseUrl(agentUrl, node, options.nodeDirectory);
+          let res: Response;
+          try {
+            res = await fetch(`${targetUrl}/services/${encodeURIComponent(serviceId)}`, { signal: AbortSignal.timeout(5000) });
+          } catch {
+            return {
+              content: [{ type: 'text', text: `无法连接到目标节点 (${targetUrl})。` }],
+              isError: true,
+            };
+          }
 
-        if (res.status === 404) {
-          return {
-            content: [{ type: 'text', text: `在节点 (${targetUrl}) 上未找到服务: ${serviceId}` }],
-            isError: true,
-          };
-        }
-        if (!res.ok) {
-          return {
-            content: [{ type: 'text', text: `节点响应异常: HTTP ${res.status}` }],
-            isError: true,
-          };
-        }
+          if (res.status === 404) {
+            return {
+              content: [{ type: 'text', text: `在节点 (${targetUrl}) 上未找到服务: ${serviceId}` }],
+              isError: true,
+            };
+          }
+          if (!res.ok) {
+            return {
+              content: [{ type: 'text', text: `节点响应异常: HTTP ${res.status}` }],
+              isError: true,
+            };
+          }
 
-        const service = (await res.json()) as RegisteredService;
+          service = (await res.json()) as RegisteredService;
+        }
         const skillsMap = extractSkillsMap(service);
 
         if (skill) {
@@ -716,7 +898,11 @@ export async function callDreammateTool(
         if (method) {
           let methodDef = service.methods?.[method];
           let resolvedMethod = method;
-          if (service.metadata?.mcp_source) {
+          if (privateSource) {
+            const details = await privateSource.describe(serviceId, method);
+            methodDef = details.details;
+            resolvedMethod = details.method;
+          } else if (service.metadata?.mcp_source) {
             const details = await withRequestTimeout(async signal => {
               const response = await fetch(`${targetUrl}/services/${encodeURIComponent(serviceId)}/methods/${encodeURIComponent(method)}`, { signal });
               return { ok: response.ok, status: response.status, data: await response.json() };
@@ -795,6 +981,19 @@ export async function callDreammateTool(
             content: [{ type: 'text', text: '缺少必填参数: service_id 和 method (或 capability)' }],
             isError: true,
           };
+        }
+
+        if (node === '@client') {
+          const source = options.privateMcpSources;
+          if (!source?.get(serviceId)) return jsonResult({ node, service_id: serviceId,
+            error: '当前私有 MCP 配置中没有此服务', retryable: false }, true);
+          const result = await source.invoke(serviceId, { method, params });
+          const mcp = CallToolResultSchema.safeParse(result.data);
+          const context = { node, service_id: serviceId, method, upstream_status: result.status, client_private: true };
+          if (mcp.success && result.data && typeof result.data === 'object'
+            && Array.isArray((result.data as { content?: unknown }).content)) return { ...mcp.data, ...(result.status >= 400 ? { isError: true } : {}),
+            _meta: { ...mcp.data._meta, dreammate: context } };
+          return jsonResult({ ...context, error: result.data, retryable: false }, true);
         }
 
         const targetUrl = await resolveNodeBaseUrl(agentUrl, node, options.nodeDirectory);
@@ -1100,10 +1299,63 @@ export async function callDreammateTool(
 }
 
 export async function runMcpServer(options: McpOptions = {}): Promise<void> {
-  const server = createMcpServer(options);
-  const removeReloadHandler = installMcpReload(server, options);
-  server.onclose = removeReloadHandler;
-  const transport = new StdioServerTransport();
-  try { await server.connect(transport); }
-  catch (error) { removeReloadHandler(); throw error; }
+  let ownedSources: PrivateMcpSources | undefined;
+  let server: Server | undefined;
+  let removeReloadHandler = () => {};
+  let stopping = false;
+  const startupInput: Buffer[] = [];
+  let startupBytes = 0;
+  const bufferStartupInput = (chunk: Buffer) => {
+    startupBytes += chunk.length;
+    // Match the SDK's default read-buffer limit while private sources initialize.
+    if (startupBytes > 10 * 1024 * 1024) {
+      console.error('DreamMate MCP startup input exceeds the 10 MiB limit');
+      shutdown();
+      return;
+    }
+    startupInput.push(chunk);
+  };
+  const pauseStartupInput = () => {
+    process.stdin.pause();
+    process.stdin.off('data', bufferStartupInput);
+  };
+  const cleanup = async () => {
+    pauseStartupInput();
+    startupInput.length = 0;
+    removeReloadHandler();
+    process.off('SIGINT', shutdown);
+    process.off('SIGTERM', shutdown);
+    process.stdin.off('end', shutdown);
+    await ownedSources?.stop();
+  };
+  const shutdown = () => {
+    if (stopping) return;
+    stopping = true;
+    void (async () => { try { await server?.close(); } finally { await cleanup(); process.exit(0); } })();
+  };
+  process.once('SIGINT', shutdown);
+  process.once('SIGTERM', shutdown);
+  process.stdin.once('end', shutdown);
+  // An end listener alone does not read a paused pipe. Consume into a temporary
+  // buffer so EOF can close private subprocesses even during initialization.
+  process.stdin.on('data', bufferStartupInput);
+  try {
+    if (!options.privateMcpSources) {
+      await loadPrivateMcpSources(options.mcpConfig, source => {
+        ownedSources = source;
+        if (stopping) void source.stop();
+      });
+    }
+    if (stopping) { await cleanup(); return; }
+    pauseStartupInput();
+    if (startupBytes > 0) process.stdin.unshift(Buffer.concat(startupInput, startupBytes));
+    startupInput.length = 0;
+    if (ownedSources) options = { ...options, privateMcpSources: ownedSources };
+    server = createMcpServer(options);
+    removeReloadHandler = installMcpReload(server, options);
+    server.onclose = () => { void cleanup(); };
+    await server.connect(new StdioServerTransport());
+    if (!stopping) process.stdin.resume();
+  }
+  catch (error) { await cleanup(); throw error; }
 }

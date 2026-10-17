@@ -31,6 +31,37 @@ dreammate-node cli invoke --agent http://GATEWAY:36908 --node DEVICE --service S
 
 `search` 省略 `--node` 时扫描已知节点；其他命令省略时、或显式使用 `--node localhost` 时，目标是入口网关所在设备。指定名称时优先用导入的地址簿，未导入时从入口 `/nodes` 解析目标，再从当前终端直连该节点；入口不是跨节点中继。
 
+## 发现和读取业务技能
+
+用户需要专门流程或项目里的操作指南时，用 `cli search-skills --query '任务描述'`（带真实入口，默认跨节点）。
+选择匹配的候选后，用结果中的 `node`、`id`、`revision`：
+
+```sh
+dreammate-node cli read-skill --agent http://GATEWAY:36908 --node DEVICE --skill SKILL_ID --revision HASH
+dreammate-node cli read-skill --agent http://GATEWAY:36908 --node DEVICE --skill SKILL_ID --revision HASH --resource references/stages.md
+```
+
+占位参数替换为真实搜索结果；相对资源路径去除 Markdown 的 `#锚点`。先读完整主指南，再按需读取资源。
+HTTP 409 / `SKILL_REVISION_CHANGED` 表示源文件已变更，重新搜索并读新版本，不混用新旧脚本与指南。
+来源目录原件不复制到客户端，读取不会安装或执行脚本。根据指南确认实际执行设备、依赖和文件可达性。
+MCP 对应 `dreammate_search_skills` → `dreammate_read_skill`。目录返回 `partial` / `unsupported` 时说明覆盖限制。
+用户要求发布项目技能时，在原件所在设备用 `dreammate-node skills add --name NAME --project /absolute/project`；
+项目扫描 `.agents/skills`、`.claude/skills`、`skills`。共享或单个技能包用 `--dir /absolute/skills`。
+只登记用户要发布的来源；可用 `skills list`、`skills refresh [ID]`、`skills remove ID` 管理，remove 保留原件。
+来源管理仅接受 loopback，不能从客户端向远端网关登记本地目录。
+这些命令由 Node 转发给独立运行、已报备的 Skill Manager；Node 不包含目录扫描器，也不依赖该 npm 包。
+HTTP 503 表示没有已接入的技能服务，先在原件所在设备确认 Manager 进程和报备，不能解释为没有技能。
+用户已要求本机提供技能管理时，检查 `dreammate-skills status`；未安装包时安装 `@1agents/skill-manager`，
+调试可运行 `dreammate-skills serve --agent http://127.0.0.1:36908`，长期托管用 `dreammate-skills install`。
+Manager 默认只监听 `127.0.0.1:36909`，每 15 秒向本机 Node 重报备；Node 重启不要求重建来源。
+`dreammate-skills list|read|sources` 可不经网关直接使用本地来源；`serve --no-register` 不报备。
+常见用户/系统共享目录会由 Manager 自动登记；Manager 在后台通过已安装的 `1session` 补充历史会话工作目录中的项目技能，
+也可用 `dreammate-node skills discover` 立即更新，`--no-projects` 只发现共享目录。
+reader 不可用时共享发现仍可用，诊断不表示没有项目技能；历史工作目录不等于当前存在或包含所有命令 PWD。
+链接技能按真实目录去重，删除自动来源后会排除其目录，避免下次刷新重新添加。
+通过 `/services/:id/invoke` 直接调用来源管理也受通用 `metadata.local_only_methods` 回环限制。
+历史 `service.skills` 附带 SOP 与技能管理服务的目录是两种接口，继续按服务实际契约读取。
+
 ## 给 iSH 导出设备地址簿
 
 用户要把稳定设备清单带到 iSH 时，在能访问节点网关的终端执行：
@@ -60,12 +91,41 @@ dreammate-node cli nodes export --agent http://127.0.0.1:36908 --default-node sc
 
 ## MCP 与生命周期
 
+节点来源的接入与共享独立：`dreammate-node mcp add --file CONFIG` 添加来源，源 JSON 的
+`sharing` 支持 `local` / `network`，省略默认 `network`，旧配置继续网络共用。
+在网关所在设备执行 `dreammate-node mcp share MCP_ID --scope local|network` 可单独切换，
+即时生效且持久保存，不重连上游；`mcp list` 查看范围。占位 CONFIG/MCP_ID 替换为真实文件与来源 ID。
+`local` 仅允许网关回环请求发现、读取契约和调用，同机多个 Agent 可共用；`network` 不区分调用方身份。
+`reachability: localhost` 是上游直连限制，与共享策略独立；不要据此认定来源仅供本机使用。
+
+按客户端 Token 区分权限时，使用 DreamMate 的私有 `mcpServers` 配置：默认
+`~/.1agents/mcp-client.json`（属于当前用户，权限 600），或在 CLI/MCP 启动参数中
+指定 `--mcp-config PATH`；`DREAMMATE_MCP_CONFIG` 次之，`none` 禁用。
+`cli search --node @client --query 'ERP 项目'` / MCP `node: "@client"` 仅发现该进程私有来源；
+后续 inspect/invoke 使用搜索返回的 `@client`、service_id 和 method。
+这类来源不通过 `mcp add` 写入共享节点，不把 Token 放进工具参数。
+日常配置只读 Token，管理员需启动时显式选择另一文件；配置变更后重启客户端。
+不要将两个角色固定凭据都注册到共享网关，否则调用者可任选管理员来源。
+
 宿主明确需要 MCP 时配置 stdio 命令 `dreammate-node mcp --agent http://GATEWAY:36908`。MCP 进程由宿主按会话管理；该命令是客户端适配层，不会自动启动目标 HTTP 网关。不要把 MCP 协议日志写入 stdout。
 
 业务任务使用 `dreammate_search_tools`（必填 `query`）→ `dreammate_inspect`（指定 `method`）→ `dreammate_invoke`。`dreammate_list_nodes` 用于节点发现，`dreammate_list_services` 用于显式目录浏览。元工具的 `service_id` 和 `method` 来自真实搜索与契约；上下文中只展开当前需要的 Schema。
 搜索自动从本次扫描到的全部服务发现就绪模型，其他设备无需安装权重或逐个配置模型 URL。发现范围随 `--node`，显式 `localhost` 只看入口设备；`--service ID`／`service_id` 只筛业务方法，不排除同一节点范围内其他服务提供的模型。没有可见就绪 provider 时返回 `search.semantic_status=no_provider` 和有界词法结果；结合 `partial`、`discovery`、`scans` 说明范围，不能据此称全网没安装模型。模型请求失败同样有界降级。
 多个 provider 按 priority 高优先、健康状态、稳定 URL 选择，最多尝试两个，共享默认 5 秒语义预算。自动发现路径下，一次尝试的 query 与 documents 固定 provider、revision、维度和编码配置；切备用不能混用向量。显式 `DREAMMATE_EMBEDDING_URL` 优先并固定地址，失败不自动切到其他模型；`DREAMMATE_EMBEDDING_MODEL` 可限定别名。
-模型服务可以只驻留一台内网设备。客户端直连选中节点的 `POST /services/<id>/embed`，该网关仅代理本机已注册的 loopback HTTP 端口，不跨节点中继。用户要求部署语义检索时，先显式准备离线权重，再在模型设备的仓库目录运行 `node scripts/local-embeddings/serve.mjs --model qwen3 --port 8766 --agent http://127.0.0.1:36908`；启动器只在真实就绪后登记模型信息，每 15 秒刷新，正常退出注销。普通调用不自动下载、部署或启动模型；没有全局 leader 或中心搜索 API。
+模型服务可以只驻留一台内网设备。客户端直连选中节点的 `POST /services/<id>/embed`，该网关仅代理本机已注册的 loopback HTTP 端口，不跨节点中继。用户要求部署语义检索时，先显式准备离线权重，再在模型设备的仓库目录运行 `node scripts/local-embeddings/serve.mjs --model qwen3 --port 8766 --agent http://127.0.0.1:36908`；启动器只在真实就绪后登记模型信息，每 15 秒刷新，正常退出注销。普通调用不自动下载或部署模型；没有全局 leader 或中心搜索 API。
+
+用户明确要求 Mac 按需使用已有本地模型时，用 `dreammate-node embedding install --python /absolute/venv/bin/python --manifest /absolute/manifest.json --device mps --batch-size 8 --idle-timeout-ms 300000 --priority 100 --sharing local`；先核验环境与权重存在，不自动下载。
+`embedding status` 只探活，不加载模型；`embedding uninstall` 停止启动器及其模型子进程。
+优先级用 `embedding config` 查看，`embedding config --priority N` 持久修改，无需重填安装路径。
+按需启动器每 15 秒读取 `~/.1agents/embedding-config.json`（`{"version":1,"priority":100,"sharing":"local"}`），配置分别覆盖 `--priority` / `--sharing` 启动兜底值；`--config` 可指定其他文件。
+用 `embedding config --sharing local|network` 单独修改范围；`local` 仅本机 Agent 共用，应使用 loopback 网关入口，其他设备目录隐藏且直接调用返回 404。本机仍可回退到网络共享的远端模型。
+旧配置未提供 sharing 时保持启动参数，启动参数默认 network；只改 priority 不丢已有 sharing。local 报备先验证网关支持通用服务共享范围，旧网关不支持时拒绝发布并报告注册错误。
+修改不重启模型或 MCP，也不重置空闲计时；运行中配置无效保留最近有效值并通过 `health.config.last_error` 报告。
+轻量启动器常驻，首次实际编码才加载 Qwen，最后一个请求结束后空闲 5 分钟退出 Python；健康检查与服务报备不会保活。
+按需 worker 只把文档文本哈希及向量写入 `~/.1agents/cache/embeddings/`，下次按模型版本、维度和编码配置校验恢复，不保存描述原文或查询。
+按需服务的 `loaded`/`loading`/`worker_pid` 表示真实模型状态，`embedding_provider.ready` 仅表示启动器可接单。
+广告优先级 100 高于普通远端的 0，默认全网搜索保留远端回退；优先级只在共享范围内生效。
+不固定 `DREAMMATE_EMBEDDING_URL`，已有 MCP 可自动发现。独立 CLI 不继承 MCP 专属超时变量，验证时显式设置 `DREAMMATE_EMBEDDING_TIMEOUT_MS=30000` 并给整命令 `--timeout-ms 60000`。
 
 服务生命周期通过 `cli manage --service SERVICE --action status|start|stop` 或 `dreammate_manage_service`；传入正确的入口和节点。只在用户已要求时启停服务。写入、发布、删除等业务方法同样以用户当前授权为限。
 

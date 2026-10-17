@@ -38,6 +38,8 @@ export interface Registration {
   port?: number;
   /** 省略按 `network` 理解——大多数服务是对外的，只监听回环的那个才特殊。 */
   reachability?: Reachability;
+  /** Gateway publication scope, independent of the service's listening address. Defaults to network. */
+  sharing?: 'local' | 'network';
   /** 存活探测路径，默认 `/health`。 */
   health?: string;
   resources?: ResourceDescriptor[];
@@ -169,6 +171,7 @@ export class ServiceRegistry {
       ...entry,
       skills,
       reachability: entry.reachability ?? 'network',
+      sharing: entry.sharing ?? 'network',
       health: entry.health ?? '/health',
       registeredAt: existing?.registeredAt ?? new Date().toISOString(),
       liveness: entry.port !== undefined ? 'unknown' : 'up',
@@ -241,6 +244,7 @@ export class ServiceRegistry {
               ? [{ protocol: 'cli' as const, command: s.command }]
               : []),
       reachability: s.reachability,
+      ...(s.sharing ? { sharing: s.sharing } : {}),
       ...(s.port !== undefined ? { port: s.port } : {}),
       ...(s.health ? { health: s.health } : {}),
       metadata: {

@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import type { RegisteredService } from './registry.js';
 import { withRequestTimeout } from './request-timeout.js';
 import type { EmbeddingProvider } from './embedding-providers.js';
+import type { SkillSummary } from './skill-sources.js';
 
 export interface PageOptions { limit: number; offset: number; maxChars: number }
 
@@ -321,11 +322,42 @@ function balanceServices(ranked: RankedCard[], scoped: boolean) {
 
 export async function searchTools(services: readonly DiscoveredService[], args: Record<string, unknown>, options: ToolSearchOptions = {}): Promise<Record<string, unknown>> {
   args = { ...args, limit: args.limit ?? 15, max_chars: args.max_chars ?? 12000 };
+  const filtered = services.filter(service => (!args.service_id || service.id === args.service_id) && (!args.kind || service.kind === args.kind));
+  const index = indexCards(filtered, args.include_disabled === true);
+  const { results, search, query } = await rankCards(index, args, options);
+  const balanced = balanceServices(results, Boolean(args.service_id));
+  search.diversity = balanced.metadata;
+  return pageResponse(balanced.ranked.map(({ exact: _exact, semanticMatch: _semanticMatch, lexicalScore: _lexicalScore, ...card }) => ({
+    ...card, score: Number(card.score.toFixed(6)),
+    ...(card.semantic_score !== undefined ? { semantic_score: Number(card.semantic_score.toFixed(6)) } : {}),
+  })), args, { ...options.responseBase, query, total_candidates: index.length, search }, 'results');
+}
+
+export interface DiscoveredSkill extends SkillSummary { node: string }
+
+/** Share lexical/embedding ranking with tools, while preserving independent skill identities. */
+export async function searchSkills(skills: readonly DiscoveredSkill[], args: Record<string, unknown>, options: ToolSearchOptions = {}): Promise<Record<string, unknown>> {
+  args = { ...args, limit: args.limit ?? 15, max_chars: args.max_chars ?? 12000 };
+  const selected = skills.filter(skill => !args.source_id || skill.source_id === args.source_id);
+  const byKey = new Map(selected.map(skill => [JSON.stringify([skill.node, skill.id]), skill]));
+  // These internal cards are ranking inputs only; no synthetic methods are registered or exposed.
+  const index: IndexedCard[] = [...byKey.values()].map<IndexedCard>(skill => ({
+    card: { node: skill.node, service_id: skill.source_id, method: skill.id, original_name: skill.name, description: skill.description },
+    fields: [[skill.name, 4], [skill.description, 2], [skill.source_id, 1], [skill.compatibility ?? '', 0.5]],
+    text: `Skill: ${skill.name}\nPurpose: ${skill.description}${skill.compatibility ? `\nCompatibility: ${skill.compatibility}` : ''}`,
+  })).sort((a, b) => JSON.stringify(a.card).localeCompare(JSON.stringify(b.card)));
+  const { results, search, query } = await rankCards(index, args, options);
+  if (search.mode === 'hybrid') search.score_semantics = 'ranking only: semantic = 1 + cosine; keyword-only = 1/(60 + rank); exact skill name first';
+  return pageResponse(results.map(card => ({
+    ...byKey.get(JSON.stringify([card.node, card.method]))!, score: Number(card.score.toFixed(6)),
+    ...(card.semantic_score !== undefined ? { semantic_score: Number(card.semantic_score.toFixed(6)) } : {}),
+  })), args, { ...options.responseBase, query, total_candidates: index.length, search }, 'results');
+}
+
+async function rankCards(index: IndexedCard[], args: Record<string, unknown>, options: ToolSearchOptions) {
   parsePageOptions(args);
   if (typeof args.query !== 'string' || !args.query.trim() || args.query.length > 2000) throw new Error('query 必须是 1–2000 字符的非空查询');
   const query = args.query.trim();
-  const filtered = services.filter(service => (!args.service_id || service.id === args.service_id) && (!args.kind || service.kind === args.kind));
-  const index = indexCards(filtered, args.include_disabled === true);
   const lexical = lexicalScores(index, query);
   const rawUrl = options.embeddingUrl ?? process.env.DREAMMATE_EMBEDDING_URL;
   const model = options.embeddingModel ?? process.env.DREAMMATE_EMBEDDING_MODEL;
@@ -390,11 +422,5 @@ export async function searchTools(services: readonly DiscoveredService[], args: 
     return [{ ...item.card, score, ...(semantic ? { semantic_score: semantic[i]! } : {}), exact, semanticMatch, lexicalScore: lexical[i]! }];
   }).sort((a, b) => Number(b.exact) - Number(a.exact) || Number(b.semanticMatch) - Number(a.semanticMatch)
     || b.score - a.score || b.lexicalScore - a.lexicalScore || a.method.localeCompare(b.method));
-  const balanced = balanceServices(results, Boolean(args.service_id));
-  search.diversity = balanced.metadata;
-  return pageResponse(balanced.ranked.map(({ exact: _exact, semanticMatch: _semanticMatch, lexicalScore: _lexicalScore, ...card }) => ({
-    ...card, score: Number(card.score.toFixed(6)),
-    ...(card.semantic_score !== undefined ? { semantic_score: Number(card.semantic_score.toFixed(6)) } : {}),
-  })), args,
-    { ...options.responseBase, query, total_candidates: index.length, search }, 'results');
+  return { results, search, query };
 }

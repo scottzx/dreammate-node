@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { isIP } from 'node:net';
 import { parseArgs } from 'node:util';
 import { cliError } from './cli-process.js';
-import { MAX_MCP_CONFIG_BYTES, parseMcpSourceConfig } from './mcp-source-config.js';
+import { MAX_MCP_CONFIG_BYTES, parseMcpSharing, parseMcpSourceConfig, type McpSharing } from './mcp-source-config.js';
 
 export const MCP_SOURCE_USAGE = `dreammate-node mcp — 管理本机自定义 MCP 数据源
 
@@ -11,17 +11,20 @@ export const MCP_SOURCE_USAGE = `dreammate-node mcp — 管理本机自定义 MC
   list                             列出数据源及连接状态
   remove ID                        移除数据源及其工具
   refresh ID                       重新连接并刷新工具目录
+  share ID --scope local|network   修改共享范围，不重连上游
 
 支持 {"mcpServers":{"名称":{"command":"npx","args":["..."]}}}、
 {"mcpServers":{"名称":{"url":"https://example.com/mcp","headers":{"Authorization":"Bearer ..."}}}}
 或单个 command/url 对象（此时必须指定 --name）。远程 type 支持 http、streamable-http、sse。
 支持已有 OAuth refresh token 自动续期（oauth.tokenUrl/clientId/refreshToken）；不提供浏览器首次授权。
+接入配置可指定 sharing: local|network，默认 network。local 仅供网关所在设备使用，不区分本机 Agent。
 --agent URL：默认 DREAMMATE_AGENT_URL 或 http://127.0.0.1:36908；管理操作仅支持 loopback。
 --timeout-ms N：1–3600000，默认 30000。stdout 输出 JSON；退出码 0 成功、1 连接失败、2 参数错误。
 配置保存在本机；env/headers/URL/oauth 中的凭据不会出现在数据源清单中。`;
 
 const OPTIONS = {
   config: { type: 'string' }, file: { type: 'string' }, name: { type: 'string' },
+  scope: { type: 'string' },
   agent: { type: 'string' }, 'timeout-ms': { type: 'string' }, help: { type: 'boolean', short: 'h' },
 } as const;
 
@@ -67,6 +70,7 @@ function sanitize(value: unknown, secrets: string[], key = '', depth = 0): unkno
     // A harmless header value such as x-forwarded-proto:http must not hide
     // the API's fixed transport/status labels when values happen to match.
     if (['type', 'transport'].includes(key) && ['stdio', 'http', 'sse'].includes(value)) return value;
+    if (key === 'sharing' && ['local', 'network'].includes(value)) return value;
     if (key === 'status' && ['connected', 'connecting', 'disconnected', 'error'].includes(value)) return value;
     let result = value;
     for (const secret of secrets) result = result.split(secret).join('[redacted]');
@@ -91,9 +95,24 @@ function failedSources(value: unknown): boolean {
   return ['sources', 'results', 'source', 'imported', 'catalog'].some(key => failedSources(data[key]));
 }
 
-/** One-shot MCP management. argv starts with add/list/remove/refresh, after `mcp`. */
+function sharingUpdated(value: unknown, expected: { id: string; sharing: McpSharing }): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const data = value as Record<string, unknown>;
+  if (data.isError === true || data.ok === false || data.success === false) return false;
+  const source = data.source ?? data;
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return false;
+  if (source !== data && data.error) return false;
+  const updated = source as Record<string, unknown>;
+  // Connection diagnostics describe the upstream. The saved sharing policy can
+  // still change while that connection is disconnected or reporting an error.
+  return updated.id === expected.id && updated.sharing === expected.sharing
+    && updated.isError !== true && updated.ok !== false && updated.success !== false;
+}
+
+/** One-shot MCP management. argv starts with add/list/remove/refresh/share, after `mcp`. */
 export async function runMcpSourceCli(argv: string[]): Promise<number> {
   let request: { url: string; method: string; body?: string };
+  let sharingUpdate: { id: string; sharing: McpSharing } | undefined;
   let timeoutMs = 30_000;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const controller = new AbortController();
@@ -107,9 +126,10 @@ export async function runMcpSourceCli(argv: string[]): Promise<number> {
     const { values, positionals } = parsed;
     if (values.help || positionals.length === 0) { console.log(MCP_SOURCE_USAGE); return 0; }
     const command = positionals[0];
-    if (!['add', 'list', 'remove', 'refresh'].includes(command!)) throw new Error('MCP 子命令必须是 add、list、remove 或 refresh');
-    if (positionals.length !== (command === 'remove' || command === 'refresh' ? 2 : 1)) throw new Error('MCP 子命令参数数量无效');
-    const allowed = command === 'add' ? ['config', 'file', 'name', 'agent', 'timeout-ms'] : ['agent', 'timeout-ms'];
+    if (!['add', 'list', 'remove', 'refresh', 'share'].includes(command!)) throw new Error('MCP 子命令必须是 add、list、remove、refresh 或 share');
+    if (positionals.length !== (['remove', 'refresh', 'share'].includes(command!) ? 2 : 1)) throw new Error('MCP 子命令参数数量无效');
+    const allowed = command === 'add' ? ['config', 'file', 'name', 'agent', 'timeout-ms']
+      : command === 'share' ? ['scope', 'agent', 'timeout-ms'] : ['agent', 'timeout-ms'];
     if (Object.keys(values).some(key => !allowed.includes(key))) throw new Error('当前 MCP 子命令不支持此参数');
     if (values['timeout-ms'] !== undefined) {
       timeoutMs = Number(values['timeout-ms']);
@@ -143,8 +163,15 @@ export async function runMcpSourceCli(argv: string[]): Promise<number> {
     else {
       const id = positionals[1]!;
       if (!/^mcp-[A-Za-z0-9_-]{1,64}$/.test(id)) throw new Error('MCP ID 必须是 mcp- 加有效的数据源名称');
-      request = { url: `${base}/${encodeURIComponent(id)}${command === 'refresh' ? '/refresh' : ''}`,
-        method: command === 'remove' ? 'DELETE' : 'POST' };
+      if (command === 'share') {
+        if (values.scope === undefined) throw new Error('mcp share 必须通过 --scope 指定 local 或 network');
+        const sharing = parseMcpSharing(values.scope);
+        sharingUpdate = { id, sharing };
+        request = { url: `${base}/${encodeURIComponent(id)}/sharing`, method: 'PATCH', body: JSON.stringify({ sharing }) };
+      } else {
+        request = { url: `${base}/${encodeURIComponent(id)}${command === 'refresh' ? '/refresh' : ''}`,
+          method: command === 'remove' ? 'DELETE' : 'POST' };
+      }
     }
   } catch (error) {
     clearTimeout(timer);
@@ -162,7 +189,7 @@ export async function runMcpSourceCli(argv: string[]): Promise<number> {
       return 1;
     }
     console.log(JSON.stringify(sanitize(result, [...secrets.filter(secret => secret.length >= 4), ...grantSecrets]), null, 2));
-    return !response.ok || failedSources(result) ? 1 : 0;
+    return !response.ok || (sharingUpdate ? !sharingUpdated(result, sharingUpdate) : failedSources(result)) ? 1 : 0;
   } catch {
     cliError(controller.signal.aborted ? `MCP 命令超过 ${timeoutMs} ms` : '无法连接本机 MCP 管理接口', 'MCP_SOURCE_ERROR');
     return 1;

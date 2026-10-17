@@ -15,6 +15,12 @@
 
 此方案默认能访问该服务的可信调用方共享配置凭证的能力，不提供不同 Agent、用户或设备之间的权限隔离。
 
+2026-10-17：新增客户端私有 MCP 来源。`dreammate-node mcp` 与一次性 CLI 可读取
+`~/.1agents/mcp-client.json` / `--mcp-config PATH`，在当前进程独立连接并以 `@client`
+发现、查看和调用工具。该配置不进入共享 HTTP 节点；客户端固定使用一个 Token 身份，
+权限仍由上游服务强制校验。此路径已用于单站点 ERP 管理员/只读双 Token。
+这不改变上述共享节点来源的权限模型。操作见[自定义 MCP 接入](custom-mcp.md#客户端私有配置独立-token-身份)。
+
 此处定义接入范围。2026-09-29 已按此方案部署官方 Plane MCP 与薄桥接：30 个官方工具接入现有 `plane-pm` 服务，已验证工作区、项目、工作项及迭代的只读调用。部署代码和维护说明见 [Plane MCP 薄桥接](../deploy/plane-bridge/README.md)。
 
 ## 后续需求：暂缓，不阻塞 Demo

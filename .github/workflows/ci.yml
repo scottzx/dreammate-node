@@ -15,6 +15,7 @@ jobs:
         with:
           node-version: '22'
       - run: npm ci
-      - run: npm run typecheck
-      - run: npm test
-      - run: npm run build
+      - run: npm run typecheck:all
+      - run: npm run test:all
+      - run: npm run build:all
+      - run: node scripts/check-package-boundary.mjs

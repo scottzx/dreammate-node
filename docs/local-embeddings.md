@@ -43,6 +43,107 @@ Python 进程在导入模型库前设置 `HF_HUB_OFFLINE=1`、`TRANSFORMERS_OFFL
 .local/tool-search/venv/bin/python scripts/local-embeddings/server.py --self-test
 ```
 
+## macOS 按需加载，空闲后释放模型
+
+权重和 Python 环境已按前文准备后，可安装轻量按需服务，而不让模型始终占用内存：
+
+```sh
+dreammate-node embedding install \
+  --python "$PWD/.local/tool-search/venv/bin/python" \
+  --manifest "$PWD/.local/tool-search/manifest.json" \
+  --device mps --batch-size 8 --idle-timeout-ms 300000 --priority 100 --sharing local
+dreammate-node embedding status
+dreammate-node embedding uninstall
+```
+
+以上从已准备权重的仓库根目录运行，`--python` 与 `--manifest` 使用绝对路径；安装不会准备或下载缺少的依赖。
+macOS launchd 标签为 `work.dreammate.embedding`，仅常驻轻量 Node 启动器，默认监听 `127.0.0.1:8766`。
+模型通过私有标准输入输出子进程提供编码，不额外开放 Python HTTP 端口。
+日志位于 `~/.1agents/logs/dreammate-embedding.log` 与 `.err.log`。
+
+首次 `POST /embed` 才启动并预热 Python/Qwen，验证其真实版本、维度、编码配置后执行请求。
+并发请求共享一次启动及一个模型进程。最后一个实际编码请求完成后重新计时，连续空闲默认 300000 ms 后退出 Python。
+有正在运行或排队的请求时不执行空闲关闭；定期 `/health` 和服务报备不加载模型，也不延长驻留时间。
+下一次编码自动重新启动。停止启动器会同时结束其模型子进程。
+
+`GET /health` 返回 `service: dreammate-embedding-on-demand` 和 `loaded`、`loading`、`worker_pid`、
+`pending_requests`、`last_used`、`idle_timeout_ms`。按需服务的 `embedding_provider.ready: true`
+表示启动器已准备好按需接单，重型模型是否已加载以 `loaded` 为准；`lifecycle: on_demand` 区分此模式。
+仅探测健康或运行 `status` 不会加载模型。模型进程退出后，内存和进程内缓存释放。
+按需 worker 另将文档 SHA-256 与 FP32 向量原子保存到 `~/.1agents/cache/embeddings/`，最多 4096 条、单文件 64 MiB，
+目录权限 700、文件权限 600；不保存描述原文或用户查询。模型版本、维度和编码配置共同确定缓存文件，
+下次启动校验并恢复有效向量。坏缓存或指纹变化不会当成可用向量；未缓存的新文档仍需要编码。
+
+默认广告优先级为 100，普通模型为 0。已有 MCP 每次搜索重新发现服务，可以自动选用它；无需固定模型 IP。
+该优先级在共享范围内生效；上面的 `--sharing local` 限制为本机 Agent 共用。
+默认 `all` 范围保留远端候选，显式 `localhost` 范围只使用入口设备的模型。
+显式固定 `DREAMMATE_EMBEDDING_URL` 会关闭自动模型回退，因此这里不使用该选项。
+
+### 通过配置调整优先级
+
+按需启动器默认读取 `~/.1agents/embedding-config.json`，格式为：
+
+```json
+{
+  "version": 1,
+  "priority": 100,
+  "sharing": "local"
+}
+```
+
+`priority` 必须是 -1000–1000 的整数，数值越大越优先。可以直接编辑文件，也可以运行：
+
+```sh
+dreammate-node embedding config                  # 查看配置值与启动兜底值
+dreammate-node embedding config --priority 100   # Mac 优先于 priority=0 的远端
+dreammate-node embedding config --priority -10   # priority=0 的远端优先
+```
+
+配置文件的 `priority` 覆盖启动参数 `--priority`；文件不存在时使用启动参数，按需启动器的参数默认值为 100。
+`install --priority N` 设置启动兜底值，不改写已有 JSON；安装结果同时给出兜底值和有效值。
+`install --config /absolute/path.json` 可指定配置文件，后续 `config` 默认沿用已安装服务的路径；
+前台运行启动器也支持 `--config`。单独执行 `config --config PATH` 只选择本次读写的文件，
+不会切换已运行服务所监听的路径。
+
+运行中的启动器每 15 秒重新读取配置并向 Node 更新报备；下一次发现服务时使用更新后的优先级。
+调整不会重启模型、触发加载、重置空闲时间或使向量缓存失效，也无需重启已有 MCP 会话。
+运行中遇到损坏或不合法的配置会保留最近有效值，并在 `/health` 的 `config.last_error` 中报告；
+启动时已有配置不合法则拒绝启动。删除文件恢复启动参数的兜底值。
+同分时的健康状态与地址排序、最多两个模型候选及超时分配仍使用下述检索策略。
+
+### 通过配置限制共享范围
+
+`sharing` 沿用 MCP 的 `local` / `network` 语义，决定哪些调用方能发现和使用这个模型；
+`priority` 只决定调用方可见模型的尝试顺序。按需模型是普通 HTTP 服务，不需要转换成 MCP 来源。
+
+```sh
+dreammate-node embedding config --sharing local    # 仅本机 Agent 共用
+dreammate-node embedding config --sharing network  # 允许网络内其他设备使用
+```
+
+两项配置可单独修改，也可同时传入；只修改优先级会保留已有共享范围。
+`sharing` 配置覆盖安装参数 `--sharing`，旧 JSON 省略此字段时沿用启动参数；
+启动参数也省略时保持 `network`，兼容已有部署。设置 `local` 时应通过
+`http://127.0.0.1:36908` 访问本机网关；以 socket 回环来源为准，不采信转发头。
+
+本机看到并使用 Mac 模型，其他设备的目录隐藏该服务，知道服务 ID 也无法直接调用网关编码路由。
+本机搜索仍能发现网络共享的远端模型，本机模型失败时可继续回退；
+`sharing: local` 不等于将搜索范围缩成 `--node localhost`。
+共享范围也每 15 秒更新报备，不启动或重启模型、不改变空闲计时。
+按需启动器在 `local` 报备前验证网关声明 `service_sharing: dreammate.service-sharing.v1`；
+旧网关未支持时不发布本地模型，并通过注册错误报告，避免把 `local` 当成已执行的限制。
+
+首次启动与全部缺失文档编码共用检索预算。当前 Mac 的 Codex MCP 已配置 30 秒；独立 CLI 不继承 MCP 的专属环境：
+
+```sh
+DREAMMATE_EMBEDDING_TIMEOUT_MS=30000 dreammate-node cli search-skills \
+  --agent http://127.0.0.1:36908 --query '制作小红书封面和图文卡片' --timeout-ms 60000
+```
+
+无 launchd 或只需前台诊断时，可直接执行 `node scripts/local-embeddings/on-demand.mjs`，传入同样的路径和运行参数；
+`--no-register` 可不报备，仅在本机测试。当前按需服务安装管理命令只支持 macOS。
+完整参数以 `dreammate-node embedding --help` 为准。
+
 ## 客户端自动发现与选择
 
 客户端只需已有网关入口，不必另填模型 URL。例如将下面地址替换为实际可达网关：
@@ -85,7 +186,7 @@ node dist/bin/dreammate-node.js cli search \
 
 客户端每批最多编码 16 张卡片。自动发现模式的版本、维度、编码配置及向量数值校验通过后，可保留已完成批次，下次继续；换 provider 后不复用另一个 provider 的批次。该路径的进程内文档缓存最多 4096 条、TTL 5 分钟，键包含 provider 地址、模型版本、维度、编码配置和卡片内容。方法说明或参数名变化、后端 revision 或编码配置变化都会生成独立缓存键。
 
-适配器另有跨请求共享的文档 LRU 缓存，最多 4096 条，寿命与进程相同。键为 `alias@revision` 与卡片文本 SHA-256；每个适配器进程的编码配置固定。只有缺失卡片需要编码，同批重复卡片只编码一次，结果保持原顺序。有效向量以 FP32 数组保存；查询每次重新编码，不占文档缓存；缓存不写磁盘，重启后需要重建。
+适配器另有跨请求共享的文档 LRU 缓存，最多 4096 条，寿命与进程相同。键为 `alias@revision` 与卡片文本 SHA-256；每个适配器进程的编码配置固定。只有缺失卡片需要编码，同批重复卡片只编码一次，结果保持原顺序。有效向量以 FP32 数组保存；查询每次重新编码，不占文档缓存。普通 `serve.mjs` 模式仅使用内存缓存；前述按需 worker 额外保存经过校验的文档向量，模型卸载后仍可恢复。
 
 模型预热不等于工具目录已编码。冷文档缓存或较慢设备可能超过默认预算并有界降级；需要时可先执行一次较长预算的只读搜索建立缓存，再恢复默认值：
 
@@ -94,7 +195,7 @@ DREAMMATE_EMBEDDING_TIMEOUT_MS=60000 node dist/bin/dreammate-node.js cli search 
   --agent http://100.100.10.30:36908 --query '读取文件并查询 Git 状态' --timeout-ms 90000
 ```
 
-确认 `search.semantic_status=ok` 后再评估热查询。适配器重启、改用尚未索引的模型或目录大幅扩展后可能需要重新预建。当前没有持久化目录索引、目录扫描缓存、中心搜索 API 或自动模型部署；目录扫描、向量比较与排序仍在各 CLI/MCP 进程完成。实测数据保留在 [评测记录](tool-search-evaluation.md)。
+确认 `search.semantic_status=ok` 后再评估热查询。适配器重启且没有可恢复向量、改用尚未索引的模型或目录大幅扩展后可能需要重新预建。按需模式的磁盘缓存只保存可重建向量，当前没有目录扫描缓存、中心搜索 API 或自动模型部署；目录扫描、向量比较与排序仍在各 CLI/MCP 进程完成。实测数据保留在 [评测记录](tool-search-evaluation.md)。
 
 `DREAMMATE_EMBEDDING_MIN_SCORE` 为余弦召回阈值（默认 0.35、范围 -1–1），不是置信概率。返回的 `semantic_score` 是余弦值，`score` 是分组排名信号（语义候选为 1+余弦，关键词补充为倒数排名），不能当作执行授权。阈值仍需结合实际请求校准。当前尚无专门的任务拒识分类器，候选描述不匹配时应改写查询或说明目录不支持。禁止因无匹配而自动展开全目录。
 

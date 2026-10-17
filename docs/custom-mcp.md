@@ -4,7 +4,60 @@
 
 添加 MCP 后自动完成原生工具遍历、可识别的子动作目录同步、名称转换、搜索索引和调用路由。标准 MCP 的 `tools/list` 适用于所有来源；隐藏在元工具背后的动作，需要来源声明下述通用目录协议，或由内置适配器识别。目前内置 Activepieces 适配器，无需单独配置 GitHub 等应用。
 
+## 接入与共享
+
+接入配置决定网关怎样连接上游 MCP，`sharing` 独立决定接入后的能力可被哪些设备使用。无需把 Agent 注册为 client，也不通过 client/server 角色决定共享权限。同一网关对 Agent 提供 MCP server，同时作为 client 连接上游 MCP。
+
+| `sharing` | 范围 |
+| --- | --- |
+| `network` | 网格网络内可发现、查看契约和调用；默认值，兼容已有配置 |
+| `local` | 仅网关所在设备可发现、查看契约和调用；其他设备即使知道服务 ID，也不能通过网关直接调用 |
+
+`local` 以网关所在设备为边界，同一设备上的多个 Agent 仍可共用该来源。它与下文客户端私有来源的进程隔离不同；客户端私有来源不会因 `sharing` 而发布到网络。
+
+同样的共享范围也可用于普通服务：在向本机 `POST /services` 报备时声明顶层
+`sharing: "local" | "network"`，省略仍按 `network`。按需 embedding 模型可用
+`dreammate-node embedding config --sharing local` 设置，具体配置见 [本地模型共享范围](local-embeddings.md#通过配置限制共享范围)。
+`mcp share` 管理 MCP 来源；普通服务通过其自身报备更新范围，二者共用网关的发现与调用限制。
+
+上游的网络可达性与共享范围是两件事：上游只监听 localhost，网关仍可代理它并按 `network` 共享；上游使用远程 HTTP，也可以设置为 `local`。共享策略只约束经 DreamMate 访问的能力，不改变上游 MCP 本身的访问规则。
+
+目前仍采用可信网络共用模式，`network` 不提供独立的调用方身份验证。上游 API Key/OAuth 凭据由使用该来源的调用方共用，`local`/`network` 不提供按 Agent、服务方法或用户的细粒度鉴权。
+
 ## 配置与添加
+
+### 客户端私有配置（独立 Token 身份）
+
+需要按客户端 Token 区分权限的来源，放在 DreamMate 客户端配置中。默认读取
+`~/.1agents/mcp-client.json`，也可用 `--mcp-config PATH` 或 `DREAMMATE_MCP_CONFIG`
+指定；优先级为参数、环境变量、默认文件。配置沿用下方 `mcpServers` 格式，文件必须属于
+当前用户且权限为 600。仅默认文件不存在时允许无私有来源；显式路径错误、配置损坏或连接失败
+会终止加载。`--mcp-config none` 可显式禁用。客户端配置中的环境变量由当前进程读取。
+
+```sh
+dreammate-node cli search --node @client --query 'ERP 客户与项目'
+dreammate-node cli inspect --node @client --service mcp-erp-site --method erp_count
+dreammate-node cli invoke --node @client --service mcp-erp-site --method erp_count --params '{"doctype":"Project"}'
+dreammate-node cli invoke --mcp-config /private/erp-admin.json --node @client --service mcp-erp-site --method erp_whoami
+dreammate-node mcp --mcp-config /private/erp-readonly.json
+```
+
+CLI 和 Stdio MCP 进程在内存中独立连接这些来源，不启动 HTTP 服务、不调用 `mcp add`、
+不写入共享注册表。默认搜索与 `node: all` 同时发现网络服务与私有工具，显式指定其他节点时
+只查该节点。私有工具返回 `node: "@client"`，后续 inspect/invoke 必须使用该节点标记；
+缺少配置或服务时不会回退至网络上的同名服务。来源、Token 身份只能在进程启动时选择，
+工具参数不能切换。配置改变后重启该客户端进程。
+
+CLI 完成、超时或取消时关闭私有连接和子进程；Stdio MCP 在标准输入关闭或收到退出信号时
+同样清理，包括上游初始化尚未完成的情况。超时与取消不会重试已发送的调用。
+
+例如 ERP 管理员和只读分别使用不同的客户端文件，日常默认只读，管理员执行时显式指定文件。
+Token 可由私有 stdio 适配器的 `--token-file` 读取，或通过远程来源的私有 `headers` 提供；
+上游 ERP MCP 仍校验每个请求。持有同一操作系统账号和两个 Token 文件的人可以选择两种身份；
+只分发只读 Token 的客户端无法通过选择服务名取得管理员身份。
+
+下面的 `mcp add/list/remove/refresh/share` 管理的是**节点来源**，可分别设为 `local` 或 `network`，其固定凭据由允许访问该来源的调用者共用，
+不适合保存需要区分调用者权限的管理员 Token。
 
 支持粘贴 JSON 字符串、JSON 文件或标准输入，接受标准 `mcpServers` 包装、具名配置表，以及通过 `--name` 命名的单个源配置。添加操作由已启动的本机 node 执行，不会在 CLI 退出时关闭连接。
 
@@ -13,6 +66,7 @@
   "mcpServers": {
     "local-tools": {
       "command": "/absolute/path/to/node",
+      "sharing": "local",
       "args": ["/absolute/path/to/server.mjs"],
       "cwd": "/absolute/path/to/project",
       "env": { "API_KEY": "${LOCAL_API_KEY}" }
@@ -35,11 +89,15 @@
 dreammate-node mcp add --file ./mcp.json
 dreammate-node mcp add --config '{"url":"https://example.com/mcp"}' --name remote-tools
 dreammate-node mcp list
+dreammate-node mcp share mcp-remote-tools --scope local
+dreammate-node mcp share mcp-remote-tools --scope network
 dreammate-node mcp refresh mcp-remote-tools
 dreammate-node mcp remove mcp-remote-tools
 ```
 
 管理命令支持 `--agent http://127.0.0.1:36908` 和 `--timeout-ms`。添加同名源会拒绝覆盖；更新时先移除旧源，再添加新配置。新增批次配置会先整体校验，再分别连接；暂时连接失败的合法源会保留配置，后续自动重连，CLI 返回失败状态并显示各源状态。
+
+省略 `sharing` 时按 `network` 接入，stdio、HTTP 和 SSE 均可独立设置共享范围。`mcp share ID --scope local|network` 必须显式提供范围，只允许在本机管理入口执行；它会保存共享设置并更新目录与访问范围，不重新连接上游。连接参数发生变化时仍需移除并重新添加来源。
 
 `${ENV_VAR}` 从运行 node 网关的进程环境读取，不从调用 CLI 的终端环境读取；`$$` 表示字面的 `$`。通过 launchd/systemd 运行时，需将变量配置到该服务环境并重启；也可以在受保护的配置文件中填写值。启动命令和 URL、环境变量、HTTP 头不出现在公共注册表或源状态中。源配置文件包含连接所需凭证，以权限 600 原子写入 `~/.1agents/mcp-sources.json`，不会作为业务服务 metadata 广播。
 
@@ -107,6 +165,7 @@ dreammate-node cli invoke --agent http://127.0.0.1:36908 --service mcp-remote-to
 | `GET /mcp/sources` | 查看脱敏后的来源和连接状态 |
 | `POST /mcp/sources` | 添加 `{ "config": "粘贴的 JSON 字符串或对象", "name": "单源名称，可选" }`，也可直接提交 `mcpServers` 对象 |
 | `POST /mcp/sources/:id/refresh` | 重新连接并刷新工具目录 |
+| `PATCH /mcp/sources/:id/sharing` | 设置 `{ "sharing": "local" }` 或 `{ "sharing": "network" }`，不重连上游 |
 | `DELETE /mcp/sources/:id` | 移除持久化配置并关闭连接 |
 
 读取单动作契约使用 `GET /services/:id/methods/:method`，沿用普通服务读取入口的跨节点访问方式。路径中的方法名需要 URL 编码；返回 `{ "method": "匹配后的完整名称", "details": { ... } }`。服务摘要目录不会附带所有子动作 Schema。

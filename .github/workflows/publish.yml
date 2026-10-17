@@ -54,10 +54,15 @@ jobs:
           echo "版本一致：$pkg"
 
       - name: Pack（先看清楚要发什么）
-        run: npm pack --dry-run
+        run: npm pack --dry-run --ignore-scripts --workspaces=false
+
+      - name: Verify isolated package installation
+        run: |
+          npm run skill-manager:build
+          node scripts/check-package-boundary.mjs
 
       - name: Publish
         if: ${{ github.event_name == 'push' || !inputs.dry_run }}
-        run: npm publish --provenance --access public
+        run: npm publish --provenance --access public --workspaces=false
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

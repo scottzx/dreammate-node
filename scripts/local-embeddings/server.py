@@ -283,6 +283,8 @@ def main():
 
         def server_bind(self):
             # HTTPServer's default reverse-DNS lookup is unnecessary for this adapter.
+            if self.allow_reuse_address:
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             socket.socket.bind(self.socket, self.server_address)
             self.server_name, self.server_port = self.server_address[:2]
 

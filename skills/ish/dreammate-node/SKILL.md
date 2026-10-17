@@ -52,6 +52,24 @@ dreammate-node cli services --node scott-pc-1
 - 缓存 HTTP 地址匹配节点自身名称或 `dnsName` 且带 `ipv4` 时自动优先走 IP，保留端口与路径。HTTPS、代理地址与显式 `--agent` 不改写。`--agent IP` 不会改写 `--node all` 的其他目标地址。
 - 子命令语法可直接查看 `cli nodes export --help` 和 `cli nodes import --help`。没有缓存时也可用 `cli services --node IP` 或完整 URL 直连已知网关。
 
+## 搜索和读取远端技能
+
+业务需要专门指南时，运行 `dreammate-node cli search-skills --query '任务描述'`，带已有入口。
+结果只含摘要，选择匹配候选后，用其 `node`、`id`、`revision` 读取完整指南：
+
+```sh
+dreammate-node cli read-skill --node DEVICE --skill SKILL_ID --revision HASH
+dreammate-node cli read-skill --node DEVICE --skill SKILL_ID --revision HASH --resource references/stages.md
+```
+
+使用真实结果替换占位值。先读主指南，再读用到的相对资源路径；Markdown 链接去掉 `#锚点`。
+HTTP 409 / `SKILL_REVISION_CHANGED` 时重新搜索。技能留在原设备，读取不会安装或执行脚本；
+涉及设备软件或 CAD 环境的任务继续使用对应设备的业务服务，不假定这些脚本能在 iSH 运行。
+技能来源由原设备独立运行的 Skill Manager 管理，它向本机 Node 报备；Node 负责代理读取，双方分别安装和运行。
+iSH 远程读取时不运行 `skills add`，不安装或启动本机 Manager。
+HTTP 503 表示目标 Node 没有已接入的技能服务，应在目标设备检查 `dreammate-skills status` 与报备状态，不能解释为没有技能。
+目录扫描的 `partial` / `unsupported` 表示覆盖不完整，不能据此断定全网没有技能。
+
 ## 先搜索方法，再查看契约，再调用
 
 ```sh
@@ -73,6 +91,12 @@ dreammate-node cli invoke --node DEVICE --service SERVICE --method METHOD --para
 - 调用的写入、发布、删除等影响以用户当前授权为限；查看一个服务不等于授权执行其中所有方法。
 
 ## 读结果与失败处理
+
+需要按 Token 区分权限的 MCP 来源使用 DreamMate 客户端私有配置，默认
+`~/.1agents/mcp-client.json`（当前用户所有，chmod 600），或显式 `--mcp-config PATH`。
+`--node @client` 只发现该进程来源；后续 inspect/invoke 也使用 `@client`。
+身份在启动时固定，Token 不进入工具参数或共享 `mcp add` 来源。私有配置中的本地命令
+必须在当前设备可运行；不要直接复制 Mac 的绝对路径到 iSH。`none` 可禁用私有来源。
 
 stdout 是完整 MCP 结果 JSON：优先读 `structuredContent`，没有时读 `content` 中的文本块；保留图像等非文本内容和 `isError`。退出码 `0` 为成功，`1` 为网络/HTTP/MCP 业务失败，`2` 为参数错误，参数错误同时在 stderr 输出诊断 JSON。
 

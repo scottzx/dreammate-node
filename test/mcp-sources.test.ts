@@ -97,6 +97,117 @@ test('MCP source persistence restores literal config, owner-only permissions and
   }
 });
 
+test('MCP sharing changes immediately without reconnecting and validates management requests', async () => {
+  await withFixture(async fixture => {
+    const registry = new ServiceRegistry({ storagePath: false });
+    const manager = new McpSourceManager(registry, { storagePath: false });
+    try {
+      const imported = await manager.import({ url: fixture.url }, 'sharing');
+      assert.equal(imported.sources[0]?.sharing, 'network');
+      assert.equal(manager.sharing('mcp-sharing'), 'network');
+      assert.equal(manager.sharing('missing'), undefined);
+      assert.equal(registry.get('mcp-sharing')?.metadata?.mcp_sharing, 'network');
+      assert.equal(registry.get('mcp-sharing')?.sharing, 'network');
+      const connectedAt = imported.sources[0]?.last_connected_at;
+      const initialRequests = [...fixture.requests];
+
+      for (const sharing of ['local', 'network'] as const) {
+        const changed = manager.setSharing('mcp-sharing', sharing);
+        assert.equal(changed.sharing, sharing);
+        assert.equal(changed.status, 'connected');
+        assert.equal(changed.last_connected_at, connectedAt);
+        assert.equal(manager.sharing('mcp-sharing'), sharing);
+        assert.equal(manager.list()[0]?.sharing, sharing);
+        assert.equal(registry.get('mcp-sharing')?.metadata?.mcp_sharing, sharing);
+        assert.equal(registry.get('mcp-sharing')?.sharing, sharing);
+        assert.deepEqual(fixture.requests, initialRequests);
+      }
+      const result = await manager.invoke('mcp-sharing', { method: 'mcp-sharing.echo' });
+      assert.equal(result.status, 200);
+      assert.equal(fixture.requests.filter(method => method === 'initialize').length, 1);
+      assert.throws(() => manager.setSharing('mcp-sharing', 'invalid' as never),
+        (error: unknown) => error instanceof McpSourceError && error.status === 400);
+      assert.throws(() => manager.setSharing('mcp-sharing', undefined as never),
+        (error: unknown) => error instanceof McpSourceError && error.status === 400);
+      assert.throws(() => manager.setSharing('missing', 'local'),
+        (error: unknown) => error instanceof McpSourceError && error.status === 404);
+      await manager.stop();
+      assert.throws(() => manager.setSharing('mcp-sharing', 'local'), /manager is stopped/);
+      assert.equal(manager.sharing('mcp-sharing'), 'network');
+    } finally { await manager.stop(); }
+  });
+});
+
+test('MCP sharing restores legacy network defaults and persists changes through refresh and restart', async () => {
+  await withFixture(async fixture => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-sharing-'));
+    const storagePath = path.join(dir, 'mcp-sources.json');
+    fs.writeFileSync(storagePath, JSON.stringify({ mcpServers: { legacy: { url: fixture.url } } }));
+    const registry = new ServiceRegistry({ storagePath: false });
+    const first = new McpSourceManager(registry, { storagePath });
+    let restored: McpSourceManager | undefined;
+    try {
+      assert.equal(first.list()[0]?.sharing, 'network');
+      assert.equal(first.sharing('mcp-legacy'), 'network');
+      await first.start();
+      assert.equal(registry.get('mcp-legacy')?.metadata?.mcp_sharing, 'network');
+      first.setSharing('mcp-legacy', 'local');
+      await first.refresh('mcp-legacy');
+      assert.equal(first.list()[0]?.sharing, 'local');
+      assert.equal(registry.get('mcp-legacy')?.metadata?.mcp_sharing, 'local');
+      const stored = JSON.parse(fs.readFileSync(storagePath, 'utf8'));
+      assert.equal(stored.mcpServers.legacy.sharing, 'local');
+      await first.stop();
+
+      const restoredRegistry = new ServiceRegistry({ storagePath: false });
+      restored = new McpSourceManager(restoredRegistry, { storagePath });
+      assert.equal(restored.list()[0]?.sharing, 'local');
+      await restored.start();
+      assert.equal(restoredRegistry.get('mcp-legacy')?.metadata?.mcp_sharing, 'local');
+      const added = await restored.import({ url: fixture.url, sharing: 'local' }, 'private');
+      assert.equal(added.sources[0]?.sharing, 'local');
+      assert.equal(restoredRegistry.get('mcp-private')?.metadata?.mcp_sharing, 'local');
+      assert.equal(JSON.parse(fs.readFileSync(storagePath, 'utf8')).mcpServers.private.sharing, 'local');
+    } finally {
+      await first.stop(); await restored?.stop();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+test('MCP sharing persistence failure leaves the previous policy, registry and connection intact', async () => {
+  await withFixture(async fixture => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-sharing-'));
+    const storagePath = path.join(dir, 'mcp-sources.json');
+    const registry = new ServiceRegistry({ storagePath: false });
+    const manager = new McpSourceManager(registry, { storagePath });
+    try {
+      await manager.import({ url: fixture.url, sharing: 'local' }, 'rollback');
+      const before = fs.readFileSync(storagePath, 'utf8');
+      const previousService = registry.get('mcp-rollback');
+      const initialRequests = [...fixture.requests];
+      fs.renameSync(storagePath, `${storagePath}.saved`);
+      fs.mkdirSync(storagePath);
+      assert.throws(() => manager.setSharing('mcp-rollback', 'network'),
+        (error: unknown) => error instanceof McpSourceError && error.status === 500);
+      assert.equal(manager.sharing('mcp-rollback'), 'local');
+      assert.equal(manager.list()[0]?.sharing, 'local');
+      assert.equal(registry.get('mcp-rollback'), previousService);
+      assert.equal(registry.get('mcp-rollback')?.metadata?.mcp_sharing, 'local');
+      assert.deepEqual(fixture.requests, initialRequests);
+      assert.equal(fs.readFileSync(`${storagePath}.saved`, 'utf8'), before);
+      assert.deepEqual(fs.readdirSync(dir).sort(), ['mcp-sources.json', 'mcp-sources.json.saved']);
+      fs.rmdirSync(storagePath);
+      fs.renameSync(`${storagePath}.saved`, storagePath);
+      manager.setSharing('mcp-rollback', 'network');
+      assert.equal(manager.sharing('mcp-rollback'), 'network');
+    } finally {
+      await manager.stop();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 test('MCP persistence rejects total configuration overflow and protects damaged files', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-runtime-'));
   const storagePath = path.join(dir, 'mcp-sources.json');
@@ -132,18 +243,22 @@ test('MCP heartbeat marks failures down and reconnects without periodically redi
     const registry = new ServiceRegistry({ storagePath: false });
     const manager = new McpSourceManager(registry, { storagePath: false, timeoutMs: 300, reconnectIntervalMs: 20 });
     try {
-      await manager.import({ url: fixture.url }, 'heartbeat');
+      await manager.import({ url: fixture.url, sharing: 'local' }, 'heartbeat');
       await manager.start();
       await eventually(() => fixture.requests.includes('ping'));
       assert.equal(fixture.requests.filter(method => method === 'tools/list').length, 1);
       fixture.setAvailable(false);
       await eventually(() => manager.list()[0]?.status === 'error');
       assert.equal(registry.get('mcp-heartbeat')?.metadata?.enabled, false);
+      assert.equal(manager.sharing('mcp-heartbeat'), 'local');
+      assert.equal(registry.get('mcp-heartbeat')?.metadata?.mcp_sharing, 'local');
       await registry.probeAll();
       assert.equal(registry.get('mcp-heartbeat')?.liveness, 'down');
       fixture.setAvailable(true);
       await eventually(() => manager.list()[0]?.status === 'connected');
       assert.equal(registry.get('mcp-heartbeat')?.metadata?.enabled, true);
+      assert.equal(manager.list()[0]?.sharing, 'local');
+      assert.equal(registry.get('mcp-heartbeat')?.metadata?.mcp_sharing, 'local');
       const result = await manager.invoke('mcp-heartbeat', { method: 'mcp-heartbeat.echo' });
       assert.equal(result.status, 200);
     } finally { await manager.stop(); }

@@ -2,8 +2,9 @@ import { parseArgs } from 'node:util';
 import fs from 'node:fs';
 import path from 'node:path';
 import { isIP } from 'node:net';
-import { cliError, CLI_OPTIONS } from './cli-process.js';
+import { cliError, CLI_OPTIONS, cliIsFinishing, registerCliCleanup } from './cli-process.js';
 import { callDreammateTool, MCP_TOOLS } from './mcp.js';
+import { loadPrivateMcpSources } from './mcp-client-sources.js';
 import { directoryNodeUrl, directoryPath, exportDirectory, findDirectoryNode, gatewayUrl, loadDirectory,
   parseDirectory, saveDirectory, type NodeDirectory } from './node-directory.js';
 
@@ -13,6 +14,9 @@ export const CLI_USAGE = `dreammate-node cli — 执行一次，输出 JSON 后�
   nodes export [--file nodes.json] [--default-node NAME]   在 Mac/在线网关侧导出地址簿
   nodes import --file nodes.json                          导入并替换本地地址簿（- 读 stdin）
   search --query TEXT       按任务跨节点查找方法摘要（默认最多 15 条）
+  search-skills --query TEXT 按任务跨节点查找 Skill 摘要（--source ID 限定来源）
+  read-skill --skill ID --revision HASH [--resource relative/path]
+                            按检索版本读取完整指南或指定资源
   services                  分页浏览服务摘要（--node all 扫描全网）
   inspect --service ID      分页查看方法摘要；--method NAME 才展开该方法契约
                             --skill NAME 查看配套业务指南
@@ -21,19 +25,25 @@ export const CLI_USAGE = `dreammate-node cli — 执行一次，输出 JSON 后�
   tools                     输出工具名称和参数 Schema，无需联网
 
 公共参数：
+  --mcp-config PATH|none    本进程私有 MCP 配置；优先于 DREAMMATE_MCP_CONFIG
+                            默认 ~/.1agents/mcp-client.json；none 禁用，不导入共享网关
+                            --node @client 仅使用此配置，身份只能在启动时选择
   --agent URL               已在线设备的网关，如 http://100.x.y.z:36908
                             优先于 DREAMMATE_AGENT_URL，再使用缓存默认节点
   --nodes-file PATH         本地缓存文件（或 DREAMMATE_NODES_FILE），默认 ~/.1agents/nodes.json
   --live                    忽略缓存，使用入口网关实时发现
-  --node NAME|IP|URL|all     search 省略时扫描已知节点；其他命令默认入口网关设备
-                            search --node localhost 可限定入口网关所在设备
+  --node NAME|IP|URL|all     search/search-skills 省略时扫描已知节点；其他命令默认入口网关设备
+                            --node localhost 可限定入口网关所在设备
   --keyword TEXT            nodes/services 关键词
-  --query TEXT              search 必填的非空任务描述，最多 2000 字符
+  --query TEXT              search/search-skills 必填的非空任务描述，最多 2000 字符
+  --source ID               search-skills 来源过滤（skills- 加来源名称）
+  --skill ID --revision HASH read-skill 必填技能 ID 和检索返回的 SHA256 内容版本
+  --resource PATH           read-skill 可选包内相对文件路径；省略读取主指南
   --kind TYPE               search/services 类型
   --service ID              search 可选服务过滤；inspect/invoke/manage 必填
-  --limit N                 search/services/inspect 每页 1–20 条；search 默认 15，其余 10
-  --offset N                search/services/inspect 起始偏移 0–1000000，默认 0
-  --max-chars N             摘要 JSON 预算 1000–12000 字符；search 默认 12000，其余 6000
+  --limit N                 搜索/浏览每页 1–20 条；search/search-skills 默认 15，其余 10
+  --offset N                搜索/浏览起始偏移 0–1000000，默认 0
+  --max-chars N             摘要 JSON 预算 1000–12000 字符；搜索默认 12000，其余 6000
   --include-disabled        包含已禁用服务
   --all                     nodes 包含离线设备
   --params -                invoke 从标准输入读取 JSON 对象
@@ -49,6 +59,8 @@ stdout 为完整 MCP 结果 JSON（保留 content、structuredContent、isError�
 const COMMANDS: Record<string, { tool: string; flags: string[]; required?: string[] }> = {
   nodes: { tool: 'dreammate_list_nodes', flags: ['keyword', 'all'] },
   search: { tool: 'dreammate_search_tools', flags: ['query', 'node', 'service', 'kind', 'include-disabled', 'limit', 'offset', 'max-chars'], required: ['query'] },
+  'search-skills': { tool: 'dreammate_search_skills', flags: ['query', 'node', 'source', 'limit', 'offset', 'max-chars'], required: ['query'] },
+  'read-skill': { tool: 'dreammate_read_skill', flags: ['node', 'skill', 'revision', 'resource'], required: ['skill', 'revision'] },
   services: { tool: 'dreammate_list_services', flags: ['node', 'keyword', 'kind', 'include-disabled', 'limit', 'offset', 'max-chars'] },
   inspect: { tool: 'dreammate_inspect', flags: ['node', 'service', 'method', 'skill', 'limit', 'offset', 'max-chars'], required: ['service'] },
   invoke: { tool: 'dreammate_invoke', flags: ['node', 'service', 'method', 'params'], required: ['service', 'method'] },
@@ -84,6 +96,8 @@ export async function runCli(argv: string[]): Promise<number> {
   let tool: string;
   let agentUrl: string;
   let nodeDirectory: NodeDirectory | undefined;
+  let mcpConfig: string | undefined;
+  let hasConfiguredAgent = false;
   const args: Record<string, unknown> = {};
   try {
     const { values, positionals } = parseArgs({
@@ -133,7 +147,7 @@ export async function runCli(argv: string[]): Promise<number> {
     const spec = Object.hasOwn(COMMANDS, command) ? COMMANDS[command] : undefined;
     if (!spec || positionals.length !== 1) throw new Error(`未知命令或多余参数: ${positionals.join(' ')}`);
     for (const key of Object.keys(values)) {
-      if (!['agent', 'help', 'nodes-file', 'live', 'timeout-ms', ...spec.flags].includes(key)) throw new Error(`${command} 不支持 --${key}`);
+      if (!['agent', 'help', 'nodes-file', 'live', 'timeout-ms', 'mcp-config', ...spec.flags].includes(key)) throw new Error(`${command} 不支持 --${key}`);
     }
     for (const key of spec.required ?? []) {
       if (!(values as Record<string, unknown>)[key]) throw new Error(`缺少必填参数: --${key}`);
@@ -141,6 +155,24 @@ export async function runCli(argv: string[]): Promise<number> {
     if (values.query !== undefined) {
       if (!values.query.trim() || values.query.length > 2000) throw new Error('--query 必须是 1–2000 字符的非空任务描述');
       args.query = values.query.trim();
+    }
+    if (values.source !== undefined) {
+      if (!/^skills-[A-Za-z0-9_-]{1,64}$/.test(values.source)) throw new Error('--source 必须是有效的 Skill 来源 ID');
+      args.source_id = values.source;
+    }
+    if (command === 'read-skill') {
+      if (!values.skill?.trim() || values.skill.length > 256 || values.skill.includes('\0')) throw new Error('--skill 必须是有效的非空技能 ID（最多 256 字符）');
+      if (!/^[a-fA-F0-9]{64}$/.test(values.revision!)) throw new Error('--revision 必须是 64 位十六进制 SHA256 内容版本');
+      args.skill_id = values.skill;
+      args.revision = values.revision!.toLowerCase();
+      if (values.resource !== undefined) {
+        if (!values.resource || values.resource.length > 1024 || values.resource.includes('\0') || values.resource.includes('\\')
+          || path.posix.isAbsolute(values.resource) || /^[A-Za-z]:/.test(values.resource)
+          || values.resource.split('/').some(part => !part || part === '.' || part === '..')) {
+          throw new Error('--resource 必须是无 .. 的包内相对文件路径');
+        }
+        args.resource = values.resource;
+      }
     }
     for (const [key, min, max] of [['limit', 1, 20], ['offset', 0, 1_000_000], ['max-chars', 1000, 12_000]] as const) {
       const raw = values[key];
@@ -162,14 +194,15 @@ export async function runCli(argv: string[]): Promise<number> {
       ?? (nodeDirectory ? directoryNodeUrl(findDirectoryNode(nodeDirectory, nodeDirectory.default_node)!) : undefined)
       ?? (values.node && isIP(values.node) ? `http://${isIP(values.node) === 6 ? `[${values.node}]` : values.node}:36908` : undefined)
       ?? (values.node && /^https?:\/\//.test(values.node) ? values.node : undefined);
-    if (!configured) throw new Error('请先 cli nodes import --file nodes.json，或用 --agent URL / DREAMMATE_AGENT_URL 指定在线网关');
-    agentUrl = gatewayUrl(configured);
-    if (values.node === 'all' && !['search', 'services'].includes(command)) throw new Error('--node all 仅用于 search/services');
+    hasConfiguredAgent = Boolean(configured);
+    agentUrl = gatewayUrl(configured ?? 'http://127.0.0.1:36908');
+    mcpConfig = values['mcp-config'];
+    if (values.node === 'all' && !['search', 'search-skills', 'services'].includes(command)) throw new Error('--node all 仅用于 search/search-skills/services');
     if (values.action && !['start', 'stop', 'status'].includes(values.action)) throw new Error('--action 必须是 start、stop 或 status');
     if (values.method && values.skill) throw new Error('--method 和 --skill 请只指定一个');
 
     for (const key of ['node', 'method', 'skill', 'keyword', 'kind', 'action'] as const) {
-      if (values[key] !== undefined) args[key] = values[key];
+      if (values[key] !== undefined && !(command === 'read-skill' && key === 'skill')) args[key] = values[key];
     }
     if (values.service) args.service_id = values.service;
     if (values.all) args.online_only = false;
@@ -184,7 +217,24 @@ export async function runCli(argv: string[]): Promise<number> {
     return 2;
   }
 
-  const result = await callDreammateTool(tool, args, { agentUrl, nodeDirectory });
-  console.log(JSON.stringify(result, null, 2));
-  return result.isError ? 1 : 0;
+  let privateMcpSources;
+  let unregisterCleanup: (() => void) | undefined;
+  try {
+    privateMcpSources = await loadPrivateMcpSources(mcpConfig, source => {
+      unregisterCleanup = registerCliCleanup(() => source.stop());
+    });
+    if (cliIsFinishing()) return 1;
+    if (!hasConfiguredAgent && !privateMcpSources) {
+      cliError('请先 cli nodes import --file nodes.json，或用 --agent URL / DREAMMATE_AGENT_URL 指定在线网关', 'INVALID_ARGUMENT');
+      return 2;
+    }
+    const result = await callDreammateTool(tool, args, { agentUrl, nodeDirectory, privateMcpSources });
+    if (cliIsFinishing()) return 1;
+    console.log(JSON.stringify(result, null, 2));
+    return result.isError ? 1 : 0;
+  } catch {
+    if (cliIsFinishing()) return 1;
+    cliError('无法加载私有 MCP 配置或连接上游；未回退到共享身份', 'PRIVATE_MCP_ERROR');
+    return 1;
+  } finally { await privateMcpSources?.stop(); unregisterCleanup?.(); }
 }

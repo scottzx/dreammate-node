@@ -1,10 +1,21 @@
 import path from 'node:path';
 
+export type McpSharing = 'local' | 'network';
+
+/** Older source files keep their existing network-wide sharing behavior. */
+export function parseMcpSharing(value: unknown): McpSharing {
+  if (value === undefined) return 'network';
+  if (value === 'local' || value === 'network') return value;
+  throw new Error('MCP sharing 仅支持 local 或 network');
+}
+
 /** A source is one MCP server. Its tools share this stable service ID. */
 export interface McpSourceConfig {
   id: string;
   name: string;
   type: 'stdio' | 'http' | 'sse';
+  /** Omitted legacy values mean network. This is independent of transport. */
+  sharing?: McpSharing;
   command?: string;
   args?: string[];
   env?: Record<string, string>;
@@ -25,7 +36,7 @@ export interface McpSourceConfig {
 
 export const MAX_MCP_CONFIG_BYTES = 256 * 1024;
 const MAX_SOURCES = 64;
-const SOURCE_FIELDS = new Set(['command', 'args', 'env', 'cwd', 'url', 'headers', 'type', 'transport', 'oauth']);
+const SOURCE_FIELDS = new Set(['command', 'args', 'env', 'cwd', 'url', 'headers', 'type', 'transport', 'oauth', 'sharing']);
 
 // JSON.parse silently keeps the last duplicate key, which could hide an MCP
 // source or override its credentials. Check object keys after syntax validation.
@@ -138,7 +149,7 @@ function parseSource(name: string, value: unknown): McpSourceConfig {
   if (raw.transport !== undefined && transport(raw.transport) !== type) {
     throw new Error('MCP type 与 transport 不一致');
   }
-  const result: McpSourceConfig = { id: `mcp-${name}`, name, type };
+  const result: McpSourceConfig = { id: `mcp-${name}`, name, type, sharing: parseMcpSharing(raw.sharing) };
   if (type === 'stdio') {
     if (raw.url !== undefined || raw.headers !== undefined || raw.oauth !== undefined) throw new Error('stdio MCP 不支持 url、headers 或 oauth');
     result.command = text(raw.command, 'command', 4096);

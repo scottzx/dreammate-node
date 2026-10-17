@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.12.0 — 2026-10-18
+
+- Separate MCP connections from gateway sharing with persistent `local` / `network` scopes, defaulting existing sources to `network`; change scopes without reconnecting and enforce them on discovery, schemas, invocation and service subroutes.
+- Support the same independent sharing scope for ordinary registered services, including skill-provider and embedding routes; recheck access after request-body reads so a revoked network call cannot reach the upstream.
+- Load owner-readable private MCP configurations in CLI/Stdio processes, route their tools through the reserved `@client` target, and keep selected credentials out of shared gateway catalogs and tool parameters.
+- Extract `@1agents/skill-manager` into an independent package and HTTP service with versioned skill reads, shared/project discovery, source management and user-service lifecycle commands; retain Node compatibility routes through the registered provider.
+- Manage on-demand local embedding workers with idle shutdown, persistent vector caches, configurable provider priority and macOS service commands while keeping health checks and advertisements independent of model loading.
+- Recover from encoder spawn failures without leaving a duplicate worker, and clean up private MCP subprocesses when the host closes during initialization while preserving buffered client input.
+- Verify both packages through isolated tarball installations and gateway/provider integration tests, and publish Skill Manager independently from its own release tag.
+
 ## 0.10.0 — 2026-10-17
 
 - Add persistent custom MCP sources from pasted JSON, files or stdin, supporting local stdio and remote Streamable HTTP / SSE, automatic paginated discovery, reconnection and loopback-only management commands and APIs.

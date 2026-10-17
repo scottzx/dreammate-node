@@ -8,7 +8,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { CallToolResultSchema, ErrorCode, McpError, ToolListChangedNotificationSchema, type Tool } from '@modelcontextprotocol/sdk/types.js';
-import { MAX_MCP_CONFIG_BYTES, parseMcpSourceConfig, type McpSourceConfig } from './mcp-source-config.js';
+import { MAX_MCP_CONFIG_BYTES, parseMcpSourceConfig, type McpSharing, type McpSourceConfig } from './mcp-source-config.js';
 import { ServiceRegistry, type MethodDescriptor } from './registry.js';
 import { withRequestTimeout } from './request-timeout.js';
 import { AjvJsonSchemaValidator } from '@modelcontextprotocol/sdk/validation/ajv';
@@ -29,6 +29,7 @@ export interface McpSourceStatus {
   id: string;
   name: string;
   type: McpSourceConfig['type'];
+  sharing: McpSharing;
   status: 'connected' | 'connecting' | 'disconnected' | 'error';
   transport?: McpSourceConfig['type'];
   tool_count: number;
@@ -113,6 +114,7 @@ function statusOf(state: SourceState): McpSourceStatus {
     id: state.config.id,
     name: state.config.name,
     type: state.config.type,
+    sharing: state.config.sharing ?? 'network',
     status: state.status,
     ...(state.actualTransport ? { transport: state.actualTransport } : {}),
     tool_count: state.tools.size + (state.catalogStatus === 'ready' ? state.children.size : 0),
@@ -246,6 +248,24 @@ export class McpSourceManager {
     return this.#sources.has(id);
   }
 
+  sharing(id: string): McpSharing | undefined {
+    const state = this.#sources.get(id);
+    return state ? state.config.sharing ?? 'network' : undefined;
+  }
+
+  setSharing(id: string, sharing: McpSharing): McpSourceStatus {
+    if (sharing !== 'local' && sharing !== 'network') throw new McpSourceError(400, 'MCP sharing must be "local" or "network"');
+    const state = this.#sources.get(id);
+    if (!state) throw new McpSourceError(404, 'MCP source not found');
+    if (this.#stopping) throw new Error('MCP source manager is stopped');
+    const previous = state.config;
+    state.config = { ...previous, sharing };
+    try { this.#persist(); }
+    catch (error) { state.config = previous; throw error; }
+    this.#syncRegistry(state);
+    return statusOf(state);
+  }
+
   async remove(id: string): Promise<boolean> {
     const state = this.#sources.get(id);
     if (!state) return false;
@@ -300,9 +320,11 @@ export class McpSourceManager {
       }];
     }));
     const registered = this.#registry.register({
-      id, name: state.config.name, kind: 'mcp', execution: 'http', reachability: 'localhost', methods,
+      id, name: state.config.name, kind: 'mcp', execution: 'http', reachability: 'localhost',
+      sharing: state.config.sharing ?? 'network', methods,
       metadata: {
         mcp_source: id,
+        mcp_sharing: state.config.sharing ?? 'network',
         mcp_transport: state.actualTransport ?? state.config.type,
         description: `MCP tools from ${state.config.name}`,
         enabled: state.status === 'connected',

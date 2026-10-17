@@ -21,9 +21,11 @@ export {
 export { createAgent, serveAgent, NODE_AGENT_PORT, type AgentOptions } from './server.js';
 export { McpSourceError, McpSourceManager, type McpSourceManagerOptions,
   type McpSourceStatus, type McpSourceImportResult } from './mcp-sources.js';
-export { parseMcpSourceConfig, type McpSourceConfig } from './mcp-source-config.js';
+export { parseMcpSourceConfig, parseMcpSharing, type McpSourceConfig, type McpSharing } from './mcp-source-config.js';
+export { loadPrivateMcpSources, type PrivateMcpSources } from './mcp-client-sources.js';
 export { ToolNameError, ToolNameIndex, type ToolIdentity, type NamedTool } from './mcp-tool-names.js';
 export { CatalogError, detectCatalogAdapters, type CatalogAdapter, type CatalogCall, type CatalogTool } from './mcp-catalogs.js';
+export type { SkillSummary } from './skill-sources.js';
 export { rediscover, type RediscoverOptions } from './rediscover.js';
 export {
   reportToAgent,

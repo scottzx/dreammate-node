@@ -1,5 +1,6 @@
 dist/
 node_modules/
+.DS_Store
 skills/*/dreammate-node-workspace/
 .local/tool-search/
 scripts/local-embeddings/__pycache__/

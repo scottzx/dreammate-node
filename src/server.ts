@@ -7,6 +7,7 @@
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { DEFAULT_PORTS, PROTOCOL_VERSION, type NodeManifest, type MethodDescriptor } from '@1agents/dreammate-network';
 import { nodeIdentity } from './identity.js';
 import { ServiceRegistry, type Registration, type RegisteredService } from './registry.js';
@@ -16,6 +17,7 @@ import { withRequestTimeout } from './request-timeout.js';
 import { McpSourceError, McpSourceManager, type McpSourceManagerOptions } from './mcp-sources.js';
 import { CatalogError } from './mcp-catalogs.js';
 import { ToolNameError } from './mcp-tool-names.js';
+import { registeredSkillProvider, requiresLocalMethod, SkillProviderError } from './skill-provider.js';
 
 /** 固定端口。改它等于让全网的探测方同时失明。 */
 export const NODE_AGENT_PORT: number = DEFAULT_PORTS['node-agent'];
@@ -42,6 +44,11 @@ const json = (res: http.ServerResponse, status: number, body: unknown): void => 
   });
   res.end(payload);
 };
+
+/** Strong conditional token for a registry snapshot, independent of the service implementation. */
+function serviceEtag(service: RegisteredService): string {
+  return `"${createHash('sha256').update(JSON.stringify(service)).digest('hex')}"`;
+}
 
 /**
  * 报备只接受来自回环的请求。
@@ -129,7 +136,12 @@ function embeddingPayload(raw: string, model: string): { model: string; texts: s
   return { model, texts: entry.texts as string[], input_type: entry.input_type };
 }
 
-async function proxyEmbedding(req: http.IncomingMessage, res: http.ServerResponse, service: RegisteredService): Promise<void> {
+async function proxyEmbedding(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  service: RegisteredService,
+  canAccess: () => boolean,
+): Promise<void> {
   if (service.metadata?.enabled === false || service.liveness === 'down') {
     return json(res, 503, { error: 'Embedding provider is disabled or down' });
   }
@@ -153,6 +165,9 @@ async function proxyEmbedding(req: http.IncomingMessage, res: http.ServerRespons
     if (req.aborted || res.destroyed) return;
     const payload = embeddingPayload(await readEmbeddingBody(req), advertisement.model);
     if (disconnected.signal.aborted || req.aborted || res.destroyed) return;
+    // A body may arrive slowly while the provider is switched back to local.
+    // Recheck the current owner/registration policy before waking the model.
+    if (!canAccess()) return json(res, 404, { error: 'no such service' });
     const result = await withRequestTimeout(async deadline => {
       const response = await fetch(`http://127.0.0.1:${service.port}/embed`, {
         method: 'POST', redirect: 'error', headers: { 'content-type': 'application/json' },
@@ -204,8 +219,16 @@ function validate(body: unknown): Registration {
   if (entry.capabilities !== undefined && !Array.isArray(entry.capabilities)) {
     throw new Error('capabilities must be an array');
   }
+  const localMethods = entry.metadata?.local_only_methods;
+  if (localMethods !== undefined && (!Array.isArray(localMethods)
+    || localMethods.some(method => typeof method !== 'string' || !method.trim()))) {
+    throw new Error('metadata.local_only_methods must be an array of non-empty method names');
+  }
   if (entry.reachability && entry.reachability !== 'localhost' && entry.reachability !== 'network') {
     throw new Error('reachability must be "localhost" or "network"');
+  }
+  if (entry.sharing !== undefined && entry.sharing !== 'local' && entry.sharing !== 'network') {
+    throw new Error('sharing must be "local" or "network"');
   }
   if (entry.methods !== undefined) {
     if (typeof entry.methods !== 'object' || entry.methods === null || Array.isArray(entry.methods)) {
@@ -367,6 +390,9 @@ async function executeService(
   payload: { method: string; capability?: string; params?: unknown },
 ): Promise<ExecutionResult> {
   const mode = service.execution ?? (service.command ? 'hybrid' : 'http');
+  const advertisedTimeout = service.metadata?.invoke_timeout_ms;
+  const httpTimeout = typeof advertisedTimeout === 'number' && Number.isInteger(advertisedTimeout)
+    && advertisedTimeout >= 1 && advertisedTimeout <= 120_000 ? advertisedTimeout : 15_000;
 
   // 1. execution === 'cli': 仅本地 CLI
   if (mode === 'cli') {
@@ -382,7 +408,7 @@ async function executeService(
         data: { error: `Service "${service.id}" has execution: 'http' but no port specified` },
       };
     }
-    return executeViaHttp(service.port, payload);
+    return executeViaHttp(service.port, payload, httpTimeout);
   }
 
   // 3. execution === 'hybrid': 双模兼容，优先 CLI！
@@ -397,7 +423,7 @@ async function executeService(
     typeof (cliRes.data as any)?.error === 'string' &&
     (cliRes.data as any).error.includes('Failed to spawn CLI');
   if (isSpawnNotFound && service.port && service.liveness !== 'down') {
-    return executeViaHttp(service.port, payload);
+    return executeViaHttp(service.port, payload, httpTimeout);
   }
 
   return cliRes;
@@ -408,20 +434,27 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
   const mcpSources = new McpSourceManager(registry, options.mcpSources);
   const execute = (service: RegisteredService, payload: { method: string; capability?: string; params?: unknown }): Promise<ExecutionResult> =>
     mcpSources.owns(service.id) ? mcpSources.invoke(service.id, payload) : executeService(service, payload);
-
   const server = http.createServer((req, res) => {
     void (async () => {
       try {
         const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
         const { pathname } = url;
         const identity = await nodeIdentity();
+        // Sharing belongs to the owning source, independently of the upstream
+        // transport/reachability. Never trust forwarding headers for local access.
+        const local = isLoopback(req);
+        const canAccessService = (id: string): boolean => local
+          || (mcpSources.sharing(id) ?? registry.get(id)?.sharing) !== 'local';
+        const skillRequest = (method: string, params: unknown = {}): Promise<ExecutionResult> =>
+          execute(registeredSkillProvider(registry, service => canAccessService(service.id)), { method, params });
 
         if (req.method === 'GET' && pathname === '/health') {
           return json(res, 200, {
             status: 'ok',
             node_id: identity.node_id,
             service: 'node-agent',
-            services: registry.list().length,
+            service_sharing: 'dreammate.service-sharing.v1',
+            services: registry.list().filter(service => canAccessService(service.id)).length,
           });
         }
 
@@ -433,14 +466,14 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
             type: identity.type,
             tailscale_name: identity.dnsName ?? null,
             online: true,
-            metadata: { protocol_version: PROTOCOL_VERSION, identity_source: identity.source },
-            services: registry.toServices(host, identity.ipv4),
+            metadata: { protocol_version: PROTOCOL_VERSION, identity_source: identity.source, skill_catalog: '/skills', service_sharing: 'dreammate.service-sharing.v1' },
+            services: registry.toServices(host, identity.ipv4).filter(service => canAccessService(service.id)),
           };
           return json(res, 200, manifest);
         }
 
         if (req.method === 'GET' && pathname === '/services') {
-          return json(res, 200, { node: identity.name, services: registry.list() });
+          return json(res, 200, { node: identity.name, services: registry.list().filter(service => canAccessService(service.id)) });
         }
 
         if (req.method === 'GET' && pathname === '/nodes') {
@@ -449,9 +482,69 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
           return json(res, 200, { node: identity.name, nodes });
         }
 
+        // Publishing a directory is a local management operation; only published skills are readable over the network.
+        if (pathname === '/skills/sources' || pathname.startsWith('/skills/sources/')) {
+          if (!isLoopback(req)) return json(res, 403, { error: 'Skill source management is loopback-only' });
+          if (pathname === '/skills/sources' && req.method === 'GET') {
+            const result = await skillRequest('sources');
+            return json(res, result.status, result.data);
+          }
+          if (pathname === '/skills/sources' && req.method === 'POST') {
+            const result = await skillRequest('add_source', JSON.parse(await readBody(req)));
+            return json(res, result.status === 200 ? 201 : result.status, result.data);
+          }
+          if (pathname === '/skills/sources/discover' && req.method === 'POST') {
+            const body = JSON.parse(await readBody(req)) as Record<string, unknown> | null;
+            if (!body || typeof body !== 'object' || Array.isArray(body)
+              || Object.keys(body).some(key => key !== 'projects')
+              || (body.projects !== undefined && typeof body.projects !== 'boolean')) {
+              return json(res, 400, { error: 'Skill discovery only accepts an optional projects boolean' });
+            }
+            const result = await skillRequest('discover_sources', { projects: body.projects !== false });
+            return json(res, result.status, result.data);
+          }
+          if (pathname === '/skills/sources/refresh' && req.method === 'POST') {
+            const result = await skillRequest('refresh_sources');
+            return json(res, result.status, result.data);
+          }
+          const sourceRoute = /^\/skills\/sources\/([^/]+)(\/refresh)?$/.exec(pathname);
+          if (sourceRoute) {
+            const id = decodeURIComponent(sourceRoute[1]!);
+            if ((!sourceRoute[2] && req.method === 'DELETE') || (sourceRoute[2] && req.method === 'POST')) {
+              const result = await skillRequest(sourceRoute[2] ? 'refresh_sources' : 'remove_source', { id });
+              return json(res, result.status, result.data);
+            }
+          }
+          return json(res, 404, { error: 'no such skill source route' });
+        }
+
+        if (req.method === 'GET' && pathname === '/skills') {
+          const limit = Number(url.searchParams.get('limit') ?? 100);
+          const offset = Number(url.searchParams.get('offset') ?? 0);
+          if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200 || !Number.isSafeInteger(offset) || offset < 0 || offset > 1_000_000) {
+            return json(res, 400, { error: 'Skill catalog limit must be 1..200 and offset 0..1000000' });
+          }
+          const result = await skillRequest('catalog', { limit, offset });
+          return json(res, result.status, result.status === 200 && result.data && typeof result.data === 'object'
+            ? { ...result.data, node: identity.name } : result.data);
+        }
+
+        const readSkill = /^\/skills\/([^/]+)$/.exec(pathname);
+        if (req.method === 'GET' && readSkill) {
+          const revision = url.searchParams.get('revision') ?? '';
+          const resource = url.searchParams.get('resource') ?? undefined;
+          if (!/^[a-f0-9]{64}$/.test(revision)) return json(res, 400, { error: 'A 64-character lowercase SHA256 skill revision is required' });
+          if (resource !== undefined && (!resource || resource.includes('\\') || resource.includes('\0')
+            || resource.startsWith('/') || /^[A-Za-z]:/.test(resource) || resource.split('/').some(part => part === '..' || part === '.'))) {
+            return json(res, 400, { error: 'Invalid skill resource path' });
+          }
+          const result = await skillRequest('read', { skill_id: decodeURIComponent(readSkill[1]!), revision, ...(resource !== undefined ? { resource } : {}) });
+          return json(res, result.status, result.data);
+        }
+
         // Connecting an MCP may spawn a local program or read local credentials.
-        // Only the owning machine can configure sources; discovered tools remain
-        // callable through the normal network gateway.
+        // Only the owning machine can configure connections and sharing. The
+        // sharing policy controls publication independently of the connection.
         if (pathname === '/mcp/sources' || pathname.startsWith('/mcp/sources/')) {
           if (!isLoopback(req)) return json(res, 403, { error: 'MCP source management is loopback-only' });
           if (pathname === '/mcp/sources' && req.method === 'GET') {
@@ -469,6 +562,18 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
             const result = await mcpSources.import(wrapped ? request.config : body, wrapped ? request.name as string | undefined : undefined);
             return json(res, 201, result);
           }
+          const sharingRoute = /^\/mcp\/sources\/([^/]+)\/sharing$/.exec(pathname);
+          if (sharingRoute && req.method === 'PATCH') {
+            let body: unknown;
+            try { body = JSON.parse(await readBody(req)); }
+            catch { return json(res, 400, { error: 'MCP sharing request must be valid JSON' }); }
+            if (!body || typeof body !== 'object' || Array.isArray(body)
+              || Object.keys(body).some(key => key !== 'sharing') || !('sharing' in body)
+              || (body.sharing !== 'local' && body.sharing !== 'network')) {
+              return json(res, 400, { error: 'MCP sharing request only accepts sharing: local or network' });
+            }
+            return json(res, 200, mcpSources.setSharing(decodeURIComponent(sharingRoute[1]!), body.sharing));
+          }
           const sourceRoute = /^\/mcp\/sources\/([^/]+)(\/refresh)?$/.exec(pathname);
           if (sourceRoute) {
             const id = decodeURIComponent(sourceRoute[1]!);
@@ -482,6 +587,14 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
             }
           }
           return json(res, 404, { error: 'no such MCP source route' });
+        }
+
+        // Apply the same source policy to every service subroute, including
+        // direct schema reads, invocation, lifecycle and skill/embedding routes.
+        // Hidden sources look absent even when a caller cached their IDs.
+        const serviceRoute = /^\/services\/([^/]+)(?:\/|$)/.exec(pathname);
+        if (serviceRoute && !canAccessService(decodeURIComponent(serviceRoute[1]!))) {
+          return json(res, 404, { error: 'no such service' });
         }
 
         const getSkillArchive = /^\/services\/([^/]+)\/skills\/([^/]+)\/archive$/.exec(pathname);
@@ -520,7 +633,7 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
         if (req.method === 'POST' && embedService) {
           const id = decodeURIComponent(embedService[1]!);
           const service = registry.get(id);
-          return service ? proxyEmbedding(req, res, service)
+          return service ? proxyEmbedding(req, res, service, () => Boolean(registry.get(id)) && canAccessService(id))
             : json(res, 404, { error: `no such service: ${id}` });
         }
 
@@ -535,6 +648,7 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
         if (req.method === 'GET' && getSingle) {
           const id = decodeURIComponent(getSingle[1]!);
           const service = registry.get(id);
+          if (service) res.setHeader('etag', serviceEtag(service));
           return service
             ? json(res, 200, service)
             : json(res, 404, { error: `no such service: ${id}` });
@@ -563,6 +677,11 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
           }
           const raw = await readBody(req);
           const payload = raw ? JSON.parse(raw) : {};
+          // Recheck after reading the body: sharing may have changed meanwhile.
+          if (!registry.get(id) || !canAccessService(id)) return json(res, 404, { error: 'no such service' });
+          if (!isLoopback(req) && requiresLocalMethod(service, payload)) {
+            return json(res, 403, { error: 'Service method is loopback-only' });
+          }
           const result = await execute(service, payload);
           return json(res, result.status, result.data);
         }
@@ -572,6 +691,7 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
           const capability = decodeURIComponent(invokeCap[1]!);
           const target = registry.list().find(
             (s) =>
+              canAccessService(s.id) &&
               (Boolean(s.capabilities?.includes(capability)) || Boolean(s.methods && capability in s.methods)) &&
               s.metadata?.enabled !== false &&
               s.liveness !== 'down',
@@ -581,7 +701,12 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
           }
           const raw = await readBody(req);
           const payload = raw ? JSON.parse(raw) : {};
-          const result = await execute(target, { method: capability, capability, ...payload });
+          const invocation = { method: capability, capability, ...payload };
+          if (!registry.get(target.id) || !canAccessService(target.id)) return json(res, 404, { error: 'no active service found for capability/method' });
+          if (!isLoopback(req) && requiresLocalMethod(target, invocation, capability)) {
+            return json(res, 403, { error: 'Service method is loopback-only' });
+          }
+          const result = await execute(target, invocation);
           return json(res, result.status, result.data);
         }
 
@@ -678,6 +803,13 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
           if (mcpSources.owns(id)) {
             return json(res, 409, { error: 'remove managed MCP services through /mcp/sources/:id' });
           }
+          const expected = req.headers['if-match'];
+          if (expected !== undefined) {
+            const current = registry.get(id);
+            if (!current || expected !== serviceEtag(current)) {
+              return json(res, 412, { error: 'Service registration changed; conditional deregistration was skipped' });
+            }
+          }
           return registry.deregister(id)
             ? json(res, 200, { removed: id })
             : json(res, 404, { error: `no such service: ${id}` });
@@ -685,8 +817,9 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
 
         json(res, 404, { error: `no route: ${req.method} ${pathname}` });
       } catch (error: unknown) {
-        json(res, error instanceof McpSourceError || error instanceof CatalogError || error instanceof ToolNameError ? error.status : 400,
-          { error: error instanceof Error ? error.message : String(error), ...(error instanceof ToolNameError ? { candidates: error.candidates } : {}) });
+        json(res, error instanceof McpSourceError || error instanceof CatalogError || error instanceof ToolNameError || error instanceof SkillProviderError ? error.status : 400,
+          { error: error instanceof Error ? error.message : String(error), ...(error instanceof ToolNameError ? { candidates: error.candidates } : {}),
+            ...(error instanceof SkillProviderError ? { code: error.code } : {}) });
       }
     })();
   });

@@ -1,0 +1,41 @@
+{
+  "name": "@1agents/skill-manager",
+  "version": "0.2.0",
+  "description": "Discover project and shared Agent Skills, manage their source directories, and read versioned resources on demand.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "dreammate-skills": "dist/cli.js"
+  },
+  "files": ["dist", "CHANGELOG.md"],
+  "sideEffects": false,
+  "scripts": {
+    "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.test.json --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
+    "check": "npm run typecheck && npm test && npm run build",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run check"
+  },
+  "engines": { "node": ">=22.5" },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/scottzx/dreammate-node.git",
+    "directory": "packages/skill-manager"
+  },
+  "publishConfig": { "access": "public" }
+}

@@ -1,6 +1,6 @@
 {
   "name": "@1agents/dreammate-node",
-  "version": "0.10.0",
+  "version": "0.12.0",
   "description": "DreamMate Network 的设备网关与一次性 CLI：服务发现、调用与可导入的设备地址簿。",
   "keywords": [
     "dreammate",
@@ -31,6 +31,9 @@
   "bin": {
     "dreammate-node": "dist/bin/dreammate-node.js"
   },
+  "workspaces": [
+    "packages/skill-manager"
+  ],
   "files": [
     "dist/bin/*.js",
     "dist/bin/*.d.ts",
@@ -49,9 +52,20 @@
   ],
   "sideEffects": false,
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --import tsx --test test/*.test.ts test/*.test.mjs deploy/plane-bridge/bridge.test.mjs",
+    "build": "npm run build:node",
+    "build:node": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.build.json",
+    "build:all": "npm run build && npm run skill-manager:build",
+    "skill-manager:build": "npm run build --workspace=@1agents/skill-manager",
+    "skill-manager:check": "npm run check --workspace=@1agents/skill-manager",
+    "typecheck": "tsc -p tsconfig.node-tests.json --noEmit",
+    "typecheck:integration": "npm run skill-manager:build && tsc -p tsconfig.json --noEmit",
+    "typecheck:all": "npm run typecheck && npm run typecheck --workspace=@1agents/skill-manager && npm run typecheck:integration",
+    "test": "npm run test:node",
+    "test:all": "npm test && npm run test --workspace=@1agents/skill-manager && npm run test:integration",
+    "test:node": "node --import tsx --test test/*.test.ts test/*.test.mjs deploy/plane-bridge/bridge.test.mjs",
+    "test:integration": "npm run skill-manager:build && node --import tsx --test test/*.integration.ts",
+    "test:packages": "npm run build:all && node scripts/check-package-boundary.mjs",
+    "check:all": "npm run typecheck:all && npm run test:all && npm run test:packages",
     "postinstall": "node scripts/install-skills.mjs --postinstall",
     "skills:install": "node scripts/install-skills.mjs",
     "prepack": "npm run build"

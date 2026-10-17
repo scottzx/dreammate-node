@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { MAX_MCP_CONFIG_BYTES, parseMcpSourceConfig } from '../src/mcp-source-config.js';
+import { MAX_MCP_CONFIG_BYTES, parseMcpSharing, parseMcpSourceConfig } from '../src/mcp-source-config.js';
 
 test('MCP config parses standard local and remote configurations without expanding placeholders', () => {
   const sources = parseMcpSourceConfig(JSON.stringify({ mcpServers: {
@@ -8,14 +8,14 @@ test('MCP config parses standard local and remote configurations without expandi
     activepieces: { url: 'https://ap.example/api/v1/mcp/token/sse?session=secret', headers: { Authorization: 'Bearer ${TOKEN}' } },
   } }));
   assert.deepEqual(sources, [
-    { id: 'mcp-local', name: 'local', type: 'stdio', command: 'npx', args: ['-y', 'test-mcp', ''], env: { TOKEN: '${SECRET}' }, cwd: '/tmp' },
-    { id: 'mcp-activepieces', name: 'activepieces', type: 'http', url: 'https://ap.example/api/v1/mcp/token/sse?session=secret', headers: { Authorization: 'Bearer ${TOKEN}' } },
+    { id: 'mcp-local', name: 'local', type: 'stdio', sharing: 'network', command: 'npx', args: ['-y', 'test-mcp', ''], env: { TOKEN: '${SECRET}' }, cwd: '/tmp' },
+    { id: 'mcp-activepieces', name: 'activepieces', type: 'http', sharing: 'network', url: 'https://ap.example/api/v1/mcp/token/sse?session=secret', headers: { Authorization: 'Bearer ${TOKEN}' } },
   ]);
 });
 
 test('MCP config supports named maps, explicit SSE, and streamable HTTP aliases', () => {
   assert.deepEqual(parseMcpSourceConfig({ url: { url: 'https://example.com', type: 'sse' } }), [
-    { id: 'mcp-url', name: 'url', type: 'sse', url: 'https://example.com' },
+    { id: 'mcp-url', name: 'url', type: 'sse', sharing: 'network', url: 'https://example.com' },
   ]);
   for (const alias of ['http', 'streamable-http', 'streamableHttp', 'streamable_http']) {
     assert.equal(parseMcpSourceConfig({ url: 'http://127.0.0.1:5000/mcp', transport: alias }, 'local-http')[0]?.type, 'http');
@@ -23,6 +23,23 @@ test('MCP config supports named maps, explicit SSE, and streamable HTTP aliases'
   assert.equal(parseMcpSourceConfig({ command: 'node', transport: 'stdio' }, 'node')[0]?.type, 'stdio');
   assert.equal(parseMcpSourceConfig({ url: 'https://${MCP_HOST}/mcp/${MCP_TOKEN}' }, 'remote')[0]?.url,
     'https://${MCP_HOST}/mcp/${MCP_TOKEN}');
+});
+
+test('MCP sharing is independent of transport and defaults to network for legacy sources', () => {
+  assert.equal(parseMcpSharing(undefined), 'network');
+  for (const sharing of ['local', 'network'] as const) {
+    assert.equal(parseMcpSharing(sharing), sharing);
+    for (const config of [
+      { command: 'node' }, { url: 'https://example.com/mcp' }, { type: 'sse', url: 'https://example.com/sse' },
+    ]) assert.equal(parseMcpSourceConfig({ ...config, sharing }, 'source')[0]?.sharing, sharing);
+  }
+  assert.equal(parseMcpSourceConfig({ command: 'node' }, 'legacy')[0]?.sharing, 'network');
+  for (const sharing of [null, '', 'LOCAL', 'private', true, 0, [], {}]) {
+    assert.throws(() => parseMcpSharing(sharing), /sharing/);
+    assert.throws(() => parseMcpSourceConfig({ command: 'node', sharing }, 'source'), /sharing/);
+  }
+  assert.throws(() => parseMcpSourceConfig({ command: 'node', sharing: 'sensitive-sharing-marker' }, 'source'),
+    error => error instanceof Error && !error.message.includes('sensitive-sharing-marker'));
 });
 
 test('MCP config requires an unambiguous source name and rejects duplicate JSON keys', () => {

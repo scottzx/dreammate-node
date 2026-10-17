@@ -1,0 +1,105 @@
+name: Skill Manager
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['skill-manager-v*']
+    paths:
+      - 'packages/skill-manager/**'
+      - '.github/workflows/skill-manager.yml'
+  pull_request:
+    paths:
+      - 'packages/skill-manager/**'
+      - '.github/workflows/skill-manager.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: skill-manager-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  standalone-package:
+    name: Standalone package / Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Copy package outside the gateway repository
+        run: |
+          mkdir -p "$RUNNER_TEMP/skill-manager" "$RUNNER_TEMP/artifacts"
+          cp -R packages/skill-manager/. "$RUNNER_TEMP/skill-manager/"
+      - name: Install package development dependencies independently
+        working-directory: ${{ runner.temp }}/skill-manager
+        run: npm install --workspaces=false --package-lock=false --ignore-scripts --no-audit --no-fund
+      - name: Typecheck, test and build
+        working-directory: ${{ runner.temp }}/skill-manager
+        run: npm run check
+      - name: Verify release tag matches the package version
+        if: startsWith(github.ref, 'refs/tags/skill-manager-v')
+        working-directory: ${{ runner.temp }}/skill-manager
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: node --input-type=module -e "import pkg from './package.json' with { type:'json' }; if (process.env.RELEASE_TAG !== 'skill-manager-v' + pkg.version) throw new Error('Tag and package version differ');"
+      - name: Pack the standalone release artifact
+        working-directory: ${{ runner.temp }}/skill-manager
+        run: npm pack --pack-destination "$RUNNER_TEMP/artifacts"
+      - name: Install and exercise the tarball without sibling source code
+        run: |
+          mkdir -p "$RUNNER_TEMP/consumer"
+          cd "$RUNNER_TEMP/consumer"
+          npm init --yes
+          npm install --ignore-scripts --package-lock=false --no-audit --no-fund "$RUNNER_TEMP"/artifacts/*.tgz
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import { SkillSourceManager } from '@1agents/skill-manager';
+          assert.equal(fs.existsSync('node_modules/@1agents/dreammate-node'), false);
+          const pkg = JSON.parse(fs.readFileSync('node_modules/@1agents/skill-manager/package.json', 'utf8'));
+          assert.deepEqual(Object.keys(pkg.dependencies ?? {}), []);
+          fs.mkdirSync('fixture');
+          fs.writeFileSync('fixture/SKILL.md', '---\nname: standalone-consumer\ndescription: Verify standalone versioned guide reads.\n---\nGuide content.\n');
+          const manager = new SkillSourceManager({ storagePath: false, autoDiscover: false });
+          await manager.add({ name: 'fixture', dir: path.resolve('fixture') });
+          const { skills } = await manager.catalog();
+          assert.equal(skills.length, 1);
+          assert.match((await manager.read(skills[0].id, skills[0].revision)).content, /Guide content/);
+          JS
+          ./node_modules/.bin/dreammate-skills --help
+          ./node_modules/.bin/dreammate-skills list --config "$RUNNER_TEMP/unused-skill-sources.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: skill-manager-node-${{ matrix.node }}
+          path: ${{ runner.temp }}/artifacts/*.tgz
+          if-no-files-found: error
+
+  publish:
+    name: Publish verified standalone package
+    if: startsWith(github.ref, 'refs/tags/skill-manager-v')
+    needs: standalone-package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+      - uses: actions/download-artifact@v4
+        with:
+          name: skill-manager-node-22
+          path: ${{ runner.temp }}/skill-manager-release
+      - name: Publish the tested tarball
+        run: npm publish "$RUNNER_TEMP"/skill-manager-release/*.tgz --provenance --access public --workspaces=false
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

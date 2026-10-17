@@ -41,18 +41,19 @@ test('MCP CLI help works offline', async () => {
   assert.equal(result.code, 0);
   assert.match(result.stdout, /add --config/);
   assert.match(result.stdout, /OAuth/);
+  assert.match(result.stdout, /share ID --scope local\|network/);
 });
 
 test('MCP CLI imports pasted configurations and redacts credentials in server responses', async () => {
   const config = { mcpServers: { activepieces: { url: 'https://ap.example/mcp/private-url-token',
-    headers: { Authorization: 'Bearer private-header-token', 'x-forwarded-proto': 'http' } } } };
+    sharing: 'local', headers: { Authorization: 'Bearer private-header-token', 'x-forwarded-proto': 'http', 'X-Sharing': 'local' } } } };
   await gateway(async (req, res) => {
     assert.equal(req.url, '/mcp/sources');
     assert.equal(req.method, 'POST');
     let body = '';
     for await (const chunk of req) body += chunk;
     assert.deepEqual(JSON.parse(body), { config });
-    res.end(JSON.stringify({ sources: [{ id: 'mcp-activepieces', type: 'http', transport: 'http', status: 'connected', tool_count: 12 }],
+    res.end(JSON.stringify({ sources: [{ id: 'mcp-activepieces', type: 'http', transport: 'http', sharing: 'local', status: 'connected', tool_count: 12 }],
       headers: { Authorization: 'Bearer private-header-token' },
       error_detail: 'https://ap.example/mcp/private-url-token Bearer private-header-token' }));
   }, async url => {
@@ -61,9 +62,59 @@ test('MCP CLI imports pasted configurations and redacts credentials in server re
     assert.equal(JSON.parse(result.stdout).sources[0].tool_count, 12);
     assert.equal(JSON.parse(result.stdout).sources[0].type, 'http');
     assert.equal(JSON.parse(result.stdout).sources[0].transport, 'http');
+    assert.equal(JSON.parse(result.stdout).sources[0].sharing, 'local');
     assert.ok(!result.stdout.includes('private-header-token'));
     assert.ok(!result.stdout.includes('private-url-token'));
     assert.equal(result.stderr, '');
+  });
+});
+
+test('MCP CLI changes sharing through the local management endpoint', async () => {
+  const scopes = ['local', 'network'];
+  let calls = 0;
+  await gateway(async (req, res) => {
+    assert.equal(req.url, '/mcp/sources/mcp-source/sharing');
+    assert.equal(req.method, 'PATCH');
+    assert.equal(req.headers['content-type'], 'application/json');
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    const sharing = scopes[calls++];
+    assert.deepEqual(JSON.parse(body), { sharing });
+    res.end(JSON.stringify({ source: { id: 'mcp-source', status: 'connected', sharing } }));
+  }, async url => {
+    for (const scope of scopes) {
+      const result = await cli(['share', 'mcp-source', '--scope', scope], url);
+      assert.equal(result.code, 0, result.stdout);
+      assert.equal(JSON.parse(result.stdout).source.sharing, scope);
+    }
+    assert.equal(calls, 2);
+  });
+});
+
+test('MCP CLI sharing updates succeed independently of upstream status and still reject failed updates', async () => {
+  const source = { id: 'mcp-source', sharing: 'local', status: 'error', error: 'upstream connection failed' };
+  const responses = [
+    { status: 200, body: source, code: 0 },
+    { status: 200, body: { source }, code: 0 },
+    { status: 200, body: { source, isError: true }, code: 1 },
+    { status: 200, body: { source, ok: false }, code: 1 },
+    { status: 200, body: { source, success: false }, code: 1 },
+    { status: 200, body: { source, error: 'sharing update failed' }, code: 1 },
+    { status: 200, body: { ...source, sharing: 'network' }, code: 1 },
+    { status: 500, body: source, code: 1 },
+    { status: 403, body: { error: 'forbidden' }, code: 1 },
+  ];
+  let calls = 0;
+  await gateway((_req, res) => {
+    const response = responses[calls++]!;
+    res.statusCode = response.status;
+    res.end(JSON.stringify(response.body));
+  }, async url => {
+    for (const response of responses) {
+      const result = await cli(['share', 'mcp-source', '--scope', 'local'], url);
+      assert.equal(result.code, response.code, JSON.stringify(response));
+    }
+    assert.equal(calls, responses.length);
   });
 });
 
@@ -108,6 +159,13 @@ test('MCP CLI rejects invalid arguments, unsafe management targets and invalid c
       ['add'], ['add', '--config', '{}', '--file', '-'], ['add', '--config', '{"command":"node"}'],
       ['add', '--config', '{malformed-private-marker'], ['refresh'], ['remove', '../source'],
       ['remove', 'mcp-source', 'extra'], ['list', '--config', '{}'], ['list', '--timeout-ms', '1.5'],
+      ['share'], ['share', 'mcp-source'], ['share', 'mcp-source', '--scope', 'invalid'],
+      ['share', 'mcp-source', '--scope', 'LOCAL'], ['share', 'mcp-source', '--scope', ''],
+      ['share', '../source', '--scope', 'local'], ['share', 'mcp-source', 'extra', '--scope', 'local'],
+      ['share', 'mcp-source', '--scope', 'local', '--config', '{}'],
+      ['list', '--scope', 'local'], ['refresh', 'mcp-source', '--scope', 'network'],
+      ['remove', 'mcp-source', '--scope', 'network'], ['add', '--config', '{"local":{"command":"node"}}', '--scope', 'local'],
+      ['share', 'mcp-source', '--scope', 'local', '--agent', 'http://192.168.1.2:36908'],
       ['list', '--timeout-ms', '3600001'], ['list', '--unknown', 'private-marker'],
       ['list', '--agent', 'https://example.com'], ['list', '--agent', 'http://192.168.1.2:36908'],
       ['list', '--agent', 'http://user:private-marker@127.0.0.1:36908'],
