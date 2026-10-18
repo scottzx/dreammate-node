@@ -1,0 +1,7 @@
+# Local document parsing only. No model, inference, OCR or network SDK packages.
+# Python 3.10+; Poppler, LibreOffice and FFmpeg are separate local executables.
+pypdf>=5.0,<7
+python-pptx>=1.0,<2
+openpyxl>=3.1,<4
+xlrd>=2.0,<3
+Pillow>=10.0,<13

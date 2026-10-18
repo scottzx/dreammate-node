@@ -67,13 +67,16 @@ def main():
         request_id = None
         try:
             request = json.loads(line)
-            if (not isinstance(request, dict) or set(request) != {"id", "model", "texts", "input_type"}
+            if (not isinstance(request, dict)
+                    or set(request) not in ({"id", "model", "texts", "input_type"}, {"id", "model", "texts", "input_type", "task"})
+                    or ("task" in request and request["task"] != "document_search")
                     or not isinstance(request["id"], str) or not 1 <= len(request["id"]) <= 100):
                 raise ValueError("Invalid worker request")
             request_id = request["id"]
             with redirect_stdout(sys.stderr):
-                result = encoder.encode(request["model"], request["texts"], request["input_type"])
-                if request["input_type"] == "document":
+                result = encoder.encode(request["model"], request["texts"], request["input_type"],
+                                        **({"task": request["task"]} if "task" in request else {}))
+                if request["input_type"] == "document" and "task" not in request:
                     save_document_cache(encoder, args.model)
             send({"type": "result", "id": request_id, "result": result})
         except Exception as error:

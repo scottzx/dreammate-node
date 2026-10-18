@@ -7,7 +7,7 @@ import { spawn } from 'node:child_process';
 import { PassThrough, Writable } from 'node:stream';
 import test from 'node:test';
 import { createOnDemandProvider, startOnDemandProvider, parseOptions, readModelMetadata,
-  validateEmbedRequest, requestAgent } from '../scripts/local-embeddings/on-demand.mjs';
+  validateEmbedRequest, requestAgent, routeInvocation } from '../scripts/local-embeddings/on-demand.mjs';
 import { defaultConfigPath, readPriorityConfig } from '../scripts/local-embeddings/priority-config.mjs';
 
 const metadata = { protocol: 'dreammate.embedding.v1', model: 'qwen3', revision: 'fixture-sha', dimensions: 2,
@@ -85,6 +85,39 @@ test('on-demand CLI defaults and strict validation do not touch model processes'
     ['--inference-timeout-ms', 'NaN'], ['--max-pending', '257'], ['--device', 'metal'], ['--model', 'cloud'],
     ['--batch-size', '65'], ['--max-length', '1'], ['--priority', '1001'], ['--python', ' '], ['--config', ' '],
     ['--agent', 'https://example.com'], ['--host', '0.0.0.0'], ['--sharing', 'lcoal'], ['--sharing', 'LOCAL'], ['--sharing', '']]) assert.throws(() => parseOptions(flags), flags.join(' '));
+});
+
+test('document task is accepted only by text invoke, while embed protocol stays strict', () => {
+  const routed = routeInvocation({ method: 'embedding.encode_text', params: { texts: ['report'], input_type: 'query', task: 'document_search' } });
+  assert.deepEqual(routed.request, { model: 'qwen3', texts: ['report'], input_type: 'query', task: 'document_search' });
+  assert.throws(() => validateEmbedRequest({ ...input, task: 'document_search' }, 'qwen3'), /Expected model/);
+  assert.throws(() => routeInvocation({ method: 'embedding.encode', params: { texts: ['report'], target: 'multimodal', task: 'document_search' } }), /requires the Qwen/);
+  assert.throws(() => routeInvocation({ method: 'embedding.encode_text', params: { texts: ['report'], task: 'other' } }), /Unknown embedding task/);
+});
+
+test('document invocations share a worker with tools and validate the separate result profile', async t => {
+  const f = await fixture(t, [{ respond(request) {
+    const value = result(request);
+    if (request.task) { value.task = request.task; value.encoding = value.encoding.replace('tool-search', 'artifact-search'); }
+    return { type: 'result', id: request.id, result: value };
+  } }], { idleTimeoutMs: 10000, mediaRoot: '/private/test-inbox' });
+  const health = await (await fetch(`${f.url}/health`)).json();
+  assert.equal(health.embedding_profiles[0].task, 'document_search');
+  assert.equal(health.media_input.root, '/private/test-inbox');
+  assert.equal(JSON.stringify(f.provider.descriptor()).includes('/private/test-inbox'), false);
+  assert.equal(f.children.length, 0);
+  assert.equal((await f.embed()).status, 200);
+  const response = await fetch(`${f.url}/invoke`, { method: 'POST', body: JSON.stringify({ method: 'embedding.encode_text', params: { texts: ['document'], task: 'document_search' } }) });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).encoding, 'dreammate.artifact-search.v1:fp32:max512:dim2');
+  assert.equal(f.children.length, 1);
+  assert.equal((await f.embed()).body.encoding, metadata.encoding);
+});
+
+test('document invocations reject old tool-profile responses rather than silently mixing indexes', async t => {
+  const f = await fixture(t);
+  const response = await fetch(`${f.url}/invoke`, { method: 'POST', body: JSON.stringify({ method: 'embedding.encode_text', params: { texts: ['document'], task: 'document_search' } }) });
+  assert.equal(response.status, 503);
 });
 
 test('priority config is loaded before listening and invalid startup config fails without a worker', async t => {
@@ -586,9 +619,9 @@ class Encoder:
         return "qwen3@fixture-sha"
     def encoding_profile(self, dimensions):
         return "fixture-encoding:dim2"
-    def encode(self, alias, texts, input_type):
+    def encode(self, alias, texts, input_type, task=None):
         print("encoding without leaking into protocol")
-        return {"model":"fixture", "embeddings":[[1,0] for _ in texts]}
+        return {"model":"fixture", "embeddings":[[1,0] for _ in texts], **({"task":task} if task else {})}
     def embedding_provider(self):
         return {"ready":True}
 `);
@@ -599,15 +632,20 @@ class Encoder:
   await until(() => output.includes('\n'));
   child.stdin.write(`${JSON.stringify({ id: 'one', model: 'qwen3', texts: ['hello'], input_type: 'query' })}\n`);
   await until(() => output.trim().split('\n').length === 2);
+  child.stdin.write(`${JSON.stringify({ id: 'document', model: 'qwen3', texts: ['report'], input_type: 'document', task: 'document_search' })}\n`);
+  child.stdin.write(`${JSON.stringify({ id: 'invalid', model: 'qwen3', texts: ['report'], input_type: 'query', task: 'unknown' })}\n`);
+  await until(() => output.trim().split('\n').length === 4);
   child.stdin.end(); await once(child, 'exit');
   const lines = output.trim().split('\n').map(line => JSON.parse(line));
   assert.equal(lines[0].type, 'ready'); assert.equal(lines[1].type, 'result'); assert.equal(lines[1].id, 'one');
+  assert.equal(lines[2].id, 'document'); assert.equal(lines[2].result.task, 'document_search');
+  assert.equal(lines[3].type, 'error');
   assert.match(errors, /library stdout belongs on stderr/);
   const startup = errors.split('\n').find(line => line.startsWith('{"event": "encoder_ready"'));
   assert.ok(startup, 'startup diagnostics must not enter stdout');
   const timing = JSON.parse(startup);
   assert.equal(timing.restored_document_vectors, 0);
   assert.ok(timing.startup_ms >= 0);
-  assert.equal(errors.match(/encoding without leaking into protocol/g)?.length, 1,
+  assert.equal(errors.match(/encoding without leaking into protocol/g)?.length, 2,
     'startup must load model metadata without performing a discarded warmup query');
 });

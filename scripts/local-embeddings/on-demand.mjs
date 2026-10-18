@@ -121,6 +121,13 @@ function sameProvider(actual, expected) {
   return actual && ['protocol', 'model', 'revision', 'dimensions', 'encoding', 'ready'].every(key => actual[key] === expected[key]);
 }
 
+/** A task profile changes the query instruction, never the loaded weights. */
+export function artifactTextProfile(provider) {
+  if (provider.model !== 'qwen3' || !/^dreammate\.tool-search\.v1:fp32:max\d+:dim\d+$/.test(provider.encoding)) throw unavailable('Document search profile unavailable');
+  return { model: provider.model, revision: provider.revision, dimensions: provider.dimensions,
+    encoding: provider.encoding.replace('dreammate.tool-search.v1:', 'dreammate.artifact-search.v1:'), task: 'document_search' };
+}
+
 export function validateEmbedRequest(value, model) {
   if (!value || typeof value !== 'object' || Array.isArray(value)
     || Object.keys(value).some(key => !['model', 'texts', 'input_type'].includes(key))
@@ -138,9 +145,10 @@ function providerMethods(model) {
   const items = { type: 'array', minItems: 1, maxItems: 4, items: { type: 'object', additionalProperties: false,
     properties: Object.fromEntries(['text', 'image', 'audio', 'video'].map(key => [key, { type: 'string' }])) } };
   const method = (description, properties, required = []) => ({ description, parameters: { type: 'object', additionalProperties: false, properties, required } });
+  const task = { type: 'string', enum: ['document_search'], description: 'Use the separate Qwen document-search profile and query instruction, sharing the same local model worker.' };
   return {
-    'embedding.encode': method('Encode with automatic exclusive model routing. Set target=multimodal when searching a media index using text.', { target, texts, items, input_type: { type: 'string', enum: ['query', 'document'] } }),
-    'embedding.encode_text': method(`Encode text in the fixed ${model} vector space.`, { texts, input_type: { type: 'string', enum: ['query', 'document'] } }, ['texts']),
+    'embedding.encode': method('Encode with automatic exclusive model routing. Set target=multimodal when searching a media index using text.', { target, texts, items, task, input_type: { type: 'string', enum: ['query', 'document'] } }),
+    'embedding.encode_text': method(`Encode text in the fixed ${model} vector space.`, { texts, ...(model === 'qwen3' ? { task } : {}), input_type: { type: 'string', enum: ['query', 'document'] } }, ['texts']),
     'embedding.encode_media': method('Encode local images, short videos or audio with Gemma; availability depends on enabled modalities.', { items }, ['items']),
     'embedding.compare': method('Compare a text query against media using the same Gemma vector space.', { query: { type: 'string', maxLength: 8192 }, items }, ['query', 'items']),
     'embedding.prewarm': method('Load and prepare one model exclusively, without a business encoding request, then begin its idle timeout.', { target }),
@@ -161,7 +169,8 @@ export function routeInvocation(value, endpointModel = 'qwen3') {
     keys(['target']); return { model: params.target ? params.target === 'text' ? 'qwen3' : 'embeddinggemma2' : endpointModel, request: { operation: 'warmup' } };
   }
   if (!['embedding.encode', 'embedding.encode_text', 'embedding.encode_media', 'embedding.compare'].includes(value.method)) throw unavailable('Unknown embedding method', 404);
-  keys(value.method === 'embedding.encode' ? ['target', 'texts', 'items', 'input_type'] : value.method === 'embedding.encode_text' ? ['texts', 'input_type'] : value.method === 'embedding.compare' ? ['query', 'items'] : ['items']);
+  keys(value.method === 'embedding.encode' ? ['target', 'texts', 'items', 'input_type', 'task'] : value.method === 'embedding.encode_text' ? ['texts', 'input_type', 'task'] : value.method === 'embedding.compare' ? ['query', 'items'] : ['items']);
+  if (params.task !== undefined && params.task !== 'document_search') throw unavailable('Unknown embedding task', 400);
   if (params.items !== undefined) {
     if (!Array.isArray(params.items) || params.items.length < 1 || params.items.length > 4 || params.items.some(item => !item || typeof item !== 'object' || Array.isArray(item) || !Object.keys(item).length || Object.entries(item).some(([key, val]) => !['text', 'image', 'audio', 'video'].includes(key) || typeof val !== 'string' || !val.trim() || [...val].length > 8192))) throw unavailable('Expected 1..4 nonempty media items (text/image/audio/video)', 400);
   }
@@ -174,8 +183,10 @@ export function routeInvocation(value, endpointModel = 'qwen3') {
   }
   if (params.items !== undefined && params.texts !== undefined) throw unavailable('Provide texts or items, not both', 400);
   const model = hasMedia || params.target === 'multimodal' ? 'embeddinggemma2' : params.target === 'text' ? 'qwen3' : value.method === 'embedding.encode_text' ? endpointModel : 'qwen3';
+  if (params.task !== undefined && model !== 'qwen3') throw unavailable('document_search requires the Qwen text model', 400);
   if (hasMedia) return { model, request: { operation: 'media', items: params.items } };
-  return { model, request: validateEmbedRequest({ texts: params.texts ?? params.items?.map(item => item.text), input_type: params.input_type ?? 'document' }, model) };
+  return { model, request: { ...validateEmbedRequest({ texts: params.texts ?? params.items?.map(item => item.text), input_type: params.input_type ?? 'document' }, model),
+    ...(params.task === undefined ? {} : { task: params.task }) } };
 }
 
 function checkModalities(request, options) {
@@ -193,8 +204,10 @@ async function invokeBackend(backend, options, value, signal) {
 }
 
 function validateResult(result, request, provider) {
+  const expected = request.task === 'document_search' ? artifactTextProfile(provider) : provider;
   if (!result || result.model !== `${provider.model}@${provider.revision}` || result.alias !== provider.model
-    || result.revision !== provider.revision || result.dimensions !== provider.dimensions || result.encoding !== provider.encoding
+    || result.revision !== provider.revision || result.dimensions !== provider.dimensions || result.encoding !== expected.encoding
+    || (request.task !== undefined ? result.task !== request.task : result.task !== undefined)
     ) {
     throw unavailable('Encoder returned incompatible embedding metadata');
   }
@@ -258,6 +271,8 @@ export async function createOnDemandProvider(options = parseOptions([]), deps = 
     sharing, loaded: Boolean(worker?.ready), loading: Boolean(worker && !worker.ready), unloading: Boolean(retiringWorker && !retiringWorker.exited), idle_timeout_ms: idleTimeoutMs,
     last_used: lastUsed === null ? null : new Date(lastUsed).toISOString(), pending_requests: queue.length + Number(Boolean(active)),
     worker_pid: worker?.child.pid ?? retiringWorker?.child.pid ?? retirementFailure?.child.pid ?? null, embedding_provider: { ...provider, priority, lifecycle: 'on_demand' },
+    embedding_profiles: options.model === 'qwen3' ? [artifactTextProfile(provider)] : [{ model: provider.model, revision: provider.revision, dimensions: provider.dimensions, encoding: provider.encoding }],
+    ...(options.mediaRoot ? { media_input: { root: options.mediaRoot, local_only: true } } : {}),
     ...(deps.routerHealth?.() ?? {}),
     config: { file: options.config, source: configSource, priority_source: options.fixedPriority ? 'startup' : configSource, sharing_source: sharingSource,
       ...(lastConfigError ? { last_error: lastConfigError } : {}) },
@@ -602,7 +617,7 @@ export async function createRoutedProvider(options, deps = {}) {
   };
   const invoke = async (value, signal, endpointModel) => {
     const routed = routeInvocation(value, endpointModel);
-    if (routed.status) return { ...routerHealth(), idle_timeout_ms: primary.health().idle_timeout_ms };
+    if (routed.status) return primary.health();
     const backend = backends.get(routed.model);
     if (!backend) throw unavailable(`Local ${routed.model} model is unavailable; configure the matching model before searching this index`);
     if (routed.model === 'embeddinggemma2') checkModalities(routed.request, options);

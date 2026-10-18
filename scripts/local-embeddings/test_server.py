@@ -127,6 +127,28 @@ class AdapterTest(unittest.TestCase):
         self.encoder.encode("qwen3", ["Transcribe audio"], "document")
         self.assertEqual(self.fake.inputs, ["Transcribe audio"])
 
+    def test_document_search_has_own_instruction_profile_and_no_tool_cache_writes(self):
+        self.use_fake()
+        tool = self.encoder.encode("qwen3", ["same text"], "document")
+        snapshot = dict(self.encoder.document_cache)
+        document = self.encoder.encode("qwen3", ["same text"], "document", task="document_search")
+        self.assertEqual(document["encoding"], "dreammate.artifact-search.v1:fp32:max512:dim2")
+        self.assertEqual(document["task"], "document_search")
+        self.assertNotIn("task", tool)
+        self.assertEqual(self.fake.inputs, ["same text"])
+        self.assertEqual(dict(self.encoder.document_cache), snapshot)
+        self.encoder.encode("qwen3", ["sales revenue"], "query", task="document_search")
+        self.assertIn("relevant passages from documents", self.fake.inputs[0])
+        self.assertNotIn("tool descriptions", self.fake.inputs[0])
+        self.encoder.encode("qwen3", ["sales revenue"], "query")
+        self.assertIn("tool descriptions", self.fake.inputs[0])
+        self.assertEqual(self.encoder.embedding_provider()["encoding"], tool["encoding"])
+
+    def test_unknown_task_is_rejected_without_loading(self):
+        self.encoder.load = lambda _alias: self.fail("Invalid task must not load a model")
+        with self.assertRaisesRegex(ValueError, "Unknown embedding task"):
+            self.encoder.encode("qwen3", ["text"], "query", task="unknown")
+
     def test_invalid_input_is_rejected_before_loading(self):
         self.encoder.load = lambda _alias: self.fail("Invalid input must not load a model")
         for texts in (None, [], [""], [123], ["x" * 8193], ["x"] * 65):

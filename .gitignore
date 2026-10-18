@@ -4,3 +4,4 @@ node_modules/
 skills/*/dreammate-node-workspace/
 .local/tool-search/
 scripts/local-embeddings/__pycache__/
+packages/artifact-index/python/__pycache__/

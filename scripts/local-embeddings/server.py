@@ -108,8 +108,9 @@ class Encoder:
                     missing[key] = text
         return available, missing
 
-    def encoding_profile(self, dimensions: int) -> str:
-        return f"dreammate.tool-search.v1:fp32:max{self.max_length}:dim{dimensions}"
+    def encoding_profile(self, dimensions: int, task: str | None = None) -> str:
+        prefix = "dreammate.artifact-search.v1" if task == "document_search" else "dreammate.tool-search.v1"
+        return f"{prefix}:fp32:max{self.max_length}:dim{dimensions}"
 
     def embedding_provider(self):
         # Inference can take longer than the agent's health deadline on a CPU.
@@ -151,31 +152,38 @@ class Encoder:
         self.dimensions[model_version] = dimension
         return checked
 
-    def encode_inputs(self, alias: str, texts: list[str], input_type: str, model_version: str) -> list[array]:
+    def encode_inputs(self, alias: str, texts: list[str], input_type: str, model_version: str,
+                      task: str | None = None) -> list[array]:
         # Explicit prefixes avoid dependency on changing default prompts.
-        prefix = "Instruct: Given a user task, retrieve relevant tool descriptions that can accomplish the task\nQuery: "
+        prefix = ("Instruct: Given a search query, retrieve relevant passages from documents that answer the query\nQuery: "
+                  if task == "document_search" else
+                  "Instruct: Given a user task, retrieve relevant tool descriptions that can accomplish the task\nQuery: ")
         inputs = [prefix + text for text in texts] if input_type == "query" else texts
         vectors = self.encoder.encode(inputs, prompt="", batch_size=self.effective_batch_size,
                                       normalize_embeddings=True, show_progress_bar=False,
                                       convert_to_numpy=True)
         return self.validate_vectors(model_version, vectors.tolist(), len(texts))
 
-    def encode(self, alias: str, texts: list[str], input_type: str):
+    def encode(self, alias: str, texts: list[str], input_type: str, task: str | None = None):
         if alias is None:
             alias = self.serve_model or (next(iter(self.models)) if len(self.models) == 1 else None)
         if self.serve_model is not None and alias != self.serve_model:
             raise ValueError(f"This provider only serves {self.serve_model}")
         if input_type not in ("query", "document"):
             raise ValueError("input_type must be query or document")
+        if task not in (None, "document_search"):
+            raise ValueError("Unknown embedding task")
         if not isinstance(texts, list) or not 1 <= len(texts) <= 64:
             raise ValueError("texts must contain 1..64 strings")
         if any(not isinstance(text, str) or not text.strip() or len(text) > 8192 for text in texts):
             raise ValueError("Each text must contain 1..8192 characters")
         model_version = self.model_version(alias)
-        if input_type == "query":
+        # Artifact vectors are persisted by their own index. Do not mix the new
+        # query instruction/profile with the backward-compatible tool snapshot.
+        if input_type == "query" or task == "document_search":
             with self.lock:
                 model_version = self.load(alias)
-                vectors = self.encode_inputs(alias, texts, input_type, model_version)
+                vectors = self.encode_inputs(alias, texts, input_type, model_version, task)
         else:
             keys = [(model_version, hashlib.sha256(text.encode("utf-8")).digest()) for text in texts]
             available, missing = self.cached_documents(keys, texts)
@@ -198,7 +206,8 @@ class Encoder:
         # Neither conversion nor HTTP serialization holds the inference lock.
         dimensions = len(vectors[0])
         return {"model": model_version, "alias": alias, "revision": model_version.rsplit("@", 1)[-1],
-                "dimensions": dimensions, "encoding": self.encoding_profile(dimensions),
+                "dimensions": dimensions, "encoding": self.encoding_profile(dimensions, task),
+                **({"task": task} if task is not None else {}),
                 "embeddings": [vector.tolist() for vector in vectors]}
 
 

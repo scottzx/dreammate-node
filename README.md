@@ -137,12 +137,14 @@ npm ci
 npm run build                          # 只构建 Node，无需构建 Skill Manager
 npm run typecheck && npm test           # 只检查 Node
 npm run skill-manager:check            # 独立类型检查、测试和构建
-npm run test:packages                   # 在临时目录验证两个发布包的独立安装与消费
-npm run check:all                       # 全仓检查及两个服务的集成验收
+npm run artifact-index:check            # 独立产物索引的 Node/Python 测试
+npm run test:packages                   # 验证三个发布包独立安装、消费与服务报备
+npm run check:all                       # 全仓检查及独立服务的集成验收
 ```
 
 独立版本与发布方式见 [Skill Manager 开发与发布说明](packages/skill-manager/README.md)，双方发布没有先后依赖。
 Node 自带指南的 `postinstall` 仍由 Node 维护，它属于该产品的安装流程。
+
 历史 `service.skills` 随服务附带的 SOP 及归档接口保留原有轻量兼容实现；
 项目来源发现、来源配置和版本化资源读取只由 Skill Manager 实现。
 
@@ -215,6 +217,24 @@ MCP 对应 `dreammate_search_skills` → `dreammate_read_skill`。HTTP 为分页
 来源管理方法同时受 Node 通用 `metadata.local_only_methods` 限制，仅允许 loopback 调用。
 旧网关未提供目录接口时，
 跨节点搜索保留 `unsupported` 扫描诊断与 `partial`，不能把它解释为节点没有技能。
+
+### 本地文件和视频的统一产物索引
+
+[`@1agents/artifact-index`](packages/artifact-index/README.md) 是另一独立 npm 包，提供 CLI、ESM 库和可选的只读服务。
+它索引显式传入的 PDF、PPT/PPTX、Excel 与视频，保留页码、幻灯片编号、工作表/单元格范围和时间片段，
+支持先搜索摘要、再读取原始定位对应的内容。Node 和产物索引互无 npm 运行时依赖，安装 Node 不会附带索引数据库或用户文件。
+
+产物索引复用工具检索使用的同一组本地 Qwen/Gemma 模型服务，不下载另一份模型，也不启动额外模型进程。
+文字采用专用文档 profile，视觉采用 Gemma；共享调度器继续负责互斥加载与空闲卸载。
+文档 profile 需要本次配套更新后的调度器，旧服务会明确返回不可用并保留文字词法降级。
+本地解析依赖、离线隔离等级、当前文件支持边界及源码安装方式见该包说明。
+
+```text
+智能体 → Node :36908 → Artifact Index 127.0.0.1:36910 → 本地索引和原始定位
+                              └─ 复用已登记的 Qwen/Gemma 模型服务
+```
+
+产物服务只读，新增/更新/删除索引由本机 CLI 显式执行；默认 `local`，网络发布只返回显式标记为 `network` 的资源。
 
 ### Mac 按需使用本地向量模型
 

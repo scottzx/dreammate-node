@@ -231,6 +231,20 @@ dreammate-node embedding install \
 
 `/embed` 始终固定到接收端口对应的模型：8766 为 Qwen 工具文本空间，8767 为 Gemma 多媒体空间，不能通过输入内容改变其向量空间。Gemma 端口的 `embedding.encode_text` 兼容方法同样固定为 Gemma，因此仍可用于文字查询已有多媒体向量。工具/技能自动检索继续只选择 Qwen；Gemma 服务不会混入 Qwen 工具索引。两套向量需分别校验模型 revision、维度和编码指纹，不能直接跨空间比较，也不能把两个库的余弦分数当成相同尺度合并。
 
+### 普通文档索引与工具索引共用推理器
+
+独立的 [`@1agents/artifact-index`](../packages/artifact-index/README.md) 负责 PDF、PPT、Excel 与视频的解析、定位和 SQLite 索引；网关不依赖或内嵌该包。它复用这里安装的模型服务和权重，不启动另一套推理进程。
+
+Qwen 普通文档查询使用独立的任务契约，经现有 `/invoke` 请求：
+
+```json
+{"method":"embedding.encode_text","params":{"texts":["备份保留多久"],"input_type":"query","task":"document_search"}}
+```
+
+建立文档向量时使用同样的 `task` 和 `input_type: "document"`。返回编码为 `dreammate.artifact-search.v1:fp32:max512:dim1024`；工具 `/embed` 的 `dreammate.tool-search.v1`、缓存与响应保持原约定。两者共用同一个 Qwen worker，任务和索引空间分开。`embedding.status.embedding_profiles` 公开支持的文档 profile；`media_input` 仅在本机状态接口公布已有媒体 inbox，注册摘要不携带本地路径。
+
+该任务从 `@1agents/dreammate-node@0.14.0` 提供，`0.13.0` 尚未支持。升级模型设备的 npm 包后，使用原 Python、manifest、媒体根目录等参数重新执行 `embedding install`，让已安装的常驻启动器切换到新版脚本；npm 升级本身不等于启动器已重启。独立索引包连接旧调度器会报告不支持并降级文字检索，不自动安装第二份模型。完整的文件导入与只读检索接口见产物包文档。
+
 ### 预热、状态与自动卸载
 
 可通过统一 `/invoke` 显式预热或查询状态：

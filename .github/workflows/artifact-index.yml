@@ -1,0 +1,105 @@
+name: Artifact Index
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['artifact-index-v*']
+    paths:
+      - 'packages/artifact-index/**'
+      - '.github/workflows/artifact-index.yml'
+  pull_request:
+    paths:
+      - 'packages/artifact-index/**'
+      - '.github/workflows/artifact-index.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: artifact-index-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  standalone-package:
+    name: Independent package / Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: ['22.13', '24']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Copy source outside the gateway repository
+        run: |
+          mkdir -p "$RUNNER_TEMP/artifact-index" "$RUNNER_TEMP/artifacts"
+          cp -R packages/artifact-index/. "$RUNNER_TEMP/artifact-index/"
+      - name: Install parser dependencies without any model libraries
+        working-directory: ${{ runner.temp }}/artifact-index
+        run: python -m pip install -r python/requirements.txt
+      - name: Test the independent package and local parsers
+        working-directory: ${{ runner.temp }}/artifact-index
+        run: npm run check
+      - name: Verify release tag matches the package version
+        if: startsWith(github.ref, 'refs/tags/artifact-index-v')
+        working-directory: ${{ runner.temp }}/artifact-index
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: node --input-type=module -e "import pkg from './package.json' with { type:'json' }; if (process.env.RELEASE_TAG !== 'artifact-index-v' + pkg.version) throw new Error('Tag and package version differ');"
+      - name: Pack the independent artifact
+        working-directory: ${{ runner.temp }}/artifact-index
+        run: npm pack --ignore-scripts --workspaces=false --pack-destination "$RUNNER_TEMP/artifacts"
+      - name: Install and use the tarball without sibling packages
+        run: |
+          mkdir -p "$RUNNER_TEMP/consumer"
+          cd "$RUNNER_TEMP/consumer"
+          npm init --yes
+          npm install --offline --ignore-scripts --package-lock=false --no-audit --no-fund "$RUNNER_TEMP"/artifacts/*.tgz
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import fs from 'node:fs';
+          import { ArtifactIndex } from '@1agents/artifact-index';
+          const pkg = JSON.parse(fs.readFileSync('node_modules/@1agents/artifact-index/package.json'));
+          assert.equal(Object.keys(pkg.dependencies ?? {}).length, 0);
+          for (const sibling of ['@1agents/dreammate-node', '@1agents/skill-manager']) {
+            assert.throws(() => import.meta.resolve(sibling), { code: 'ERR_MODULE_NOT_FOUND' });
+          }
+          const index = new ArtifactIndex({ dbPath: ':memory:' });
+          assert.equal(index.stats().resources, 0);
+          index.close();
+          JS
+          ./node_modules/.bin/artifact-index --help
+          ./node_modules/.bin/artifact-index --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: artifact-index-node-${{ matrix.node }}
+          path: ${{ runner.temp }}/artifacts/*.tgz
+          if-no-files-found: error
+
+  publish:
+    name: Publish verified standalone package
+    if: startsWith(github.ref, 'refs/tags/artifact-index-v')
+    needs: standalone-package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+      - uses: actions/download-artifact@v4
+        with:
+          name: artifact-index-node-22.13
+          path: ${{ runner.temp }}/artifact-index-release
+      - name: Publish the tested tarball
+        run: npm publish "$RUNNER_TEMP"/artifact-index-release/*.tgz --provenance --access public --workspaces=false
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

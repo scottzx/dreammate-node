@@ -1,0 +1,22 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {execFile} from 'node:child_process';
+import {promisify} from 'node:util';
+import {mkdtemp,rm,symlink} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import path from 'node:path';
+import {fileURLToPath} from 'node:url';
+const run=promisify(execFile),cli=fileURLToPath(new URL('../bin/artifact-index.mjs',import.meta.url));
+test('standalone CLI supports help, SQLite stats and bounded empty search',async t=>{
+  const dir=await mkdtemp(path.join(tmpdir(),'artifact-cli-'));t.after(()=>rm(dir,{recursive:true,force:true}));
+  const db=path.join(dir,'index.sqlite');
+  const linked=path.join(dir,'artifact-index');await symlink(cli,linked);
+  assert.equal((await run(linked,['--version'])).stdout.trim(),'0.1.0');
+  assert.match((await run(linked,['--help'])).stdout,/--modalities/);
+  assert.match((await run(process.execPath,[cli,'--help'])).stdout,/--modalities/);
+  assert.equal((await run(process.execPath,[cli,'--version'])).stdout.trim(),'0.1.0');
+  assert.equal(JSON.parse((await run(process.execPath,[cli,'stats','--db',db])).stdout).resources,0);
+  const empty=JSON.parse((await run(process.execPath,[cli,'search','--db',db,'--query','木马','--mode','lexical','--modalities','video'])).stdout);
+  assert.deepEqual(empty.results,[]);assert.equal(empty.semantic_status,'not_requested');
+  await assert.rejects(run(process.execPath,[cli,'search','--db',db,'--query','x','--offset','10001']),/offset must be/);
+});
