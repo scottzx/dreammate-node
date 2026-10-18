@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.13.0 — 2026-10-18
+
+- Route text embeddings to Qwen and media embeddings to optional offline EmbeddingGemma 2 through one local supervisor; use an explicit multimodal target for text queries against media indexes and preserve separate vector profiles.
+- Serialize requests from both models in one FIFO queue, confirm the old worker has exited before switching, and unload idle workers after 60 seconds by default; status checks do not extend standby and the idle deadline can be changed without restarting.
+- Add Gemma text, image/video encoding, comparison, prewarm and status methods with local media boundaries, optional modality selection and an MPS memory limit; keep Qwen as the automatic tool-search provider.
+- Advertise bounded cold-start budgets for on-demand providers while preserving explicit search timeouts, compatible vector caches and bounded provider fallback.
+- Verify managed launchd activation remains present after bootstrap and wait for old jobs to retire before replacement, retaining ownership checks and rollback.
+- Preserve validated skill-catalog pages across slow or failed later reads, compress skill and embedding responses when requested, deduplicate replicated summary vectors and serve cached Qwen documents without waiting for unrelated inference.
+
 ## 0.12.0 — 2026-10-18
 
 - Separate MCP connections from gateway sharing with persistent `local` / `network` scopes, defaulting existing sources to `network`; change scopes without reconnecting and enforce them on discovery, schemas, invocation and service subroutes.

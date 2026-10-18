@@ -58,6 +58,25 @@ test('ready descriptor must come from the owned child and retain encoding compat
   assert.ok(!('methods' in entry) && !('capabilities' in entry), 'encoding provider must not pollute tool search');
 });
 
+test('launcher forwards an explicit vector snapshot directory to the owned encoder', async () => {
+  const options = parseOptions(['--restore-document-cache', 'vectors'], '/private/tmp');
+  assert.equal(options.restoreDocumentCache, '/private/tmp/vectors');
+  assert.throws(() => parseOptions(['--restore-document-cache', ' ']), /cannot be empty/);
+  const child = new FakeChild();
+  const provider = launchProvider(options, {
+    spawn(_command, args) {
+      const index = args.indexOf('--restore-document-cache');
+      assert.ok(index > 0);
+      assert.equal(args[index + 1], '/private/tmp/vectors');
+      return child;
+    },
+    requestJson: async () => health,
+    setInterval: () => 1, clearInterval() {}, log() {},
+  });
+  await provider.ready;
+  await provider.stop();
+});
+
 test('priority and descriptor boundaries remain discoverable without silently changing metadata', () => {
   for (const priority of [-1000, 1000]) {
     assert.equal(parseOptions([`--priority=${priority}`]).priority, priority);

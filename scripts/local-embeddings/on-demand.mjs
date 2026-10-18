@@ -10,8 +10,10 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { defaultConfigPath, readPriorityConfig, validatePriorityConfig } from './priority-config.mjs';
 import { localAgentUrl, REPO_ROOT } from './serve.mjs';
+import { createExclusiveModelSlot } from './exclusive-model-slot.mjs';
 
 const WORKER_PATH = fileURLToPath(new URL('./worker.py', import.meta.url));
+const GEMMA_WORKER_PATH = fileURLToPath(new URL('./gemma_worker.py', import.meta.url));
 const PROTOCOL = 'dreammate.embedding.v1';
 const SHARING_PROTOCOL = 'dreammate.service-sharing.v1';
 const BODY_LIMIT = 262144, RESPONSE_LIMIT = 16 * 1024 * 1024;
@@ -31,9 +33,12 @@ export function parseOptions(argv, cwd = process.cwd()) {
     config: { type: 'string' },
     python: { type: 'string' }, manifest: { type: 'string' }, device: { type: 'string', default: 'auto' },
     'batch-size': { type: 'string' }, 'max-length': { type: 'string', default: '512' },
-    'idle-timeout-ms': { type: 'string', default: '300000' }, 'startup-timeout-ms': { type: 'string', default: '180000' },
+    'idle-timeout-ms': { type: 'string', default: '60000' }, 'startup-timeout-ms': { type: 'string', default: '180000' },
     'inference-timeout-ms': { type: 'string', default: '120000' }, 'max-pending': { type: 'string', default: '32' },
     'no-register': { type: 'boolean', default: false },
+    'gemma-python': { type: 'string' }, 'gemma-manifest': { type: 'string' }, 'media-root': { type: 'string' },
+    'gemma-port': { type: 'string', default: '8767' }, 'gemma-modalities': { type: 'string', default: 'vision' },
+    'gemma-max-length': { type: 'string', default: '2048' }, 'mps-limit-mb': { type: 'string', default: '4096' },
   } });
   if (values.model !== 'qwen3') throw new Error('--model must be qwen3');
   if (!['local', 'network'].includes(values.sharing)) throw new Error('--sharing must be local or network');
@@ -42,6 +47,11 @@ export function parseOptions(argv, cwd = process.cwd()) {
     throw new Error('--python and --manifest cannot be empty');
   }
   if (values.config !== undefined && !values.config.trim()) throw new Error('--config cannot be empty');
+  const mediaPaths = ['gemma-python', 'gemma-manifest', 'media-root'];
+  const hasGemma = mediaPaths.some(key => values[key] !== undefined);
+  if (hasGemma && !mediaPaths.every(key => values[key]?.trim())) throw new Error('Provide --gemma-python, --gemma-manifest and --media-root together');
+  if (!['vision', 'all', 'text', 'audio'].includes(values['gemma-modalities'])) throw new Error('Invalid --gemma-modalities');
+  if (values.port === values['gemma-port'] && hasGemma) throw new Error('Gemma and Qwen ports must differ');
   const priority = Number(values.priority);
   if (!/^-?\d+$/.test(values.priority) || !Number.isSafeInteger(priority) || priority < -1000 || priority > 1000) {
     throw new Error('--priority must be an integer from -1000 to 1000');
@@ -55,6 +65,10 @@ export function parseOptions(argv, cwd = process.cwd()) {
     startupTimeoutMs: integer(values['startup-timeout-ms'], '--startup-timeout-ms', 1, 600000),
     inferenceTimeoutMs: integer(values['inference-timeout-ms'], '--inference-timeout-ms', 1, 600000),
     maxPending: integer(values['max-pending'], '--max-pending', 1, 256), register: !values['no-register'],
+    gemmaPort: integer(values['gemma-port'], '--gemma-port', 1, 65535), gemmaModalities: values['gemma-modalities'],
+    gemmaMaxLength: integer(values['gemma-max-length'], '--gemma-max-length', 1024, 8192),
+    mpsLimitMb: integer(values['mps-limit-mb'], '--mps-limit-mb', 1024, 16384),
+    ...(hasGemma ? { gemmaPython: path.resolve(cwd, values['gemma-python']), gemmaManifest: path.resolve(cwd, values['gemma-manifest']), mediaRoot: path.resolve(cwd, values['media-root']) } : {}),
     ...(values['batch-size'] === undefined ? {} : { batchSize: integer(values['batch-size'], '--batch-size', 1, 64) }) };
 }
 
@@ -64,13 +78,13 @@ export async function readModelMetadata(options) {
   const entry = manifest?.models?.[options.model];
   if (!entry || typeof entry.path !== 'string' || !entry.path.trim() || typeof entry.revision !== 'string'
     || !entry.revision.trim() || entry.revision !== entry.revision.trim() || entry.revision.length > 200) {
-    throw new Error('Manifest must contain a prepared qwen3 path and exact revision');
+    throw new Error(`Manifest must contain a prepared ${options.model} path and exact revision`);
   }
   const modelPath = path.resolve(REPO_ROOT, entry.path.replace(/^~(?=\/)/, process.env.HOME ?? '~'));
   const config = JSON.parse(await readFile(path.join(modelPath, 'config.json'), 'utf8'));
-  const dimensions = integer(config.hidden_size, 'Model hidden_size', 1, 4096);
+  const dimensions = options.model === 'embeddinggemma2' ? 768 : integer(config.hidden_size, 'Model hidden_size', 1, 4096);
   return { protocol: PROTOCOL, model: options.model, revision: entry.revision, dimensions,
-    encoding: `dreammate.tool-search.v1:fp32:max${options.maxLength}:dim${dimensions}`, ready: true };
+    encoding: `${options.model === 'embeddinggemma2' ? 'dreammate.gemma2.v1' : 'dreammate.tool-search.v1'}:fp32:max${options.maxLength}:dim${dimensions}`, ready: true };
 }
 
 /** Direct local registration transport, bounded and redirect-free; preserves ETag. */
@@ -113,17 +127,82 @@ export function validateEmbedRequest(value, model) {
     || (value.model !== undefined && value.model !== model) || !['query', 'document'].includes(value.input_type)
     || !Array.isArray(value.texts) || value.texts.length < 1 || value.texts.length > 64
     || value.texts.some(text => typeof text !== 'string' || !text.trim() || [...text].length > 8192)) {
-    throw unavailable('Expected model qwen3, input_type query/document and 1..64 nonempty texts of at most 8192 characters', 400);
+    throw unavailable(`Expected model ${model}, input_type query/document and 1..64 nonempty texts of at most 8192 characters`, 400);
   }
   return { model, texts: value.texts, input_type: value.input_type };
+}
+
+function providerMethods(model) {
+  const target = { type: 'string', enum: ['text', 'multimodal'], description: 'Target index: text uses Qwen; image/video/audio retrieval uses Gemma even with a text query.' };
+  const texts = { type: 'array', minItems: 1, maxItems: 64, items: { type: 'string', maxLength: 8192 } };
+  const items = { type: 'array', minItems: 1, maxItems: 4, items: { type: 'object', additionalProperties: false,
+    properties: Object.fromEntries(['text', 'image', 'audio', 'video'].map(key => [key, { type: 'string' }])) } };
+  const method = (description, properties, required = []) => ({ description, parameters: { type: 'object', additionalProperties: false, properties, required } });
+  return {
+    'embedding.encode': method('Encode with automatic exclusive model routing. Set target=multimodal when searching a media index using text.', { target, texts, items, input_type: { type: 'string', enum: ['query', 'document'] } }),
+    'embedding.encode_text': method(`Encode text in the fixed ${model} vector space.`, { texts, input_type: { type: 'string', enum: ['query', 'document'] } }, ['texts']),
+    'embedding.encode_media': method('Encode local images, short videos or audio with Gemma; availability depends on enabled modalities.', { items }, ['items']),
+    'embedding.compare': method('Compare a text query against media using the same Gemma vector space.', { query: { type: 'string', maxLength: 8192 }, items }, ['query', 'items']),
+    'embedding.prewarm': method('Load and prepare one model exclusively, without a business encoding request, then begin its idle timeout.', { target }),
+    'embedding.status': method('Read model status without loading weights or extending the idle timeout.', {}),
+  };
+}
+
+export function routeInvocation(value, endpointModel = 'qwen3') {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => !['method', 'capability', 'params'].includes(key))
+    || (value.method !== undefined && value.capability !== undefined && value.method !== value.capability)) throw unavailable('Expected consistent method/capability and params', 400);
+  value = { ...value, method: value.method ?? value.capability };
+  const params = value.params ?? {};
+  if (!params || typeof params !== 'object' || Array.isArray(params)) throw unavailable('Expected params object', 400);
+  const keys = allowed => { if (Object.keys(params).some(key => !allowed.includes(key))) throw unavailable('Unexpected method parameters', 400); };
+  if (value.method === 'embedding.status') { keys([]); return { status: true }; }
+  if (params.target !== undefined && !['text', 'multimodal'].includes(params.target)) throw unavailable('target must be text or multimodal', 400);
+  if (value.method === 'embedding.prewarm') {
+    keys(['target']); return { model: params.target ? params.target === 'text' ? 'qwen3' : 'embeddinggemma2' : endpointModel, request: { operation: 'warmup' } };
+  }
+  if (!['embedding.encode', 'embedding.encode_text', 'embedding.encode_media', 'embedding.compare'].includes(value.method)) throw unavailable('Unknown embedding method', 404);
+  keys(value.method === 'embedding.encode' ? ['target', 'texts', 'items', 'input_type'] : value.method === 'embedding.encode_text' ? ['texts', 'input_type'] : value.method === 'embedding.compare' ? ['query', 'items'] : ['items']);
+  if (params.items !== undefined) {
+    if (!Array.isArray(params.items) || params.items.length < 1 || params.items.length > 4 || params.items.some(item => !item || typeof item !== 'object' || Array.isArray(item) || !Object.keys(item).length || Object.entries(item).some(([key, val]) => !['text', 'image', 'audio', 'video'].includes(key) || typeof val !== 'string' || !val.trim() || [...val].length > 8192))) throw unavailable('Expected 1..4 nonempty media items (text/image/audio/video)', 400);
+  }
+  const hasMedia = params.items?.some(item => Object.keys(item).some(key => key !== 'text'));
+  if (hasMedia && params.target === 'text') throw unavailable('Media cannot be encoded into the Qwen text index', 400);
+  if (value.method === 'embedding.compare' || value.method === 'embedding.encode_media') {
+    if (!params.items) throw unavailable('Expected media items', 400);
+    if (value.method === 'embedding.compare' && (typeof params.query !== 'string' || !params.query.trim() || [...params.query].length > 8192)) throw unavailable('Expected a nonempty query of at most 8192 characters', 400);
+    return { model: 'embeddinggemma2', request: { operation: value.method === 'embedding.compare' ? 'compare' : 'media', items: params.items, ...(value.method === 'embedding.compare' ? { query: params.query } : {}) } };
+  }
+  if (params.items !== undefined && params.texts !== undefined) throw unavailable('Provide texts or items, not both', 400);
+  const model = hasMedia || params.target === 'multimodal' ? 'embeddinggemma2' : params.target === 'text' ? 'qwen3' : value.method === 'embedding.encode_text' ? endpointModel : 'qwen3';
+  if (hasMedia) return { model, request: { operation: 'media', items: params.items } };
+  return { model, request: validateEmbedRequest({ texts: params.texts ?? params.items?.map(item => item.text), input_type: params.input_type ?? 'document' }, model) };
+}
+
+function checkModalities(request, options) {
+  if (!request.items) return;
+  const enabled = options.gemmaModalities ?? 'vision';
+  if (request.items.some(item => (item.audio && !['all', 'audio'].includes(enabled)) || ((item.image || item.video) && !['all', 'vision'].includes(enabled)))) throw unavailable(`Media type unavailable with ${enabled} encoders`, 400);
+}
+
+async function invokeBackend(backend, options, value, signal) {
+  const routed = routeInvocation(value, options.model);
+  if (routed.status) return backend.health();
+  if (routed.model !== options.model) throw unavailable(`Local ${routed.model} model is not configured`);
+  checkModalities(routed.request, options);
+  return backend.submit(routed.request, signal);
 }
 
 function validateResult(result, request, provider) {
   if (!result || result.model !== `${provider.model}@${provider.revision}` || result.alias !== provider.model
     || result.revision !== provider.revision || result.dimensions !== provider.dimensions || result.encoding !== provider.encoding
-    || !Array.isArray(result.embeddings) || result.embeddings.length !== request.texts.length) {
+    ) {
     throw unavailable('Encoder returned incompatible embedding metadata');
   }
+  if (request.operation === 'compare') {
+    if (!Array.isArray(result.scores) || result.scores.length !== request.items.length || result.scores.some(value => typeof value !== 'number' || !Number.isFinite(value) || Math.abs(value) > 1.01)) throw unavailable('Encoder returned invalid comparison scores');
+    return result;
+  }
+  if (!Array.isArray(result.embeddings) || result.embeddings.length !== (request.items ?? request.texts).length) throw unavailable('Encoder returned incompatible embedding count');
   for (const row of result.embeddings) {
     if (!Array.isArray(row) || row.length !== provider.dimensions || row.some(value => typeof value !== 'number' || !Number.isFinite(value))
       || Math.abs(row.reduce((sum, value) => sum + value * value, 0) - 1) > 0.01) {
@@ -143,7 +222,7 @@ export async function createOnDemandProvider(options = parseOptions([]), deps = 
   integer(options.inferenceTimeoutMs, 'inferenceTimeoutMs', 1, 600000);
   integer(options.maxPending, 'maxPending', 1, 256);
   integer(options.maxLength, 'maxLength', 64, 8192);
-  if (options.model !== 'qwen3' || !['auto', 'cpu', 'mps', 'cuda'].includes(options.device)
+  if (!['qwen3', 'embeddinggemma2'].includes(options.model) || !['auto', 'cpu', 'mps', 'cuda'].includes(options.device)
     || !['local', 'network'].includes(options.sharing)
     || !Number.isSafeInteger(options.priority) || options.priority < -1000 || options.priority > 1000
     || typeof options.python !== 'string' || !options.python.trim()
@@ -155,7 +234,8 @@ export async function createOnDemandProvider(options = parseOptions([]), deps = 
   const loadConfig = deps.readPriorityConfig ?? readPriorityConfig;
   const initialValue = await loadConfig(options.config);
   const initialConfig = initialValue === undefined ? undefined : validatePriorityConfig(initialValue);
-  let priority = initialConfig?.priority ?? options.priority;
+  let priority = options.fixedPriority ? options.priority : initialConfig?.priority ?? options.priority;
+  let idleTimeoutMs = initialConfig?.idle_timeout_ms ?? options.idleTimeoutMs;
   let sharing = initialConfig?.sharing ?? options.sharing;
   let sharingSource = initialConfig?.sharing === undefined ? 'startup' : 'file';
   let configSource = initialConfig === undefined ? 'startup' : 'file', lastConfigError;
@@ -166,18 +246,20 @@ export async function createOnDemandProvider(options = parseOptions([]), deps = 
   const log = deps.log ?? (message => process.stderr.write(`${message}\n`));
   const instanceId = randomUUID();
   let stopped = false, started = false, starting, stopping, idleTimer, registrationTimer, refreshing;
-  let worker, retiring = Promise.resolve(), retirementFailure, active, pumping = false, lastUsed = null, registered = false, registeredSharing, localConfirmed = false, lastRegistrationError;
+  let worker, retiringWorker, retiring = Promise.resolve(), retirementFailure, active, pumping = false, lastUsed = null, registered = false, registeredSharing, localConfirmed = false, lastRegistrationError;
   const queue = [];
   let port = options.port;
   const descriptor = () => ({ id: `dreammate-embedding-${port}`, name: `Local embedding (${options.model}, on demand)`,
     kind: 'generic', port, sharing, reachability: 'localhost', health: '/health', execution: 'http',
-    metadata: { embedding_provider: { ...provider, priority, lifecycle: 'on_demand', instance_id: instanceId },
+    methods: providerMethods(options.model),
+    metadata: { embedding_provider: { ...provider, priority, lifecycle: 'on_demand', cold_start_timeout_ms: Math.min(60000, options.startupTimeoutMs + options.inferenceTimeoutMs), instance_id: instanceId },
       invoke_timeout_ms: Math.min(120000, options.startupTimeoutMs + options.inferenceTimeoutMs) } });
   const health = () => ({ status: 'ok', service: 'dreammate-embedding-on-demand', pid: process.pid,
-    sharing, loaded: Boolean(worker?.ready), loading: Boolean(worker && !worker.ready), idle_timeout_ms: options.idleTimeoutMs,
+    sharing, loaded: Boolean(worker?.ready), loading: Boolean(worker && !worker.ready), unloading: Boolean(retiringWorker && !retiringWorker.exited), idle_timeout_ms: idleTimeoutMs,
     last_used: lastUsed === null ? null : new Date(lastUsed).toISOString(), pending_requests: queue.length + Number(Boolean(active)),
-    worker_pid: worker?.child.pid ?? null, embedding_provider: { ...provider, priority, lifecycle: 'on_demand' },
-    config: { file: options.config, source: configSource, priority_source: configSource, sharing_source: sharingSource,
+    worker_pid: worker?.child.pid ?? retiringWorker?.child.pid ?? retirementFailure?.child.pid ?? null, embedding_provider: { ...provider, priority, lifecycle: 'on_demand' },
+    ...(deps.routerHealth?.() ?? {}),
+    config: { file: options.config, source: configSource, priority_source: options.fixedPriority ? 'startup' : configSource, sharing_source: sharingSource,
       ...(lastConfigError ? { last_error: lastConfigError } : {}) },
     registration: { registered, local_confirmed: localConfirmed, ...(registeredSharing ? { sharing: registeredSharing } : {}),
       ...(lastRegistrationError ? { last_error: lastRegistrationError } : {}) } });
@@ -186,7 +268,7 @@ export async function createOnDemandProvider(options = parseOptions([]), deps = 
   function scheduleIdle() {
     clearIdle();
     if (!stopped && worker?.ready && !active && queue.length === 0) {
-      idleTimer = setTimeout(() => { if (!active && queue.length === 0) void retireWorker(unavailable('Encoder idle timeout')); }, options.idleTimeoutMs);
+      idleTimer = setTimeout(() => { if (!active && queue.length === 0) void retireWorker(unavailable('Encoder idle timeout')); }, Math.max(1, idleTimeoutMs - (lastUsed === null ? 0 : Date.now() - lastUsed)));
       idleTimer.unref?.();
     }
   }
@@ -195,11 +277,12 @@ export async function createOnDemandProvider(options = parseOptions([]), deps = 
     const owned = worker;
     if (!owned) return retiring;
     worker = undefined;
+    retiringWorker = owned;
     owned.fail(error);
     const previous = retiring;
     retiring = (async () => {
       await previous;
-      if (owned.exited) return;
+      if (owned.exited) { if (retiringWorker === owned) retiringWorker = undefined; return; }
       await new Promise(resolve => {
         const timer = setTimeout(() => { owned.child.kill('SIGKILL'); }, deps.shutdownTimeoutMs ?? 3000);
         const fallback = setTimeout(() => {
@@ -209,6 +292,7 @@ export async function createOnDemandProvider(options = parseOptions([]), deps = 
         timer.unref?.(); fallback.unref?.();
         owned.child.once('exit', () => {
           if (retirementFailure === owned) retirementFailure = undefined;
+          if (retiringWorker === owned) retiringWorker = undefined;
           clearTimeout(timer); clearTimeout(fallback); resolve();
         });
         owned.child.kill('SIGTERM');
@@ -221,9 +305,9 @@ export async function createOnDemandProvider(options = parseOptions([]), deps = 
     if (stopped || signal?.aborted) throw unavailable('Embedding request cancelled');
     if (retirementFailure) throw unavailable('Previous local encoder has not exited');
     if (worker) return worker.readyPromise;
-    const child = spawnChild(options.python, [WORKER_PATH, '--manifest', options.manifest, '--model', options.model,
+    const child = spawnChild(options.python, [options.model === 'embeddinggemma2' ? GEMMA_WORKER_PATH : WORKER_PATH, '--manifest', options.manifest, '--model', options.model,
       '--device', options.device, '--max-length', String(options.maxLength),
-      ...(options.batchSize === undefined ? [] : ['--batch-size', String(options.batchSize)])],
+      ...(options.model === 'embeddinggemma2' ? ['--media-root', options.mediaRoot, '--modalities', options.gemmaModalities, '--mps-limit-mb', String(options.mpsLimitMb)] : options.batchSize === undefined ? [] : ['--batch-size', String(options.batchSize)])],
     { cwd: REPO_ROOT, stdio: ['pipe', 'pipe', 'pipe'], shell: false, env: { ...process.env, PYTHONUNBUFFERED: '1' } });
     let resolveReady, rejectReady;
     const owned = { child, ready: false, exited: false, buffer: Buffer.alloc(0), response: undefined,
@@ -273,6 +357,7 @@ export async function createOnDemandProvider(options = parseOptions([]), deps = 
   async function encode(request, signal) {
     const owned = await ensureWorker(signal);
     if (stopped || signal?.aborted || worker !== owned) throw unavailable('Local encoder unavailable');
+    if (request.operation === 'warmup') return { ...provider, warmed: true, loaded: true };
     return new Promise((resolve, reject) => {
       const id = randomUUID();
       const timer = setTimeout(() => { void retireWorker(unavailable('Local model inference timed out')); }, options.inferenceTimeoutMs);
@@ -301,8 +386,10 @@ export async function createOnDemandProvider(options = parseOptions([]), deps = 
   function submit(request, signal) {
     if (stopped) return Promise.reject(unavailable('Embedding provider stopped'));
     if (signal?.aborted) return Promise.reject(unavailable('Embedding request cancelled'));
+    if (sharing === 'local' && options.register && (!registered || registeredSharing !== 'local' || !localConfirmed)) return Promise.reject(unavailable('Local service sharing has not been confirmed by the Node'));
     if (queue.length + Number(Boolean(active)) >= options.maxPending) return Promise.reject(unavailable('Local encoder queue is full', 429));
     clearIdle();
+    if (deps.slot) return submitShared(request, signal);
     return new Promise((resolve, reject) => {
       const job = { request, resolve, reject, signal };
       job.cancel = () => {
@@ -322,6 +409,32 @@ export async function createOnDemandProvider(options = parseOptions([]), deps = 
         }
       }, options.startupTimeoutMs + options.inferenceTimeoutMs);
       queue.push(job); void pump();
+    });
+  }
+  function submitShared(request, signal) {
+    return new Promise((resolve, reject) => {
+      const controller = new AbortController();
+      const job = { request, resolve, reject, signal, controller, started: false };
+      const remove = () => { const index = queue.indexOf(job); if (index >= 0) queue.splice(index, 1); };
+      const cleanup = () => { clearTimeout(job.queueTimer); signal?.removeEventListener('abort', job.cancel); };
+      job.cancel = () => {
+        controller.abort(); remove(); cleanup();
+        if (active === job) void retireWorker(unavailable('Embedding request cancelled'));
+        reject(unavailable('Embedding request cancelled')); scheduleIdle();
+      };
+      signal?.addEventListener('abort', job.cancel, { once: true });
+      job.queueTimer = setTimeout(() => {
+        if (!job.started) { controller.abort(); remove(); cleanup(); reject(unavailable('Local encoder queue wait timed out', 504)); scheduleIdle(); }
+      }, options.startupTimeoutMs + options.inferenceTimeoutMs);
+      queue.push(job);
+      // Enqueue at submission, rather than behind a per-model pump, so arrivals
+      // across both models retain one global FIFO order and cancellation budget.
+      deps.slot.run(options.model, async () => {
+        if (stopped || controller.signal.aborted) throw unavailable('Embedding request cancelled');
+        remove(); clearTimeout(job.queueTimer); clearIdle(); job.started = true; active = job;
+        try { return await encode(request, controller.signal); }
+        finally { active = undefined; if (!controller.signal.aborted) lastUsed = Date.now(); }
+      }, controller.signal).then(resolve, reject).finally(() => { remove(); cleanup(); scheduleIdle(); });
     });
   }
   async function readBody(request) {
@@ -347,8 +460,9 @@ export async function createOnDemandProvider(options = parseOptions([]), deps = 
   const server = createServer(async (request, response) => {
     try {
       if (request.method === 'GET' && request.url === '/health') return json(response, 200, health());
-      if (request.method !== 'POST' || request.url !== '/embed') return json(response, 404, { error: 'Not found' });
-      const payload = validateEmbedRequest(await readBody(request), options.model);
+      if (request.method !== 'POST' || !['/embed', '/invoke', '/warmup'].includes(request.url)) return json(response, 404, { error: 'Not found' });
+      const body = await readBody(request);
+      const payload = request.url === '/embed' ? validateEmbedRequest(body, options.model) : undefined;
       // A legacy gateway may retain an older network advertisement for this port.
       // Until local registration is confirmed, that stale route must not wake weights.
       if (sharing === 'local' && options.register && (!registered || registeredSharing !== 'local' || !localConfirmed)) {
@@ -358,7 +472,10 @@ export async function createOnDemandProvider(options = parseOptions([]), deps = 
       const cancel = () => { if (!response.writableEnded) controller.abort(); };
       response.once('close', cancel);
       if (response.destroyed || request.aborted) controller.abort();
-      try { json(response, 200, await submit(payload, controller.signal)); }
+      try {
+        const invoke = deps.invoke ?? ((value, signal) => invokeBackend(api, options, value, signal));
+        json(response, 200, payload ? await submit(payload, controller.signal) : await invoke(request.url === '/warmup' ? { method: 'embedding.prewarm', params: body } : body, controller.signal, options.model));
+      }
       finally { response.off('close', cancel); }
     } catch (error) { json(response, error.status ?? 503, { error: error.status ? error.message : 'Local embedding provider unavailable' }); }
   });
@@ -385,7 +502,9 @@ export async function createOnDemandProvider(options = parseOptions([]), deps = 
         try {
           const value = await loadConfig(options.config);
           const config = value === undefined ? undefined : validatePriorityConfig(value);
-          priority = config?.priority ?? options.priority;
+          priority = options.fixedPriority ? options.priority : config?.priority ?? options.priority;
+          const nextIdleTimeout = config?.idle_timeout_ms ?? options.idleTimeoutMs;
+          if (nextIdleTimeout !== idleTimeoutMs) { idleTimeoutMs = nextIdleTimeout; scheduleIdle(); }
           const nextSharing = config?.sharing ?? options.sharing;
           if (sharing !== nextSharing) localConfirmed = false;
           sharing = nextSharing;
@@ -443,6 +562,7 @@ export async function createOnDemandProvider(options = parseOptions([]), deps = 
     return stopping ??= (async () => {
       stopped = true; clearIdle(); clearInterval(registrationTimer);
       for (const job of queue.splice(0)) {
+        job.controller?.abort();
         clearTimeout(job.queueTimer); job.signal?.removeEventListener('abort', job.cancel);
         job.reject(unavailable('Embedding provider stopped'));
       }
@@ -457,13 +577,48 @@ export async function createOnDemandProvider(options = parseOptions([]), deps = 
       if (server.listening) await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); });
     })();
   }
-  const api = { server, health, descriptor, start, refresh, stop };
+  const api = { server, health, descriptor, start, refresh, stop, submit,
+    snapshot: () => ({ model: options.model, loaded: Boolean(worker?.ready), loading: Boolean(worker && !worker.ready), unloading: Boolean(retiringWorker && !retiringWorker.exited), worker_pid: worker?.child.pid ?? retiringWorker?.child.pid ?? retirementFailure?.child.pid ?? null, port }),
+    async unload() { await retireWorker(unavailable('Switching local embedding model')); if (retirementFailure) throw unavailable('Previous local encoder has not exited'); } };
+  deps.slot?.register(options.model, api.unload);
   return api;
 }
 
 export async function startOnDemandProvider(options, deps) {
-  const provider = await createOnDemandProvider(options, deps);
+  const provider = options?.gemmaManifest ? await createRoutedProvider(options, deps) : await createOnDemandProvider(options, deps);
   try { return await provider.start(); } catch (error) { await provider.stop(); throw error; }
+}
+
+/** Two fixed vector spaces share one FIFO slot and never own live workers together. */
+export async function createRoutedProvider(options, deps = {}) {
+  options = { ...parseOptions([]), ...options };
+  if (options.port !== 0 && options.port === options.gemmaPort) throw new Error('Gemma and Qwen ports must differ');
+  const slot = createExclusiveModelSlot(), backends = new Map();
+  let gemmaError;
+  const routerHealth = () => {
+    const models = [...backends.values()].map(backend => backend.snapshot());
+    return { ...slot.health(), active_model: models.find(model => model.worker_pid !== null)?.model ?? null,
+      managed_models: models, ...(gemmaError ? { multimodal_unavailable: gemmaError } : {}) };
+  };
+  const invoke = async (value, signal, endpointModel) => {
+    const routed = routeInvocation(value, endpointModel);
+    if (routed.status) return { ...routerHealth(), idle_timeout_ms: primary.health().idle_timeout_ms };
+    const backend = backends.get(routed.model);
+    if (!backend) throw unavailable(`Local ${routed.model} model is unavailable; configure the matching model before searching this index`);
+    if (routed.model === 'embeddinggemma2') checkModalities(routed.request, options);
+    return backend.submit(routed.request, signal);
+  };
+  const primary = await createOnDemandProvider(options, { ...deps, slot, invoke, routerHealth });
+  backends.set('qwen3', primary);
+  try {
+    const gemma = await createOnDemandProvider({ ...options, model: 'embeddinggemma2', python: options.gemmaPython,
+      manifest: options.gemmaManifest, port: options.gemmaPort, maxLength: options.gemmaMaxLength, priority: -10, fixedPriority: true }, { ...deps, slot, invoke, routerHealth });
+    backends.set('embeddinggemma2', gemma);
+  } catch (error) { gemmaError = 'Gemma model metadata is unavailable'; (deps.log ?? console.error)(gemmaError); }
+  return { ...primary, backends, invoke: (value, signal) => invoke(value, signal, 'qwen3'),
+    async start() { try { for (const backend of backends.values()) await backend.start(); } catch (error) { await this.stop(); throw error; } return this; },
+    async refresh() { return Promise.all([...backends.values()].map(backend => backend.refresh())); },
+    async stop() { await Promise.all([...backends.values()].map(backend => backend.stop())); } };
 }
 
 export async function main(argv = process.argv.slice(2)) {

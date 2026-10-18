@@ -203,6 +203,20 @@ export interface ToolSearchOptions {
   responseBase?: Record<string, unknown>;
 }
 
+/** One shared search budget; explicit caller/environment settings always win. */
+export function embeddingSearchTimeoutMs(options: Pick<ToolSearchOptions, 'embeddingTimeoutMs'>,
+  firstProvider?: Pick<EmbeddingProvider, 'lifecycle' | 'coldStartTimeoutMs'>,
+  environmentTimeout: string | undefined = process.env.DREAMMATE_EMBEDDING_TIMEOUT_MS): number {
+  const advertised = firstProvider?.lifecycle === 'on_demand' ? firstProvider.coldStartTimeoutMs : undefined;
+  // Validate again because callers can also supply providers without discovery.
+  const coldStartTimeoutMs = typeof advertised === 'number' && Number.isSafeInteger(advertised)
+    && advertised >= 1 && advertised <= 60000 ? advertised : undefined;
+  const timeoutMs = options.embeddingTimeoutMs ?? (environmentTimeout === undefined
+    ? coldStartTimeoutMs ?? 5000 : Number(environmentTimeout));
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60000) throw new Error('embeddingTimeoutMs 必须是 1–60000');
+  return timeoutMs;
+}
+
 interface EmbeddingCandidate {
   endpoint: string;
   model?: string;
@@ -220,7 +234,9 @@ async function semanticScores(index: IndexedCard[], query: string, candidate: Em
     const cached = vectorCache.get(key);
     return cached && cached.expires >= Date.now() ? [[key, cached] as const] : [];
   }));
-  const missing = keys.map((key, i) => ({ key, i })).filter(({ key }) => !cachedForRequest.has(key));
+  // Replicated skill sources share summary vectors, while retaining separate cards.
+  const missing = [...new Map(keys.map((key, i) => [key, { key, i }])).values()]
+    .filter(({ key }) => !cachedForRequest.has(key));
   const attempt = new AbortController();
   try {
     const [q, d] = await withRequestTimeout(signal => {
@@ -372,8 +388,7 @@ async function rankCards(index: IndexedCard[], args: Record<string, unknown>, op
   let minSimilarity = 0.35;
   if (candidates.length && index.length > 0) {
     try {
-      const timeoutMs = options.embeddingTimeoutMs ?? Number(process.env.DREAMMATE_EMBEDDING_TIMEOUT_MS ?? 5000);
-      if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60000) throw new Error('embeddingTimeoutMs 必须是 1–60000');
+      const timeoutMs = embeddingSearchTimeoutMs(options, candidates[0]?.provider);
       minSimilarity = Number(process.env.DREAMMATE_EMBEDDING_MIN_SCORE ?? 0.35);
       if (!Number.isFinite(minSimilarity) || minSimilarity < -1 || minSimilarity > 1) throw new Error('DREAMMATE_EMBEDDING_MIN_SCORE 必须是 -1–1');
       const started = performance.now();

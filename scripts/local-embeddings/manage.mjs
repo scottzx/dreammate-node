@@ -52,6 +52,13 @@ function absoluteFile(value, name, executable = false) {
   return value;
 }
 
+function absoluteDirectory(value, name) {
+  safeText(value, name);
+  if (!path.isAbsolute(value)) throw new Error(`${name} 必须是绝对路径`);
+  if (!fs.statSync(value, { throwIfNoEntry: false })?.isDirectory()) throw new Error(`${name} 目录不存在：${value}`);
+  return value;
+}
+
 function localAgent(value) {
   const agent = new URL(value ?? 'http://127.0.0.1:36908');
   if (!['http:', 'https:'].includes(agent.protocol) || !['127.0.0.1', 'localhost', '[::1]'].includes(agent.hostname)
@@ -75,14 +82,17 @@ function installedArguments(ctx) {
 async function configurationFor(options, ctx, args = []) {
   const priorityIndex = args.indexOf('--priority');
   const sharingIndex = args.indexOf('--sharing');
+  const idleIndex = args.indexOf('--idle-timeout-ms');
   const configIndex = args.indexOf('--config');
   const fallbackPriority = validInteger(options.fallbackPriority ?? (priorityIndex < 0 ? 100 : args[priorityIndex + 1]), '--priority', -1000, 1000);
   const fallbackSharing = validSharing(options.fallbackSharing ?? (sharingIndex < 0 ? 'network' : args[sharingIndex + 1]));
+  const fallbackIdleTimeoutMs = validInteger(options.fallbackIdleTimeoutMs ?? (idleIndex < 0 ? 60000 : args[idleIndex + 1]), '--idle-timeout-ms', 1, 86400000);
   const file = configFile(options.config ?? (configIndex < 0 ? undefined : args[configIndex + 1]), ctx);
   const config = await readPriorityConfig(file);
   return {
     file, priority: config?.priority ?? fallbackPriority, fallbackPriority,
     sharing: config?.sharing ?? fallbackSharing, fallbackSharing,
+    idleTimeoutMs: config?.idle_timeout_ms ?? fallbackIdleTimeoutMs, fallbackIdleTimeoutMs,
     source: config === undefined ? 'startup' : 'file', reloadIntervalMs: configReloadIntervalMs,
     ...(config === undefined ? {} : { config }),
   };
@@ -97,7 +107,7 @@ function argumentsFor(options, ctx) {
     '--manifest', absoluteFile(options.manifest, '--manifest'),
     '--model', safeText(options.model ?? 'qwen3', '--model'),
     '--device', options.device ?? 'auto',
-    '--idle-timeout-ms', String(validInteger(options.idleTimeoutMs ?? 300000, '--idle-timeout-ms', 1, 86400000)),
+    '--idle-timeout-ms', String(validInteger(options.idleTimeoutMs ?? 60000, '--idle-timeout-ms', 1, 86400000)),
     '--priority', String(validInteger(options.priority ?? 100, '--priority', -1000, 1000)),
     '--sharing', validSharing(options.sharing === undefined ? 'network' : options.sharing),
     '--config', configFile(options.config, ctx),
@@ -109,6 +119,22 @@ function argumentsFor(options, ctx) {
     ['inferenceTimeoutMs', '--inference-timeout-ms', 1, 600000],
     ['maxPending', '--max-pending', 1, 256],
   ]) if (options[key] !== undefined) args.push(flag, String(validInteger(options[key], flag, min, max)));
+  const gemmaKeys = ['gemmaPython', 'gemmaManifest', 'mediaRoot', 'gemmaPort', 'gemmaModalities', 'gemmaMaxLength', 'mpsLimitMb'];
+  if (gemmaKeys.some(key => options[key] !== undefined)) {
+    if (['gemmaPython', 'gemmaManifest', 'mediaRoot'].some(key => options[key] === undefined)) {
+      throw new Error('--gemma-python、--gemma-manifest 和 --media-root 必须同时提供');
+    }
+    const gemmaPort = validInteger(options.gemmaPort ?? 8767, '--gemma-port', 1, 65535);
+    if (gemmaPort === Number(options.port ?? 8766)) throw new Error('--gemma-port 必须与 --port 不同');
+    const modalities = options.gemmaModalities ?? 'vision';
+    if (!['all', 'text', 'vision', 'audio'].includes(modalities)) throw new Error('--gemma-modalities 必须是 all、text、vision 或 audio');
+    args.push('--gemma-python', absoluteFile(options.gemmaPython, '--gemma-python', true),
+      '--gemma-manifest', absoluteFile(options.gemmaManifest, '--gemma-manifest'),
+      '--media-root', absoluteDirectory(options.mediaRoot, '--media-root'),
+      '--gemma-port', String(gemmaPort), '--gemma-modalities', modalities,
+      '--gemma-max-length', String(validInteger(options.gemmaMaxLength ?? 2048, '--gemma-max-length', 1024, 8192)),
+      '--mps-limit-mb', String(validInteger(options.mpsLimitMb ?? 4096, '--mps-limit-mb', 1024, 16384)));
+  }
   if (options.register === false) args.push('--no-register');
   return args;
 }
@@ -144,30 +170,50 @@ async function loadedJob(ctx, file, runOptions) {
   }
 }
 
+async function waitUntilAbsent(ctx, file) {
+  const deadline = Date.now() + 3000;
+  for (let attempt = 0; attempt < 30; attempt++) {
+    if (!await loadedJob(ctx, file, { timeout: Math.max(1, deadline - Date.now()) })) return;
+    if (attempt === 29 || Date.now() + 100 >= deadline) break;
+    await ctx.sleep(100);
+  }
+  throw new Error(`launchd 服务停止后仍未退出：${targetFor(ctx)}`);
+}
+
 async function bootstrap(ctx, file, expectedContent) {
   // launchd can briefly reject a replacement while the old job is retiring.
-  // Keep retries specific to that error, bounded to three seconds in total.
+  // Even exit 0 only acknowledges bootstrap: require the owned job to remain
+  // present across a short interval before accepting activation.
   const deadline = Date.now() + 3000;
   const delays = [200, 500, 1000];
-  for (let attempt = 0; ; attempt++) {
+  const assertUnchanged = () => {
     if (existingFile(file) !== expectedContent) throw new Error(`服务配置已变化，拒绝加载：${file}`);
+  };
+  const stable = async () => {
+    assertUnchanged();
+    const first = await loadedJob(ctx, file, { timeout: Math.max(1, deadline - Date.now()) });
+    assertUnchanged();
+    if (!first || Date.now() + 150 >= deadline) return false;
+    await ctx.sleep(150);
+    assertUnchanged();
+    const second = await loadedJob(ctx, file, { timeout: Math.max(1, deadline - Date.now()) });
+    assertUnchanged();
+    return Boolean(second);
+  };
+  for (let attempt = 0; ; attempt++) {
+    assertUnchanged();
+    let activationError;
     try {
       await ctx.run('launchctl', ['bootstrap', `gui/${ctx.uid}`, file], { timeout: Math.max(1, deadline - Date.now()) });
-      return;
     } catch (error) {
       if (!/^Bootstrap failed: 5: Input\/output error\s*$/m.test(error.stderr ?? '')) throw error;
-      if (Date.now() >= deadline) throw error;
-      const loaded = await loadedJob(ctx, file, { timeout: Math.max(1, deadline - Date.now()) });
-      if (loaded) {
-        // The transient error may race with successful activation. Its managed
-        // path and unchanged configuration must both match before accepting it.
-        if (existingFile(file) !== expectedContent) throw new Error(`已加载服务的配置已变化，拒绝接管：${file}`);
-        return;
-      }
-      const delay = delays[attempt];
-      if (delay === undefined || Date.now() + delay >= deadline) throw error;
-      await ctx.sleep(delay);
+      activationError = error;
     }
+    if (Date.now() < deadline && await stable()) return;
+    const failure = activationError ?? new Error(`launchd 服务加载后未保持运行：${targetFor(ctx)}`);
+    const delay = delays[attempt];
+    if (delay === undefined || Date.now() + delay >= deadline) throw failure;
+    await ctx.sleep(delay);
   }
 }
 function atomicWrite(file, content) {
@@ -204,7 +250,8 @@ export async function installService(options = {}, overrides = {}) {
   const content = renderServicePlist(options, ctx);
   // Validate before stopping a running supervisor. A file override deliberately
   // wins over the startup fallback, and installing never rewrites that file.
-  const configuration = await configurationFor({ config: options.config, fallbackPriority: options.priority ?? 100, fallbackSharing: options.sharing ?? 'network' }, ctx);
+  const configuration = await configurationFor({ config: options.config, fallbackPriority: options.priority ?? 100,
+    fallbackSharing: options.sharing ?? 'network', fallbackIdleTimeoutMs: options.idleTimeoutMs ?? 60000 }, ctx);
   const file = fileFor(ctx);
   const previous = existingFile(file);
   const loaded = await loadedJob(ctx, file);
@@ -217,14 +264,19 @@ export async function installService(options = {}, overrides = {}) {
     if (loaded) {
       await ctx.run('launchctl', ['bootout', targetFor(ctx)]);
       stoppedPrevious = true;
+      await waitUntilAbsent(ctx, file);
     }
+    if (existingFile(file) !== previous) throw new Error(`服务配置已变化，拒绝覆盖：${file}`);
     atomicWrite(file, content);
     wrote = true;
     await bootstrap(ctx, file, content);
   } catch (error) {
     const failures = [];
     const restore = async args => {
-      try { await ctx.run('launchctl', args); } catch (failure) { failures.push(String(failure)); }
+      try {
+        await ctx.run('launchctl', args);
+        if (args[0] === 'bootout') await waitUntilAbsent(ctx, file);
+      } catch (failure) { failures.push(String(failure)); }
     };
     // A timed-out bootstrap can still have loaded the job. Retire only the job
     // whose path is the managed configuration before restoring previous state.
@@ -248,23 +300,27 @@ export async function installService(options = {}, overrides = {}) {
   return {
     installed: true, platform: 'launchd', file,
     port: validInteger(options.port ?? 8766, '--port', 1, 65535),
-    idleTimeoutMs: validInteger(options.idleTimeoutMs ?? 300000, '--idle-timeout-ms', 1, 86400000),
+    idleTimeoutMs: configuration.fallbackIdleTimeoutMs,
+    effectiveIdleTimeoutMs: configuration.idleTimeoutMs, fallbackIdleTimeoutMs: configuration.fallbackIdleTimeoutMs,
     effectivePriority: configuration.priority, fallbackPriority: configuration.fallbackPriority,
     sharing: configuration.sharing, fallbackSharing: configuration.fallbackSharing, configuration,
   };
 }
 
-/** Reads or changes advertisement settings without restarting the supervisor or its model. */
+/** Reads or changes advertisement and idle settings without restarting the supervisor or its model. */
 export async function configurePriority(options = {}, overrides = {}) {
   const ctx = context(overrides);
   const args = installedArguments(ctx);
   const previous = await configurationFor(options, ctx, args);
-  if (options.priority === undefined && options.sharing === undefined) return { ...previous, updated: false };
+  if (options.priority === undefined && options.sharing === undefined && options.idleTimeoutMs === undefined) return { ...previous, updated: false };
   const config = validatePriorityConfig({ version: 1,
     priority: options.priority === undefined ? previous.priority : validInteger(options.priority, '--priority', -1000, 1000),
     ...(options.sharing === undefined
       ? (previous.config?.sharing === undefined ? {} : { sharing: previous.config.sharing })
       : { sharing: validSharing(options.sharing) }),
+    ...(options.idleTimeoutMs === undefined
+      ? (previous.config?.idle_timeout_ms === undefined ? {} : { idle_timeout_ms: previous.config.idle_timeout_ms })
+      : { idle_timeout_ms: validInteger(options.idleTimeoutMs, '--idle-timeout-ms', 1, 86400000) }),
   });
   fs.mkdirSync(path.dirname(previous.file), { recursive: true, mode: 0o700 });
   // Refuse to replace an invalid or non-regular file even if it appeared since
@@ -318,13 +374,18 @@ const help = `Usage: node scripts/local-embeddings/manage.mjs <install|config|st
 
 install requires --python ABSOLUTE_PATH --manifest ABSOLUTE_PATH.
   --port 8766 --agent http://127.0.0.1:36908 --model qwen3
-  --device auto|cpu|mps|cuda --idle-timeout-ms 300000 --priority 100 --sharing network --batch-size 8
+  --device auto|cpu|mps|cuda --idle-timeout-ms 60000 --priority 100 --sharing network --batch-size 8
   --max-length N --startup-timeout-ms N --inference-timeout-ms N --max-pending N
   --config ABSOLUTE_PATH --no-register
-config [--priority N] [--sharing local|network] [--config ABSOLUTE_PATH] reads or updates without restarting.
+  Optional Gemma routing: --gemma-python ABSOLUTE_PATH --gemma-manifest ABSOLUTE_PATH --media-root ABSOLUTE_DIRECTORY
+  All three Gemma paths are required together; paths must already exist. Prepared manifests are accepted without loading Python or Torch.
+  --gemma-port 8767 (different from --port) --gemma-modalities all|text|vision|audio (default: vision)
+  --gemma-max-length 2048 --mps-limit-mb 4096
+config [--priority N] [--sharing local|network] [--idle-timeout-ms N] [--config ABSOLUTE_PATH] reads or updates without restarting.
   Default file: ~/.1agents/embedding-config.json. Each configured field overrides its startup argument.
   --sharing local restricts access to this Node; network allows peer access (default).
-  Changes reload within 15 seconds. Without --priority or --sharing, config performs a read only.
+  --idle-timeout-ms accepts 1–86400000 and controls model standby time after the last request (default: 60000).
+  Changes reload within 15 seconds. Without priority, sharing or idle options, config performs a read only.
   config --config selects the file to read/write; install --config sets the service's watched file.
 status accepts --port PORT and --config ABSOLUTE_PATH; otherwise it uses the installed configuration.
 uninstall accepts no options. This installer supports macOS launchd only.
@@ -341,6 +402,8 @@ export function parseArgs(argv) {
     '--idle-timeout-ms': 'idleTimeoutMs', '--priority': 'priority', '--batch-size': 'batchSize', '--max-length': 'maxLength',
     '--startup-timeout-ms': 'startupTimeoutMs', '--inference-timeout-ms': 'inferenceTimeoutMs', '--max-pending': 'maxPending',
     '--config': 'config', '--sharing': 'sharing',
+    '--gemma-python': 'gemmaPython', '--gemma-manifest': 'gemmaManifest', '--media-root': 'mediaRoot',
+    '--gemma-port': 'gemmaPort', '--gemma-modalities': 'gemmaModalities', '--gemma-max-length': 'gemmaMaxLength', '--mps-limit-mb': 'mpsLimitMb',
   };
   for (let index = 1; index < argv.length; index++) {
     const flag = argv[index];
@@ -348,7 +411,7 @@ export function parseArgs(argv) {
     if (flag === '--no-register' && command === 'install') { options.register = false; continue; }
     if (!(flag in keys) || command === 'uninstall'
         || (command === 'status' && !['--port', '--config'].includes(flag))
-        || (command === 'config' && !['--priority', '--sharing', '--config'].includes(flag))) throw new Error(`${command} 不支持参数：${flag}`);
+        || (command === 'config' && !['--priority', '--sharing', '--idle-timeout-ms', '--config'].includes(flag))) throw new Error(`${command} 不支持参数：${flag}`);
     const value = argv[++index];
     if (!value || value.startsWith('--')) throw new Error(`${flag} 缺少值`);
     options[keys[flag]] = value;

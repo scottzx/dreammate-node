@@ -8,6 +8,8 @@ import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { gzip } from 'node:zlib';
+import { promisify } from 'node:util';
 import { DEFAULT_PORTS, PROTOCOL_VERSION, type NodeManifest, type MethodDescriptor } from '@1agents/dreammate-network';
 import { nodeIdentity } from './identity.js';
 import { ServiceRegistry, type Registration, type RegisteredService } from './registry.js';
@@ -44,6 +46,21 @@ const json = (res: http.ServerResponse, status: number, body: unknown): void => 
   });
   res.end(payload);
 };
+
+const gzipAsync = promisify(gzip);
+/** Large vectors and skill catalogs negotiate compression with the same JSON schema. */
+async function compressedJson(req: http.IncomingMessage, res: http.ServerResponse, body: unknown) {
+  const compact = Buffer.from(JSON.stringify(body));
+  const acceptsGzip = (req.headers['accept-encoding'] ?? '').split(',').some(entry => {
+    const [name, ...parameters] = entry.trim().toLowerCase().split(';');
+    return name === 'gzip' && !parameters.some(parameter => /^\s*q\s*=\s*0(?:\.0*)?\s*$/.test(parameter));
+  });
+  const payload = acceptsGzip ? await gzipAsync(compact) : compact;
+  if (res.destroyed) return;
+  res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'content-length': payload.length,
+    vary: 'Accept-Encoding', ...(acceptsGzip ? { 'content-encoding': 'gzip' } : {}) });
+  res.end(payload);
+}
 
 /** Strong conditional token for a registry snapshot, independent of the service implementation. */
 function serviceEtag(service: RegisteredService): string {
@@ -184,7 +201,7 @@ async function proxyEmbedding(
       }
       return { model: data.model, embeddings: data.embeddings, encoding: data.encoding };
     }, 60000);
-    if (!disconnected.signal.aborted && !res.destroyed) json(res, 200, result);
+    if (!disconnected.signal.aborted && !res.destroyed) await compressedJson(req, res, result);
   } catch (error) {
     if (disconnected.signal.aborted || res.destroyed) return;
     const timeout = error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError');
@@ -525,8 +542,10 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
             return json(res, 400, { error: 'Skill catalog limit must be 1..200 and offset 0..1000000' });
           }
           const result = await skillRequest('catalog', { limit, offset });
-          return json(res, result.status, result.status === 200 && result.data && typeof result.data === 'object'
-            ? { ...result.data, node: identity.name } : result.data);
+          if (result.status === 200 && result.data && typeof result.data === 'object') {
+            return await compressedJson(req, res, { ...result.data, node: identity.name });
+          }
+          return json(res, result.status, result.data);
         }
 
         const readSkill = /^\/skills\/([^/]+)$/.exec(pathname);

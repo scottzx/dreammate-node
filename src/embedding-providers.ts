@@ -11,6 +11,8 @@ export interface EmbeddingAdvertisement {
   encoding: string;
   ready: true;
   priority: number;
+  lifecycle?: 'on_demand';
+  coldStartTimeoutMs?: number;
 }
 
 export interface EmbeddingProvider {
@@ -22,6 +24,8 @@ export interface EmbeddingProvider {
   node: string;
   service_id: string;
   priority: number;
+  lifecycle?: 'on_demand';
+  coldStartTimeoutMs?: number;
 }
 
 export type EmbeddingService = RegisteredService & { node: string; gateway_url?: string };
@@ -37,11 +41,17 @@ export function parseEmbeddingAdvertisement(service: RegisteredService): Embeddi
   const advertisement = value as Record<string, unknown>;
   const { protocol, model, revision, dimensions, encoding, ready } = advertisement;
   const priority = advertisement.priority === undefined ? 0 : advertisement.priority;
+  const coldStartTimeoutMs = advertisement.cold_start_timeout_ms;
   if (protocol !== EMBEDDING_PROTOCOL || ready !== true || model !== 'qwen3' || !canonicalString(revision)
     || !canonicalString(encoding) || encoding.length > 200
     || typeof dimensions !== 'number' || !Number.isSafeInteger(dimensions) || dimensions < 1 || dimensions > 4096
     || typeof priority !== 'number' || !Number.isFinite(priority) || priority < -1000 || priority > 1000) return undefined;
-  return { protocol, model, revision, dimensions, encoding, ready, priority };
+  if (coldStartTimeoutMs !== undefined && (advertisement.lifecycle !== 'on_demand'
+    || typeof coldStartTimeoutMs !== 'number' || !Number.isSafeInteger(coldStartTimeoutMs)
+    || coldStartTimeoutMs < 1 || coldStartTimeoutMs > 60000)) return undefined;
+  return { protocol, model, revision, dimensions, encoding, ready, priority,
+    ...(advertisement.lifecycle === 'on_demand' ? { lifecycle: 'on_demand' as const } : {}),
+    ...(coldStartTimeoutMs === undefined ? {} : { coldStartTimeoutMs: coldStartTimeoutMs as number }) };
 }
 
 /** Only the gateway actually scanned by discovery determines the remote route. */
@@ -64,7 +74,9 @@ export function discoverEmbeddingProviders(services: readonly EmbeddingService[]
     } catch { continue; }
     candidates.push({ endpoint, model: advertisement.model, expectedModel: `${advertisement.model}@${advertisement.revision}`,
       dimensions: advertisement.dimensions, encoding: advertisement.encoding, node: service.node, service_id: service.id,
-      priority: advertisement.priority, healthy: service.liveness === 'up' });
+      priority: advertisement.priority, healthy: service.liveness === 'up',
+      ...(advertisement.lifecycle ? { lifecycle: advertisement.lifecycle } : {}),
+      ...(advertisement.coldStartTimeoutMs === undefined ? {} : { coldStartTimeoutMs: advertisement.coldStartTimeoutMs }) });
   }
   candidates.sort((a, b) => b.priority - a.priority
     || Number(b.healthy) - Number(a.healthy) || a.endpoint.localeCompare(b.endpoint)

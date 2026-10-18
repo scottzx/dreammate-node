@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { get } from 'node:http';
 import { createServer } from 'node:net';
@@ -9,6 +10,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const adapter = fileURLToPath(new URL('../scripts/local-embeddings/server.py', import.meta.url));
+
+test('encoder concurrency and persistent snapshot contracts run without model weights', { timeout: 10000 }, async () => {
+  await promisify(execFile)('python3', ['-m', 'unittest', 'discover', '-s', '.', '-p', 'test_*.py'],
+    { cwd: path.dirname(adapter) });
+});
 
 function startAdapter(port, manifest) {
   const child = spawn('python3', [adapter, '--host', '127.0.0.1', '--port', String(port), '--manifest', manifest]);

@@ -28,8 +28,9 @@ import type { NetworkNode } from './identity.js';
 import { directoryNodeUrl, findDirectoryNode, type NodeDirectory } from './node-directory.js';
 import { installSkillPackage, listSkillArchive } from './skills.js';
 import { withRequestTimeout } from './request-timeout.js';
-import { pageResponse, parsePageOptions, searchTools, searchSkills, type DiscoveredSkill } from './tool-search.js';
+import { pageResponse, parsePageOptions, searchTools, searchSkills } from './tool-search.js';
 import { discoverEmbeddingProviders } from './embedding-providers.js';
+import { scanSkillCatalog } from './skill-catalog.js';
 import { installMcpReload } from './mcp-runtime.js';
 import { loadPrivateMcpSources, type PrivateMcpSources } from './mcp-client-sources.js';
 
@@ -223,63 +224,14 @@ async function discoverServices(agentUrl: string, node: string | undefined, opti
   };
 }
 
-/** Bound network work independently from the small, paginated result sent to the model. */
-async function scanSkills(url: string, node: string) {
-  const scan: NodeScan & { catalog_truncated?: boolean; diagnostics_count?: number } = {
-    node, url, status: 'ok', checked_at: new Date().toISOString(),
-  };
-  let skills: DiscoveredSkill[] = [];
-  try {
-    skills = await withRequestTimeout(async signal => {
-      const result: DiscoveredSkill[] = [];
-      let offset = 0;
-      for (let page = 0; page < 5; page++) {
-        const response = await fetch(`${url}/skills?limit=200&offset=${offset}`, { signal, redirect: 'error' });
-        scan.http_status = response.status;
-        if (!response.ok) {
-          await response.body?.cancel();
-          scan.status = response.status === 404 ? 'unsupported' : 'http_error';
-          return result;
-        }
-        const data = await response.json() as { node?: unknown; skills?: unknown; has_more?: unknown; next_offset?: unknown; diagnostics?: unknown };
-        if (!data || !Array.isArray(data.skills) || data.skills.length > 200) throw new SyntaxError('Invalid skill catalog');
-        for (const raw of data.skills) {
-          const skill = raw as Record<string, unknown> | null;
-          if (!skill || typeof skill.id !== 'string' || !skill.id || skill.id.length > 256
-            || typeof skill.source_id !== 'string' || !/^skills-[A-Za-z0-9_-]{1,64}$/.test(skill.source_id)
-            || typeof skill.name !== 'string' || !skill.name || skill.name.length > 128
-            || typeof skill.description !== 'string' || !skill.description || skill.description.length > 4096
-            || typeof skill.revision !== 'string' || !/^[a-f0-9]{64}$/.test(skill.revision)
-            || (skill.scope !== undefined && !['user', 'system', 'project'].includes(String(skill.scope)))
-            || (skill.compatibility !== undefined && (typeof skill.compatibility !== 'string' || skill.compatibility.length > 1024))) {
-            throw new SyntaxError('Invalid skill summary');
-          }
-          result.push({ id: skill.id, source_id: skill.source_id, name: skill.name, description: skill.description,
-            revision: skill.revision, node,
-            ...(skill.scope !== undefined ? { scope: skill.scope as DiscoveredSkill['scope'] } : {}),
-            ...(typeof skill.compatibility === 'string' ? { compatibility: skill.compatibility } : {}) });
-        }
-        if (Array.isArray(data.diagnostics) && data.diagnostics.length) scan.diagnostics_count = data.diagnostics.length;
-        if (!data.has_more) return result;
-        if (typeof data.next_offset !== 'number' || !Number.isSafeInteger(data.next_offset) || data.next_offset <= offset) {
-          throw new SyntaxError('Invalid skill catalog cursor');
-        }
-        offset = data.next_offset;
-      }
-      scan.catalog_truncated = true;
-      return result;
-    }, 3000);
-  } catch (error) {
-    scan.status = timedOut(error) ? 'timeout' : error instanceof SyntaxError ? 'invalid_response' : 'unreachable';
-    scan.error = error instanceof Error ? error.message : String(error);
-  }
-  return { scan, skills };
-}
-
 async function discoverSkills(agentUrl: string, node: string, options: McpOptions) {
   const { targets, discovery } = await discoverTargets(agentUrl, node, options);
   const batches = await Promise.all(targets.map(async target => {
-    const [catalog, services] = await Promise.all([scanSkills(target.url, target.name), scanServices(target.url, target.name)]);
+    // A failed gateway probe already bounds unreachable nodes to three seconds.
+    // Reachable skill providers get a separate budget for each catalog page.
+    const services = await scanServices(target.url, target.name);
+    if (services.scan.status !== 'ok') return { scan: services.scan, skills: [], services: [], providerScan: services.scan };
+    const catalog = await scanSkillCatalog(target.url, target.name);
     return { ...catalog, services: services.services, providerScan: services.scan };
   }));
   const scans = batches.map(batch => batch.scan);
@@ -288,9 +240,10 @@ async function discoverSkills(agentUrl: string, node: string, options: McpOption
     providerDiscoveryPartial: batches.some(batch => batch.providerScan.status !== 'ok'),
     evidence: { scope: node, discovery, scans,
       partial: discovery.status !== 'ok' || scans.length === 0
-        || scans.some(scan => scan.status !== 'ok' || scan.catalog_truncated || scan.diagnostics_count),
+        || scans.some(scan => scan.status !== 'ok' || ('catalog_truncated' in scan && scan.catalog_truncated)
+          || ('diagnostics_count' in scan && scan.diagnostics_count)),
     },
-    allFailed: scans.length === 0 || scans.every(scan => scan.status !== 'ok'),
+    allFailed: batches.every(batch => batch.skills.length === 0) && (scans.length === 0 || scans.every(scan => scan.status !== 'ok')),
   };
 }
 

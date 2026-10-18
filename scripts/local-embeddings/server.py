@@ -53,6 +53,7 @@ class Encoder:
         self.effective_batch_size = batch_size or 1
         self.max_length = max_length
         self.lock = threading.Lock()
+        self.cache_lock = threading.Lock()
         self.current = None
         self.encoder = None
         # The sidecar survives short-lived CLI processes. Cache only hashes of
@@ -60,20 +61,24 @@ class Encoder:
         self.document_cache: OrderedDict[tuple[str, bytes], array] = OrderedDict()
         self.dimensions: dict[str, int] = {}
 
-    def load(self, alias: str):
+    def model_version(self, alias: str):
         if self.serve_model is not None and alias != self.serve_model:
             raise ValueError(f"This provider only serves {self.serve_model}")
         if alias != "qwen3" or alias not in self.models:
             raise ValueError(f"Unknown prepared model: {alias}")
+        revision = self.models[alias].get("revision", "")
+        if not isinstance(revision, str) or not revision:
+            raise ValueError("Each prepared model must record its exact revision")
+        return f"{alias}@{revision}"
+
+    def load(self, alias: str):
+        version = self.model_version(alias)
         entry = self.models[alias]
         model_path = Path(entry["path"]).expanduser().resolve()
         if not model_path.is_dir() or not (model_path / "config.json").is_file():
             raise ValueError(f"Missing local snapshot: {model_path}")
-        revision = entry.get("revision", "")
-        if not isinstance(revision, str) or not revision:
-            raise ValueError("Each prepared model must record its exact revision")
         if self.current == alias:
-            return f"{alias}@{revision}"
+            return version
         self.encoder = None
         self.current = None
         gc.collect()
@@ -89,7 +94,19 @@ class Encoder:
         self.encoder.max_seq_length = self.max_length
         self.encoder.tokenizer.padding_side = "left"
         self.current = alias
-        return f"{alias}@{revision}"
+        return version
+
+    def cached_documents(self, keys, texts):
+        available, missing = {}, {}
+        with self.cache_lock:
+            for key, text in zip(keys, texts):
+                cached = self.document_cache.get(key)
+                if cached is not None:
+                    available[key] = cached
+                    self.document_cache.move_to_end(key)
+                elif key not in missing:
+                    missing[key] = text
+        return available, missing
 
     def encoding_profile(self, dimensions: int) -> str:
         return f"dreammate.tool-search.v1:fp32:max{self.max_length}:dim{dimensions}"
@@ -154,36 +171,35 @@ class Encoder:
             raise ValueError("texts must contain 1..64 strings")
         if any(not isinstance(text, str) or not text.strip() or len(text) > 8192 for text in texts):
             raise ValueError("Each text must contain 1..8192 characters")
-        with self.lock:
-            model_version = self.load(alias)
-            if input_type == "query":
+        model_version = self.model_version(alias)
+        if input_type == "query":
+            with self.lock:
+                model_version = self.load(alias)
                 vectors = self.encode_inputs(alias, texts, input_type, model_version)
-            else:
-                keys = [(model_version, hashlib.sha256(text.encode("utf-8")).digest()) for text in texts]
-                # Each unique missing document is encoded once, then restored
-                # to the original request order, including duplicate entries.
-                available = {}
-                missing = {}
-                for key, text in zip(keys, texts):
-                    cached = self.document_cache.get(key)
-                    if cached is not None:
-                        available[key] = cached
-                        self.document_cache.move_to_end(key)
-                    elif key not in missing:
-                        missing[key] = text
-                if missing:
-                    encoded = self.encode_inputs(alias, list(missing.values()), input_type, model_version)
-                    for key, vector in zip(missing, encoded):
-                        available[key] = vector
-                        self.document_cache[key] = vector
-                        self.document_cache.move_to_end(key)
-                        while len(self.document_cache) > DOCUMENT_CACHE_LIMIT:
-                            self.document_cache.popitem(last=False)
-                vectors = [available[key] for key in keys]
-            dimensions = len(vectors[0])
-            return {"model": model_version, "alias": alias, "revision": model_version.rsplit("@", 1)[-1],
-                    "dimensions": dimensions, "encoding": self.encoding_profile(dimensions),
-                    "embeddings": [vector.tolist() for vector in vectors]}
+        else:
+            keys = [(model_version, hashlib.sha256(text.encode("utf-8")).digest()) for text in texts]
+            available, missing = self.cached_documents(keys, texts)
+            if missing:
+                with self.lock:
+                    self.load(alias)
+                    # Another request may have filled these entries while we
+                    # waited. Only misses require the serialized model.
+                    available, missing = self.cached_documents(keys, texts)
+                    if missing:
+                        encoded = self.encode_inputs(alias, list(missing.values()), input_type, model_version)
+                        with self.cache_lock:
+                            for key, vector in zip(missing, encoded):
+                                available[key] = vector
+                                self.document_cache[key] = vector
+                                self.document_cache.move_to_end(key)
+                                while len(self.document_cache) > DOCUMENT_CACHE_LIMIT:
+                                    self.document_cache.popitem(last=False)
+            vectors = [available[key] for key in keys]
+        # Neither conversion nor HTTP serialization holds the inference lock.
+        dimensions = len(vectors[0])
+        return {"model": model_version, "alias": alias, "revision": model_version.rsplit("@", 1)[-1],
+                "dimensions": dimensions, "encoding": self.encoding_profile(dimensions),
+                "embeddings": [vector.tolist() for vector in vectors]}
 
 
 def main():
@@ -198,6 +214,8 @@ def main():
     parser.add_argument("--serve-model", choices=("qwen3",),
                         help="Serve only this alias, default requests to it and warm it before HTTP")
     parser.add_argument("--self-test", action="store_true", help="Encode one pair per model without starting HTTP")
+    parser.add_argument("--restore-document-cache", type=Path,
+                        help="Restore a validated vector_cache snapshot directory after model warmup")
     args = parser.parse_args()
     if (args.batch_size is not None and not 1 <= args.batch_size <= 64) or not 64 <= args.max_length <= 8192 or not 1 <= args.port <= 65535:
         parser.error("Invalid batch-size, max-length or port")
@@ -205,6 +223,8 @@ def main():
         parser.error("--serve-model and --warmup must select the same alias")
     if args.serve_model:
         args.warmup = args.serve_model
+    if args.restore_document_cache and not args.warmup:
+        parser.error("--restore-document-cache requires --warmup or --serve-model")
     encoder = Encoder(args.manifest.resolve(), args.device, args.batch_size, args.max_length, args.serve_model)
     if args.self_test:
         import resource
@@ -233,6 +253,11 @@ def main():
 
     if args.warmup:
         encoder.encode(args.warmup, ["Find a relevant tool for the user task"], "query")
+        if args.restore_document_cache:
+            from vector_cache import load_document_cache
+            with encoder.cache_lock:
+                restored = load_document_cache(encoder, args.warmup, args.restore_document_cache)
+            print(json.dumps({"restored_document_vectors": restored}), file=sys.stderr, flush=True)
 
     class Handler(BaseHTTPRequestHandler):
         def send_json(self, status, payload):

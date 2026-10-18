@@ -78,6 +78,13 @@ test('project skills: a registered provider supplies summaries and the complete 
   const { base, project, registry } = await fixture(t);
   assert.equal(registry.list().length, 1);
   assert.equal(registry.list()[0]!.metadata?.skill_provider && (registry.list()[0]!.metadata!.skill_provider as { protocol: string }).protocol, 'dreammate.skills.v1');
+  for (const encoding of ['gzip', 'gzip;q=0']) {
+    const response = await fetch(`${base}/skills?limit=200`, { headers: { 'accept-encoding': encoding } });
+    assert.equal(response.headers.get('content-encoding'), encoding === 'gzip' ? 'gzip' : null);
+    const catalog = await response.json() as { skills: { name: string }[]; total: number };
+    assert.equal(catalog.total, 1);
+    assert.equal(catalog.skills[0]!.name, 'cad-scene');
+  }
   const found = await search(base);
   assert.equal(found.returned, 1);
   assert.equal(found.partial, false);

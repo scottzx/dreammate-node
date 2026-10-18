@@ -45,6 +45,7 @@ dreammate-node cli read-skill --agent http://GATEWAY:36908 --node DEVICE --skill
 HTTP 409 / `SKILL_REVISION_CHANGED` 表示源文件已变更，重新搜索并读新版本，不混用新旧脚本与指南。
 来源目录原件不复制到客户端，读取不会安装或执行脚本。根据指南确认实际执行设备、依赖和文件可达性。
 MCP 对应 `dreammate_search_skills` → `dreammate_read_skill`。目录返回 `partial` / `unsupported` 时说明覆盖限制。
+技能目录每次页面读取最多 10 秒，整个节点最多 30 秒、5 页；暂时的只读页面错误可重试一次。后续页失败会保留已读取的摘要并标记 partial，不能把部分目录解释为完整覆盖。
 用户要求发布项目技能时，在原件所在设备用 `dreammate-node skills add --name NAME --project /absolute/project`；
 项目扫描 `.agents/skills`、`.claude/skills`、`skills`。共享或单个技能包用 `--dir /absolute/skills`。
 只登记用户要发布的来源；可用 `skills list`、`skills refresh [ID]`、`skills remove ID` 管理，remove 保留原件。
@@ -111,19 +112,24 @@ dreammate-node cli nodes export --agent http://127.0.0.1:36908 --default-node sc
 
 业务任务使用 `dreammate_search_tools`（必填 `query`）→ `dreammate_inspect`（指定 `method`）→ `dreammate_invoke`。`dreammate_list_nodes` 用于节点发现，`dreammate_list_services` 用于显式目录浏览。元工具的 `service_id` 和 `method` 来自真实搜索与契约；上下文中只展开当前需要的 Schema。
 搜索自动从本次扫描到的全部服务发现就绪模型，其他设备无需安装权重或逐个配置模型 URL。发现范围随 `--node`，显式 `localhost` 只看入口设备；`--service ID`／`service_id` 只筛业务方法，不排除同一节点范围内其他服务提供的模型。没有可见就绪 provider 时返回 `search.semantic_status=no_provider` 和有界词法结果；结合 `partial`、`discovery`、`scans` 说明范围，不能据此称全网没安装模型。模型请求失败同样有界降级。
-多个 provider 按 priority 高优先、健康状态、稳定 URL 选择，最多尝试两个，共享默认 5 秒语义预算。自动发现路径下，一次尝试的 query 与 documents 固定 provider、revision、维度和编码配置；切备用不能混用向量。显式 `DREAMMATE_EMBEDDING_URL` 优先并固定地址，失败不自动切到其他模型；`DREAMMATE_EMBEDDING_MODEL` 可限定别名。
+多个 provider 按 priority 高优先、健康状态、稳定 URL 选择，最多尝试两个，共享一次搜索的总语义预算。普通 provider 默认 5 秒；自动发现首选的 `lifecycle: on_demand` provider 声明合法 `cold_start_timeout_ms` 时，在调用方与环境均未显式设置超时的条件下使用该冷启动预算（1–60000 ms）。显式超时始终优先；不为第二个 provider 重新增加预算。自动发现路径下，一次尝试的 query 与 documents 固定 provider、revision、维度和编码配置；切备用不能混用向量。显式 `DREAMMATE_EMBEDDING_URL` 优先并固定地址，失败不自动切到其他模型；`DREAMMATE_EMBEDDING_MODEL` 可限定别名。
 模型服务可以只驻留一台内网设备。客户端直连选中节点的 `POST /services/<id>/embed`，该网关仅代理本机已注册的 loopback HTTP 端口，不跨节点中继。用户要求部署语义检索时，先显式准备离线权重，再在模型设备的仓库目录运行 `node scripts/local-embeddings/serve.mjs --model qwen3 --port 8766 --agent http://127.0.0.1:36908`；启动器只在真实就绪后登记模型信息，每 15 秒刷新，正常退出注销。普通调用不自动下载或部署模型；没有全局 leader 或中心搜索 API。
 
-用户明确要求 Mac 按需使用已有本地模型时，用 `dreammate-node embedding install --python /absolute/venv/bin/python --manifest /absolute/manifest.json --device mps --batch-size 8 --idle-timeout-ms 300000 --priority 100 --sharing local`；先核验环境与权重存在，不自动下载。
+用户明确要求 Mac 按需使用已有本地模型时，用 `dreammate-node embedding install --python /absolute/venv/bin/python --manifest /absolute/manifest.json --device mps --batch-size 8 --idle-timeout-ms 60000 --priority 100 --sharing local`；先核验环境与权重存在，不自动下载。
 `embedding status` 只探活，不加载模型；`embedding uninstall` 停止启动器及其模型子进程。
 优先级用 `embedding config` 查看，`embedding config --priority N` 持久修改，无需重填安装路径。
-按需启动器每 15 秒读取 `~/.1agents/embedding-config.json`（`{"version":1,"priority":100,"sharing":"local"}`），配置分别覆盖 `--priority` / `--sharing` 启动兜底值；`--config` 可指定其他文件。
+按需启动器每 15 秒读取 `~/.1agents/embedding-config.json`（`{"version":1,"priority":100,"sharing":"local","idle_timeout_ms":60000}`），配置分别覆盖 `--priority` / `--sharing` / `--idle-timeout-ms` 启动兜底值；`--config` 可指定其他文件。`embedding config --idle-timeout-ms N` 持久修改待命时间，范围 1–86400000，保留已有优先级与共享范围。旧 JSON 省略 `idle_timeout_ms` 时沿用启动参数；新启动默认 60000 ms，已有 plist 的显式旧值需通过配置或重新安装调整。
 用 `embedding config --sharing local|network` 单独修改范围；`local` 仅本机 Agent 共用，应使用 loopback 网关入口，其他设备目录隐藏且直接调用返回 404。本机仍可回退到网络共享的远端模型。
 旧配置未提供 sharing 时保持启动参数，启动参数默认 network；只改 priority 不丢已有 sharing。local 报备先验证网关支持通用服务共享范围，旧网关不支持时拒绝发布并报告注册错误。
-修改不重启模型或 MCP，也不重置空闲计时；运行中配置无效保留最近有效值并通过 `health.config.last_error` 报告。
-轻量启动器常驻，首次实际编码才加载 Qwen，最后一个请求结束后空闲 5 分钟退出 Python；健康检查与服务报备不会保活。
-按需 worker 只把文档文本哈希及向量写入 `~/.1agents/cache/embeddings/`，下次按模型版本、维度和编码配置校验恢复，不保存描述原文或查询。
+修改优先级或共享范围不重启模型或 MCP，也不重置空闲计时；修改待命时间按最后一次使用时间重新评估剩余时间，配置变更本身不保活。运行中配置无效保留最近有效值并通过 `health.config.last_error` 报告。
+轻量启动器常驻，首次实际编码或显式预热才加载模型，最后一个请求或预热结束后默认空闲 60 秒退出重量 worker；运行或排队请求期间不卸载。`embedding.prewarm` 不发业务编码请求，但允许 encoder 内部初始化和预热；健康检查、状态读取与服务报备不加载模型，也不会保活。
+按需 Qwen worker 只把文档文本哈希及向量写入 `~/.1agents/cache/embeddings/`，下次按模型版本、维度和编码配置校验恢复，不保存描述原文或查询。
 按需服务的 `loaded`/`loading`/`worker_pid` 表示真实模型状态，`embedding_provider.ready` 仅表示启动器可接单。
+需要本机多模态时，同一次 `embedding install` 可追加 `--gemma-python /absolute/gemma-venv/bin/python --gemma-manifest /absolute/gemma-manifest.json --media-root /absolute/media-inbox --gemma-port 8767 --gemma-modalities vision --gemma-max-length 2048 --mps-limit-mb 4096`；前三个已准备路径必须一起提供，端口与 Qwen 的 8766 不同。安装不会下载 Gemma 或补依赖；省略 Gemma 参数保留单 Qwen 功能。
+Qwen 与 Gemma 归同一 Node supervisor 的共享队列管理，切换时等待活动请求完成，确认旧 worker 已退出后才加载新模型，同一管理器最多运行一个重量模型。此互斥不控制其他应用或其他设备上的进程。发布服务前检查当前安装参数与 `embedding status`，不能把仓库代码更新当成运行中的旧服务已经迁移。
+统一 `POST /invoke` 的 `embedding.encode` 接受 `params: {texts:["查询"],input_type:"query",target:"text"|"multimodal"}`；省略 target 时纯文本默认 Qwen，含媒体项交给启用对应模态的 Gemma。**用纯文字查询图片/视频索引也必须显式 `target:"multimodal"`**，向量空间由被检索内容决定，不能只看查询是否有文字。
+`embedding.encode_media` 接受 `items:[{image:"relative.png"}]` 等媒体项，路径受 `--media-root` 限制；`embedding.compare` 使用 `query` 与 `items` 在 Gemma 空间比较。预热用 `embedding.prewarm` 加 `target`；`embedding.status` 只读生命周期。通过网关调用前照常 inspect 对应方法，以实际 Schema 为准。
+默认 8766 `/embed` 固定 Qwen，8767 `/embed` 固定 Gemma；Gemma 端口 `embedding.encode_text` 也固定 Gemma。两套索引与缓存按模型 revision、维度和编码指纹分别保存，不混用向量；工具/技能目录自动发现只选择 Qwen，Gemma 用于独立多模态素材检索。
 广告优先级 100 高于普通远端的 0，默认全网搜索保留远端回退；优先级只在共享范围内生效。
 不固定 `DREAMMATE_EMBEDDING_URL`，已有 MCP 可自动发现。独立 CLI 不继承 MCP 专属超时变量，验证时显式设置 `DREAMMATE_EMBEDDING_TIMEOUT_MS=30000` 并给整命令 `--timeout-ms 60000`。
 

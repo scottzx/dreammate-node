@@ -1,4 +1,4 @@
-/** Strictly validated configuration for provider advertisement priority and sharing. */
+/** Strictly validated provider advertisement and idle model lifetime configuration. */
 import { constants } from 'node:fs';
 import { open } from 'node:fs/promises';
 import os from 'node:os';
@@ -12,15 +12,21 @@ export function defaultConfigPath(home = os.homedir()) {
 
 export function validatePriorityConfig(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)
-    || Object.keys(value).some(key => !['version', 'priority', 'sharing'].includes(key))
+    || Object.keys(value).some(key => !['version', 'priority', 'sharing', 'idle_timeout_ms'].includes(key))
     || value.version !== 1 || typeof value.priority !== 'number'
     || !Number.isSafeInteger(value.priority) || value.priority < -1000 || value.priority > 1000) {
-    throw new Error('Embedding priority config requires version: 1 and an integer priority from -1000 to 1000; only optional sharing is supported');
+    throw new Error('Embedding priority config requires version: 1 and an integer priority from -1000 to 1000; only optional sharing and idle_timeout_ms are supported');
   }
   if (Object.hasOwn(value, 'sharing') && !['local', 'network'].includes(value.sharing)) {
     throw new Error('Embedding config sharing must be local or network');
   }
-  return { version: 1, priority: value.priority, ...(Object.hasOwn(value, 'sharing') ? { sharing: value.sharing } : {}) };
+  if (Object.hasOwn(value, 'idle_timeout_ms') && (typeof value.idle_timeout_ms !== 'number'
+      || !Number.isSafeInteger(value.idle_timeout_ms) || value.idle_timeout_ms < 1 || value.idle_timeout_ms > 86400000)) {
+    throw new Error('Embedding config idle_timeout_ms must be an integer from 1 to 86400000');
+  }
+  return { version: 1, priority: value.priority,
+    ...(Object.hasOwn(value, 'sharing') ? { sharing: value.sharing } : {}),
+    ...(Object.hasOwn(value, 'idle_timeout_ms') ? { idle_timeout_ms: value.idle_timeout_ms } : {}) };
 }
 
 /** Open without following symlinks or blocking on special files, then read a bounded snapshot. */

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import http, { type RequestListener } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import test, { type TestContext } from 'node:test';
+import { gunzipSync } from 'node:zlib';
 import { createAgent } from '../src/server.js';
 import { ServiceRegistry, type Registration } from '../src/registry.js';
 
@@ -60,6 +61,26 @@ test('embedding proxy exposes a localhost provider through only its registered g
   assert.deepEqual(f.received, [{ ...payload, model: 'qwen3' }]);
   response = await f.post({ model: 'qwen3', texts: ['one', 'two'], input_type: 'document' });
   assert.equal(response.status, 502, 'Upstream batch size must match the request');
+});
+
+test('embedding responses negotiate gzip and preserve the plain JSON contract', async t => {
+  const f = await fixture(t);
+  for (const encoding of ['gzip', 'gzip;q=0', 'identity']) {
+    const result = await new Promise<{ headers: http.IncomingHttpHeaders; body: Buffer }>((resolve, reject) => {
+      const request = http.request(`${f.base}/services/local-embedding/embed`, {
+        method: 'POST', headers: { 'content-type': 'application/json', 'accept-encoding': encoding },
+      }, response => {
+        const chunks: Buffer[] = [];
+        response.on('data', chunk => chunks.push(Buffer.from(chunk)));
+        response.on('end', () => resolve({ headers: response.headers, body: Buffer.concat(chunks) }));
+        response.on('error', reject);
+      });
+      request.on('error', reject);request.end(JSON.stringify(payload));
+    });
+    assert.equal(result.headers.vary, 'Accept-Encoding');
+    assert.equal(result.headers['content-encoding'], encoding === 'gzip' ? 'gzip' : undefined);
+    assert.deepEqual(JSON.parse((encoding === 'gzip' ? gunzipSync(result.body) : result.body).toString()), answer);
+  }
 });
 
 test('embedding proxy rejects absent, undeclared and malformed providers without forwarding', async t => {

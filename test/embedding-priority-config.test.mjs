@@ -19,6 +19,10 @@ test('priority config accepts only its version and bounded numeric integer prior
     const input = { version: 1, priority: 100, sharing };
     assert.deepEqual(validatePriorityConfig(input), input);
   }
+  for (const idle_timeout_ms of [1, 60000, 86400000]) {
+    const input = { version: 1, priority: 100, sharing: 'local', idle_timeout_ms };
+    assert.deepEqual(validatePriorityConfig(input), input);
+  }
   for (const value of [null, [], {}, { priority: 100 }, { version: 2, priority: 100 },
     { version: 1, priority: '100' }, { version: 1, priority: null }, { version: 1, priority: NaN },
     { version: 1, priority: Infinity }, { version: 1, priority: 0.5 }, { version: 1, priority: -1001 },
@@ -27,6 +31,9 @@ test('priority config accepts only its version and bounded numeric integer prior
   }
   for (const sharing of [undefined, null, '', 'lcoal', 'LOCAL', true, [], 0]) {
     assert.throws(() => validatePriorityConfig({ version: 1, priority: 100, sharing }), /sharing must be local or network/);
+  }
+  for (const idle_timeout_ms of [undefined, null, '', '60000', true, [], 0, -1, 86400001, 0.5, NaN, Infinity]) {
+    assert.throws(() => validatePriorityConfig({ version: 1, priority: 100, idle_timeout_ms }), /idle_timeout_ms must be an integer/);
   }
 });
 
@@ -39,6 +46,8 @@ test('priority config reads bounded regular JSON files and distinguishes absence
   assert.deepEqual(await readPriorityConfig(file), { version: 1, priority: 120 });
   await writeFile(file, '{"version":1,"priority":120,"sharing":"local"}\n');
   assert.deepEqual(await readPriorityConfig(file), { version: 1, priority: 120, sharing: 'local' });
+  await writeFile(file, '{"version":1,"priority":120,"sharing":"local","idle_timeout_ms":60000}\n');
+  assert.deepEqual(await readPriorityConfig(file), { version: 1, priority: 120, sharing: 'local', idle_timeout_ms: 60000 });
   for (const text of ['', 'not JSON', '{"version":1,"priority":100,"extra":true}', ' '.repeat(16385)]) {
     await writeFile(file, text);
     await assert.rejects(readPriorityConfig(file), /Invalid embedding priority config/);

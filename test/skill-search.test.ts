@@ -43,10 +43,13 @@ test('skill search shares semantic ranking for cross-language tasks and falls ba
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/embed`;
   try {
-    const result = await searchSkills([cad, visual], { query: '改善场景的灯光效果' }, { embeddingUrl: url });
+    const result = await searchSkills([cad, visual, { ...visual, node: 'second-mac' }], { query: '改善场景的灯光效果' }, { embeddingUrl: url });
     assert.equal((result.search as Record<string, unknown>).mode, 'hybrid');
     assert.equal((result.results as DiscoveredSkill[])[0]!.id, visual.id);
     assert.ok(documentBatches.flat().every(text => text.startsWith('Skill: ')));
+    assert.equal(documentBatches.flat().length, 2, 'replicas must download each summary vector only once');
+    assert.deepEqual(new Set((result.results as DiscoveredSkill[]).filter(card => card.id === visual.id).map(card => card.node)),
+      new Set(['mac', 'second-mac']));
     // Metadata vectors are reusable, while a fresh query still checks provider availability.
     unavailable = true;
     const fallback = await searchSkills([cad, visual], { query: 'DXF' }, { embeddingUrl: url });

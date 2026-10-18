@@ -75,7 +75,7 @@ test('on-demand CLI defaults and strict validation do not touch model processes'
   assert.equal(options.priority, 100); assert.equal(options.port, 8766);
   assert.equal(options.sharing, 'network');
   assert.equal(parseOptions(['--sharing', 'local']).sharing, 'local');
-  assert.equal(options.device, 'auto'); assert.equal(options.idleTimeoutMs, 300000);
+  assert.equal(options.device, 'auto'); assert.equal(options.idleTimeoutMs, 60000);
   assert.equal(options.config, defaultConfigPath());
   assert.equal(options.register, true);
   assert.equal(parseOptions(['--no-register', '--device', 'mps', '--batch-size', '8']).register, false);

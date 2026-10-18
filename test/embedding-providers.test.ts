@@ -50,6 +50,31 @@ test('advertisement parsing validates versions, dimensions, encoding and bounded
   assert.equal(parseEmbeddingAdvertisement(service({}, { dimensions: 4096, priority: 1000 }))?.priority, 1000);
 });
 
+test('only validated on-demand advertisements can extend the cold-start budget', () => {
+  const registered = service({}, { lifecycle: 'on_demand', cold_start_timeout_ms: 60000 });
+  assert.deepEqual(parseEmbeddingAdvertisement(registered), {
+    ...parseEmbeddingAdvertisement(service()), lifecycle: 'on_demand', coldStartTimeoutMs: 60000,
+  });
+  assert.deepEqual(discoverEmbeddingProviders([registered]), [{
+    ...discoverEmbeddingProviders([service()])[0], lifecycle: 'on_demand', coldStartTimeoutMs: 60000,
+  }]);
+  assert.equal(parseEmbeddingAdvertisement(service({}, { lifecycle: 'on_demand', cold_start_timeout_ms: 1 }))?.coldStartTimeoutMs, 1);
+  assert.equal(parseEmbeddingAdvertisement(service({}, { lifecycle: 'on_demand' }))?.coldStartTimeoutMs, undefined);
+  assert.deepEqual(parseEmbeddingAdvertisement(service({}, { lifecycle: 'resident' })), parseEmbeddingAdvertisement(service()),
+    'unrelated lifecycle metadata does not change ordinary advertisements');
+  for (const cold_start_timeout_ms of [0, -1, 60001, 1.5, NaN, Infinity, '60000', null, true]) {
+    const invalid = service({}, { lifecycle: 'on_demand', cold_start_timeout_ms });
+    assert.equal(parseEmbeddingAdvertisement(invalid), undefined);
+    assert.deepEqual(discoverEmbeddingProviders([invalid]), []);
+  }
+  for (const lifecycle of [undefined, 'resident', '', null]) {
+    assert.equal(parseEmbeddingAdvertisement(service({}, { lifecycle, cold_start_timeout_ms: 60000 })), undefined);
+  }
+  assert.deepEqual(discoverEmbeddingProviders([service({}, {
+    model: 'embeddinggemma2', lifecycle: 'on_demand', cold_start_timeout_ms: 60000,
+  })]), [], 'cold-start metadata cannot expand the model allowlist');
+});
+
 test('automatic endpoints come only from scanned private gateways and encode the service ID', () => {
   const registered = service({ id: 'embedding/model #1', gateway_url: 'http://127.0.0.1:36908/' }, {
     url: 'https://external.example/embed', endpoint: 'http://100.64.0.99:8888/embed',

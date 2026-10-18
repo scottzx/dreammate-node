@@ -31,6 +31,7 @@ export function parseOptions(argv, cwd = process.cwd()) {
     agent: { type: 'string', default: 'http://127.0.0.1:36908' },
     priority: { type: 'string', default: '0' }, python: { type: 'string' }, manifest: { type: 'string' },
     'batch-size': { type: 'string' },
+    'restore-document-cache': { type: 'string' },
   } });
   if (!MODELS.has(values.model)) throw new Error('--model must be qwen3');
   const port = Number(values.port), priority = Number(values.priority);
@@ -42,6 +43,7 @@ export function parseOptions(argv, cwd = process.cwd()) {
   }
   if (values.python !== undefined && !values.python.trim()) throw new Error('--python cannot be empty');
   if (values.manifest !== undefined && !values.manifest.trim()) throw new Error('--manifest cannot be empty');
+  if (values['restore-document-cache'] !== undefined && !values['restore-document-cache'].trim()) throw new Error('--restore-document-cache cannot be empty');
   const batchSize = values['batch-size'] === undefined ? undefined : Number(values['batch-size']);
   if (batchSize !== undefined && (!/^\d+$/.test(values['batch-size']) || !Number.isSafeInteger(batchSize) || batchSize < 1 || batchSize > 64)) {
     throw new Error('--batch-size must be an integer from 1 to 64');
@@ -49,6 +51,7 @@ export function parseOptions(argv, cwd = process.cwd()) {
   return { model: values.model, port, priority, agent: localAgentUrl(values.agent),
     python: values.python ?? path.join(REPO_ROOT, '.local/tool-search/venv/bin/python'),
     manifest: values.manifest ? path.resolve(cwd, values.manifest) : path.join(REPO_ROOT, '.local/tool-search/manifest.json'),
+    ...(values['restore-document-cache'] === undefined ? {} : { restoreDocumentCache: path.resolve(cwd, values['restore-document-cache']) }),
     ...(batchSize === undefined ? {} : { batchSize }) };
 }
 
@@ -122,6 +125,7 @@ export function launchProvider(options, deps = {}) {
   const now = deps.now ?? Date.now, log = deps.log ?? (message => process.stderr.write(`${message}\n`));
   const child = spawnChild(options.python, [SERVER_PATH, '--manifest', options.manifest, '--host', '127.0.0.1',
     '--port', String(options.port), '--serve-model', options.model, '--warmup', options.model,
+    ...(options.restoreDocumentCache ? ['--restore-document-cache', options.restoreDocumentCache] : []),
     ...(options.batchSize === undefined ? [] : ['--batch-size', String(options.batchSize)])],
   { cwd: REPO_ROOT, stdio: ['ignore', 'inherit', 'inherit'], shell: false });
   const healthUrl = `http://127.0.0.1:${options.port}/health`;

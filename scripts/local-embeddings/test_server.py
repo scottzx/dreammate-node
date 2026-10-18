@@ -46,7 +46,7 @@ class AdapterTest(unittest.TestCase):
     def use_fake(self):
         def load(alias):
             self.encoder.current = alias
-            return f"{alias}@fixture-sha"
+            return f"{alias}@{self.encoder.models[alias]['revision']}"
         self.encoder.load = load
 
     def test_provider_is_advertised_only_after_successful_encoding_with_actual_profile(self):
@@ -178,13 +178,65 @@ class AdapterTest(unittest.TestCase):
     def test_document_cache_isolates_model_revisions(self):
         self.use_fake()
         self.encoder.encode("qwen3", ["same text"], "document")
-        self.encoder.load = lambda alias: f"{alias}@new-sha"
+        self.encoder.models['qwen3']['revision'] = 'new-sha'
         self.encoder.encode("qwen3", ["same text"], "document")
         self.assertEqual(len(self.fake.calls), 2)
-        self.use_fake()
+        self.encoder.models['qwen3']['revision'] = 'fixture-sha'
         self.encoder.encode("qwen3", ["same text"], "document")
         self.assertEqual(len(self.fake.calls), 2)
         self.assertEqual(len(self.encoder.document_cache), 2)
+
+    def test_cached_documents_return_while_query_is_still_running(self):
+        self.use_fake()
+        original = self.encoder.encode('qwen3', ['cached document'], 'document')
+        entered, release, answered = threading.Event(), threading.Event(), threading.Event()
+        original_encode = self.fake.encode
+        responses, errors = [], []
+        def slow_encode(inputs, **kwargs):
+            entered.set()
+            if not release.wait(3):
+                raise RuntimeError('test did not release inference')
+            return original_encode(inputs, **kwargs)
+        self.fake.encode = slow_encode
+        def query():
+            try: self.encoder.encode('qwen3', ['slow query'], 'query')
+            except Exception as error: errors.append(error)
+        def cached():
+            try: responses.append(self.encoder.encode('qwen3', ['cached document'], 'document'))
+            except Exception as error: errors.append(error)
+            finally: answered.set()
+        busy = threading.Thread(target=query);busy.start()
+        self.assertTrue(entered.wait(1))
+        hit = threading.Thread(target=cached);hit.start()
+        try:
+            self.assertTrue(answered.wait(.5), 'cache hit waited behind model inference')
+            self.assertTrue(busy.is_alive())
+            self.assertEqual(responses, [original])
+        finally:
+            release.set();busy.join(2);hit.join(2)
+        self.assertEqual(errors, [])
+
+    def test_concurrent_document_misses_encode_once(self):
+        self.use_fake()
+        entered, release = threading.Event(), threading.Event()
+        original_encode = self.fake.encode
+        def slow_encode(inputs, **kwargs):
+            entered.set()
+            if not release.wait(3): raise RuntimeError('test did not release inference')
+            return original_encode(inputs, **kwargs)
+        self.fake.encode = slow_encode
+        responses, errors = [], []
+        def request():
+            try: responses.append(self.encoder.encode('qwen3', ['same missing document'], 'document'))
+            except Exception as error: errors.append(error)
+        first = threading.Thread(target=request);first.start()
+        self.assertTrue(entered.wait(1))
+        second = threading.Thread(target=request);second.start()
+        release.set();first.join(2);second.join(2)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(responses), 2)
+        self.assertEqual(responses[0], responses[1])
+        self.assertEqual(self.fake.calls, [['same missing document']])
 
     def test_document_cache_evicts_least_recently_used_entries(self):
         self.use_fake()

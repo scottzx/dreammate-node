@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { searchTools } from '../src/tool-search.js';
+import { embeddingSearchTimeoutMs, searchTools } from '../src/tool-search.js';
 import type { EmbeddingProvider } from '../src/embedding-providers.js';
 import type { RegisteredService } from '../src/registry.js';
 
@@ -35,6 +35,60 @@ function request(rawUrl: unknown, init?: RequestInit): RecordedRequest {
 
 const resultsOf = (value: Record<string, unknown>) => value.results as { method: string; semantic_score?: number }[];
 const searchOf = (value: Record<string, unknown>) => value.search as Record<string, any>;
+
+test('cold-start search budgets preserve explicit settings and the ordinary 5-second default', () => {
+  const cold = { lifecycle: 'on_demand' as const, coldStartTimeoutMs: 60000 };
+  // Keep these expectations independent of the shell's explicit timeout setting.
+  const previous = process.env.DREAMMATE_EMBEDDING_TIMEOUT_MS;
+  delete process.env.DREAMMATE_EMBEDDING_TIMEOUT_MS;
+  try {
+    assert.equal(embeddingSearchTimeoutMs({}), 5000);
+    assert.equal(embeddingSearchTimeoutMs({}, {}), 5000);
+    assert.equal(embeddingSearchTimeoutMs({}, { coldStartTimeoutMs: 60000 }), 5000);
+    assert.equal(embeddingSearchTimeoutMs({}, { lifecycle: 'on_demand' }), 5000);
+    assert.equal(embeddingSearchTimeoutMs({}, cold), 60000);
+    assert.equal(embeddingSearchTimeoutMs({ embeddingTimeoutMs: 1234 }, cold), 1234);
+    assert.equal(embeddingSearchTimeoutMs({}, cold, '2345'), 2345);
+    assert.equal(embeddingSearchTimeoutMs({ embeddingTimeoutMs: 1234 }, cold, '2345'), 1234);
+    for (const invalid of [0, -1, 60001, 1.5, NaN, Infinity]) {
+      assert.equal(embeddingSearchTimeoutMs({}, { lifecycle: 'on_demand', coldStartTimeoutMs: invalid }), 5000);
+      assert.throws(() => embeddingSearchTimeoutMs({ embeddingTimeoutMs: invalid }, cold), /1–60000/);
+    }
+    for (const invalid of ['', 'invalid', '0', '60001', '1.5']) {
+      assert.throws(() => embeddingSearchTimeoutMs({}, cold, invalid), /1–60000/);
+    }
+  } finally {
+    if (previous === undefined) delete process.env.DREAMMATE_EMBEDDING_TIMEOUT_MS;
+    else process.env.DREAMMATE_EMBEDDING_TIMEOUT_MS = previous;
+  }
+});
+
+test('the first on-demand provider gets its advertised shared budget after more than 5 seconds elapse', async t => {
+  const previous = process.env.DREAMMATE_EMBEDDING_TIMEOUT_MS;
+  delete process.env.DREAMMATE_EMBEDDING_TIMEOUT_MS;
+  t.after(() => {
+    if (previous === undefined) delete process.env.DREAMMATE_EMBEDDING_TIMEOUT_MS;
+    else process.env.DREAMMATE_EMBEDDING_TIMEOUT_MS = previous;
+  });
+  let clock = 0;
+  t.mock.method(performance, 'now', () => (clock += 6000));
+  const first = { ...provider('cold-budget-first'), lifecycle: 'on_demand' as const, coldStartTimeoutMs: 60000 };
+  const backup = provider('cold-budget-backup');
+  const endpoints: string[] = [];
+  t.mock.method(globalThis, 'fetch', async (rawUrl: unknown, init?: RequestInit) => {
+    const recorded = request(rawUrl, init);
+    endpoints.push(recorded.endpoint);
+    return Response.json(response(first, recorded.body));
+  });
+  const result = await searchTools(corpus(3), { query: '查找知识库中保存的实体' }, { embeddingProviders: [first, backup] });
+  assert.equal(searchOf(result).semantic_status, 'ok');
+  assert.ok(endpoints.length > 0);
+  assert.ok(endpoints.every(endpoint => endpoint === first.endpoint));
+  const ordinary = await searchTools(corpus(3), { query: '音频' }, { embeddingProviders: [backup, first] });
+  assert.equal(searchOf(ordinary).semantic_status, 'unavailable');
+  assert.deepEqual(searchOf(ordinary).provider_attempts, []);
+  assert.ok(endpoints.every(endpoint => endpoint === first.endpoint), 'a backup cannot extend the first ordinary provider’s default budget');
+});
 
 test('no discovered provider keeps lexical retrieval bounded without making model requests', async t => {
   const fetch = t.mock.method(globalThis, 'fetch', () => { throw new Error('no provider must mean no embedding request'); });

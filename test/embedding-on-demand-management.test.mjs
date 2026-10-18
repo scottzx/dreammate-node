@@ -31,6 +31,7 @@ function fixture(t) {
       calls.push([command, ...args]);
       assert.equal(command, 'launchctl');
       if (args[0] === 'print') {
+        state.onPrint?.();
         if (state.printFailure) throw state.printFailure;
         if (!state.loaded) throw absent();
         return { stdout: `path = ${state.loadedPath}\nstate = running\n` };
@@ -38,6 +39,7 @@ function fixture(t) {
       if (args[0] === 'bootout') {
         if (state.bootoutFailure) throw state.bootoutFailure;
         state.loaded = false;
+        state.onBootout?.();
         return { stdout: '' };
       }
       if (args[0] === 'bootstrap') {
@@ -52,12 +54,13 @@ function fixture(t) {
           throw Object.assign(new Error('bootstrap transient failure'), { stderr: 'Bootstrap failed: 5: Input/output error\nTry running the command as root for richer errors.\n' });
         }
         state.loaded = true;
+        state.onBootstrap?.();
         return { stdout: '' };
       }
       throw new Error(`unexpected command: ${args.join(' ')}`);
     },
     fetch: async () => { throw new Error('fixture: no HTTP service'); },
-    sleep: async milliseconds => { state.sleeps.push(milliseconds); },
+    sleep: async milliseconds => { state.sleeps.push(milliseconds); state.onSleep?.(milliseconds); },
   };
   return { home, file, python, script, manifest, options: { python, manifest }, ctx, calls, state };
 }
@@ -68,7 +71,7 @@ test('renders direct absolute launchd arguments, escapes paths, preserves only P
   assert.match(content, /<key>RunAtLoad<\/key><true\/>/);
   assert.match(content, /<key>KeepAlive<\/key><true\/>/);
   assert.match(content, /<key>ProcessType<\/key><string>Interactive<\/string>/);
-  assert.match(content, /--idle-timeout-ms<\/string><string>300000/);
+  assert.match(content, /--idle-timeout-ms<\/string><string>60000/);
   assert.match(content, /--priority<\/string><string>100/);
   assert.match(content, /--sharing<\/string><string>network/);
   assert.ok(content.includes(`<string>${path.join(f.home, '.1agents', 'embedding-config.json')}</string>`));
@@ -99,17 +102,59 @@ test('validates all install inputs before touching process manager or service fi
   assert.throws(() => renderServicePlist(f.options, { ...f.ctx, platform: 'linux' }), /不支持/);
 });
 
+test('dual-model installation writes validated direct arguments and accepts prepared manifests without running Python', t => {
+  const f = fixture(t);
+  const gemmaManifest = path.join(f.home, 'prepared gemma & vision.json');
+  fs.writeFileSync(gemmaManifest, '{"format":1,"models":{"embeddinggemma2":{"path":"/prepared/model","revision":"offline"}}}');
+  const options = { ...f.options, gemmaPython: f.python, gemmaManifest, mediaRoot: f.home };
+  const content = renderServicePlist(options, f.ctx);
+  for (const [flag, value] of [
+    ['gemma-port', 8767], ['gemma-modalities', 'vision'], ['gemma-max-length', 2048], ['mps-limit-mb', 4096],
+  ]) assert.ok(content.includes(`<string>--${flag}</string><string>${value}</string>`));
+  assert.match(content, /--gemma-python<\/string><string>/);
+  assert.match(content, /prepared gemma &amp; vision\.json/);
+  assert.ok(content.includes(`<string>--media-root</string><string>${f.home}</string>`));
+  const custom = renderServicePlist({ ...options, gemmaPort: 8799, gemmaModalities: 'all', gemmaMaxLength: 4096, mpsLimitMb: 8192 }, f.ctx);
+  for (const [flag, value] of [
+    ['gemma-port', 8799], ['gemma-modalities', 'all'], ['gemma-max-length', 4096], ['mps-limit-mb', 8192],
+  ]) assert.ok(custom.includes(`<string>--${flag}</string><string>${value}</string>`));
+  assert.ok(!renderServicePlist(f.options, f.ctx).includes('--gemma-'));
+  assert.deepEqual(f.calls, []);
+});
+
+test('Gemma validation rejects incomplete paths, unsafe paths, conflicting ports and invalid limits before launchd', async t => {
+  const f = fixture(t);
+  const gemma = { gemmaPython: f.python, gemmaManifest: f.manifest, mediaRoot: f.home };
+  for (const invalid of [
+    { gemmaPython: f.python }, { gemmaManifest: f.manifest }, { mediaRoot: f.home }, { gemmaPort: 8767 },
+    { ...gemma, gemmaPython: 'python3' }, { ...gemma, gemmaManifest: 'manifest.json' }, { ...gemma, mediaRoot: '.' },
+    { ...gemma, gemmaPython: path.join(f.home, 'absent') }, { ...gemma, gemmaManifest: f.home },
+    { ...gemma, mediaRoot: f.manifest }, { ...gemma, mediaRoot: path.join(f.home, 'absent') },
+    { ...gemma, gemmaPort: 8766 }, { ...gemma, gemmaPort: 0 }, { ...gemma, gemmaPort: 65536 },
+    { ...gemma, gemmaModalities: 'image' }, { ...gemma, gemmaModalities: 'vision\nextra' },
+    { ...gemma, gemmaMaxLength: 1023 }, { ...gemma, gemmaMaxLength: 8193 },
+    { ...gemma, mpsLimitMb: 1023 }, { ...gemma, mpsLimitMb: 16385 },
+  ]) await assert.rejects(installService({ ...f.options, ...invalid }, f.ctx));
+  const nonExecutable = path.join(f.home, 'not-executable');
+  fs.writeFileSync(nonExecutable, 'not executable', { mode: 0o600 });
+  await assert.rejects(installService({ ...f.options, ...gemma, gemmaPython: nonExecutable }, f.ctx));
+  assert.equal(fs.existsSync(f.file), false);
+  assert.deepEqual(f.calls, []);
+});
+
 test('install starts only supervisor and writes private plist, then replaces its own job', async t => {
   const f = fixture(t);
   const installed = await installService(f.options, f.ctx);
   assert.equal(installed.installed, true);
-  assert.equal(installed.idleTimeoutMs, 300000);
+  assert.equal(installed.idleTimeoutMs, 60000);
+  assert.equal(installed.effectiveIdleTimeoutMs, 60000);
+  assert.equal(installed.fallbackIdleTimeoutMs, 60000);
   assert.equal(fs.statSync(f.file).mode & 0o777, 0o600);
   assert.equal(f.state.loaded, true);
-  assert.deepEqual(f.calls.map(call => call[1]), ['print', 'bootstrap']);
+  assert.deepEqual(f.calls.map(call => call[1]), ['print', 'bootstrap', 'print', 'print']);
   f.calls.length = 0;
   await installService({ ...f.options, port: 8767 }, f.ctx);
-  assert.deepEqual(f.calls.map(call => call[1]), ['print', 'bootout', 'bootstrap']);
+  assert.deepEqual(f.calls.map(call => call[1]), ['print', 'bootout', 'print', 'bootstrap', 'print', 'print']);
   assert.match(fs.readFileSync(f.file, 'utf8'), /--port<\/string><string>8767/);
 });
 
@@ -122,7 +167,7 @@ test('failed update restores old plist and old running job', async t => {
   await assert.rejects(installService({ ...f.options, port: 8767 }, f.ctx), /bootstrap failed/);
   assert.equal(fs.readFileSync(f.file, 'utf8'), previous);
   assert.equal(f.state.loaded, true);
-  assert.deepEqual(f.calls.map(call => call[1]), ['print', 'bootout', 'bootstrap', 'print', 'bootstrap']);
+  assert.deepEqual(f.calls.map(call => call[1]), ['print', 'bootout', 'print', 'bootstrap', 'print', 'bootstrap', 'print', 'print']);
 });
 
 test('failed first install removes new plist; incomplete rollback is explicit', async t => {
@@ -144,16 +189,16 @@ test('a bootstrap that loads a job before failing is safely retired before rollb
   await assert.rejects(installService(f.options, f.ctx), /bootstrap failed/);
   assert.equal(f.state.loaded, false);
   assert.equal(fs.existsSync(f.file), false);
-  assert.deepEqual(f.calls.map(call => call[1]), ['print', 'bootstrap', 'print', 'bootout']);
+  assert.deepEqual(f.calls.map(call => call[1]), ['print', 'bootstrap', 'print', 'bootout', 'print']);
 });
 
 test('transient launchd retirement errors retry only while the managed job is absent', async t => {
   const f = fixture(t);
   f.state.transientBootstrap = 3;
   await installService(f.options, f.ctx);
-  assert.deepEqual(f.state.sleeps, [200, 500, 1000]);
+  assert.deepEqual(f.state.sleeps, [200, 500, 1000, 150]);
   assert.equal(f.state.loaded, true);
-  assert.deepEqual(f.calls.map(call => call[1]), ['print', 'bootstrap', 'print', 'bootstrap', 'print', 'bootstrap', 'print', 'bootstrap']);
+  assert.deepEqual(f.calls.map(call => call[1]), ['print', 'bootstrap', 'print', 'bootstrap', 'print', 'bootstrap', 'print', 'bootstrap', 'print', 'print']);
 });
 
 test('rollback uses the same bounded retirement retries without hiding the original error', async t => {
@@ -166,7 +211,7 @@ test('rollback uses the same bounded retirement retries without hiding the origi
     assert.equal(error.message, 'bootstrap failed');
     return true;
   });
-  assert.deepEqual(f.state.sleeps, [200, 500]);
+  assert.deepEqual(f.state.sleeps, [150, 200, 500, 150]);
   assert.equal(f.state.loaded, true);
   assert.equal(fs.readFileSync(f.file, 'utf8'), previous);
 });
@@ -177,8 +222,103 @@ test('transient failure is accepted only when the expected managed job actually 
   f.state.partialBootstrap = true;
   await installService(f.options, f.ctx);
   assert.equal(f.state.loaded, true);
-  assert.deepEqual(f.state.sleeps, []);
-  assert.deepEqual(f.calls.map(call => call[1]), ['print', 'bootstrap', 'print']);
+  assert.deepEqual(f.state.sleeps, [150]);
+  assert.deepEqual(f.calls.map(call => call[1]), ['print', 'bootstrap', 'print', 'print']);
+});
+
+test('bootstrap exit zero does not count as installed until the owned job remains loaded', async t => {
+  const f = fixture(t);
+  let starts = 0;
+  f.state.onBootstrap = () => { if (++starts === 1) f.state.loaded = false; };
+  await installService(f.options, f.ctx);
+  assert.equal(starts, 2);
+  assert.equal(f.state.loaded, true);
+  assert.deepEqual(f.state.sleeps, [200, 150]);
+  assert.deepEqual(f.calls.map(call => call[1]), ['print', 'bootstrap', 'print', 'bootstrap', 'print', 'print']);
+});
+
+test('a briefly present job that vanishes during confirmation is bootstrapped again', async t => {
+  const f = fixture(t);
+  let checks = 0;
+  f.state.onSleep = milliseconds => { if (milliseconds === 150 && checks++ === 0) f.state.loaded = false; };
+  await installService(f.options, f.ctx);
+  assert.equal(f.state.loaded, true);
+  assert.equal(f.calls.filter(call => call[1] === 'bootstrap').length, 2);
+  assert.deepEqual(f.state.sleeps, [150, 200, 150]);
+});
+
+test('transient exit five and a briefly loaded job use the same stable confirmation as exit zero', async t => {
+  const f = fixture(t);
+  f.state.transientBootstrap = 1;
+  f.state.partialBootstrap = true;
+  let checks = 0;
+  f.state.onSleep = milliseconds => { if (milliseconds === 150 && checks++ === 0) f.state.loaded = false; };
+  await installService(f.options, f.ctx);
+  assert.equal(f.state.loaded, true);
+  assert.equal(f.calls.filter(call => call[1] === 'bootstrap').length, 2);
+  assert.deepEqual(f.state.sleeps, [150, 200, 150]);
+});
+
+test('repeated successful bootstrap acknowledgements with no job fail within the retry budget and roll back', async t => {
+  const f = fixture(t);
+  await installService(f.options, f.ctx);
+  const previous = fs.readFileSync(f.file, 'utf8');
+  f.calls.length = 0;
+  f.state.sleeps.length = 0;
+  let starts = 0;
+  f.state.onBootstrap = () => { if (++starts <= 4) f.state.loaded = false; };
+  await assert.rejects(installService({ ...f.options, port: 8799 }, f.ctx), /加载后未保持运行/);
+  assert.equal(starts, 5);
+  assert.equal(fs.readFileSync(f.file, 'utf8'), previous);
+  assert.equal(f.state.loaded, true);
+  assert.deepEqual(f.state.sleeps, [200, 500, 1000, 150]);
+});
+
+test('replacement waits for asynchronous bootout retirement before writing and bootstrapping', async t => {
+  const f = fixture(t);
+  await installService(f.options, f.ctx);
+  const previous = fs.readFileSync(f.file, 'utf8');
+  f.calls.length = 0;
+  f.state.sleeps.length = 0;
+  let remaining = 0;
+  f.state.onBootout = () => { remaining = 3; f.state.loaded = true; };
+  f.state.onPrint = () => {
+    if (remaining > 0) {
+      assert.equal(fs.readFileSync(f.file, 'utf8'), previous);
+      if (--remaining === 0) f.state.loaded = false;
+    }
+  };
+  await installService({ ...f.options, port: 8799 }, f.ctx);
+  assert.deepEqual(f.state.sleeps, [100, 100, 150]);
+  assert.deepEqual(f.calls.map(call => call[1]), ['print', 'bootout', 'print', 'print', 'print', 'bootstrap', 'print', 'print']);
+  assert.match(fs.readFileSync(f.file, 'utf8'), /--port<\/string><string>8799/);
+});
+
+test('bootout retirement timeout never overwrites the prior plist and retains the original failure', async t => {
+  const f = fixture(t);
+  await installService(f.options, f.ctx);
+  const previous = fs.readFileSync(f.file, 'utf8');
+  f.calls.length = 0;
+  f.state.sleeps.length = 0;
+  f.state.onBootout = () => { f.state.loaded = true; };
+  await assert.rejects(installService({ ...f.options, port: 8799 }, f.ctx), /停止后仍未退出/);
+  assert.equal(fs.readFileSync(f.file, 'utf8'), previous);
+  assert.equal(f.state.loaded, true);
+  assert.equal(f.state.sleeps.filter(milliseconds => milliseconds === 100).length, 29);
+});
+
+test('changed plist or foreign loaded path during confirmation is never accepted as a successful activation', async t => {
+  for (const change of ['plist', 'path']) {
+    const f = fixture(t);
+    f.state.onSleep = milliseconds => {
+      if (milliseconds !== 150) return;
+      if (change === 'plist') fs.appendFileSync(f.file, '\n<!-- concurrent change -->');
+      else f.state.loadedPath = path.join(f.home, 'foreign.plist');
+    };
+    await assert.rejects(installService(f.options, f.ctx), change === 'plist' ? /服务配置已变化/ : /同名 launchd/);
+    assert.equal(f.calls.filter(call => call[1] === 'bootstrap').length, 1);
+    if (change === 'path') assert.equal(f.calls.filter(call => call[1] === 'bootout').length, 0);
+  }
 });
 
 test('persistent transient errors exhaust the short retry budget and retain failure semantics', async t => {
@@ -251,6 +391,7 @@ test('config is read only when priority is omitted and reports startup fallback 
   assert.deepEqual(result, {
     file: path.join(f.home, '.1agents', 'embedding-config.json'), priority: 100, fallbackPriority: 100,
     sharing: 'network', fallbackSharing: 'network',
+    idleTimeoutMs: 60000, fallbackIdleTimeoutMs: 60000,
     source: 'startup', reloadIntervalMs: 15000, updated: false,
   });
   assert.equal(fs.existsSync(path.join(f.home, '.1agents')), false);
@@ -329,6 +470,54 @@ test('sharing updates preserve effective priority and priority-only updates pres
   assert.equal(status.configuration.fallbackSharing, 'local');
   assert.equal(fs.readFileSync(f.file, 'utf8'), plist);
   assert.ok(f.calls.every(call => call[1] === 'print'));
+});
+
+test('idle timeout configuration preserves priority and sharing, reports effective and fallback values without restarting', async t => {
+  const f = fixture(t);
+  const config = path.join(f.home, 'idle-config.json');
+  fs.writeFileSync(config, '{"version":1,"priority":-10,"sharing":"local","idle_timeout_ms":45000}');
+  const installed = await installService({ ...f.options, config, idleTimeoutMs: 120000, priority: 100, sharing: 'network' }, f.ctx);
+  assert.equal(installed.idleTimeoutMs, 120000);
+  assert.equal(installed.effectiveIdleTimeoutMs, 45000);
+  assert.equal(installed.fallbackIdleTimeoutMs, 120000);
+  const plist = fs.readFileSync(f.file, 'utf8');
+  f.calls.length = 0;
+  const updated = await configurePriority({ idleTimeoutMs: '60000' }, f.ctx);
+  assert.deepEqual(updated.config, { version: 1, priority: -10, sharing: 'local', idle_timeout_ms: 60000 });
+  assert.equal(updated.idleTimeoutMs, 60000);
+  assert.equal(updated.fallbackIdleTimeoutMs, 120000);
+  assert.equal(updated.updated, true);
+  assert.deepEqual((await configurePriority({ priority: 25 }, f.ctx)).config,
+    { version: 1, priority: 25, sharing: 'local', idle_timeout_ms: 60000 });
+  assert.deepEqual((await configurePriority({ sharing: 'network' }, f.ctx)).config,
+    { version: 1, priority: 25, sharing: 'network', idle_timeout_ms: 60000 });
+  assert.deepEqual(f.calls, []);
+  const status = await serviceStatus({}, f.ctx);
+  assert.equal(status.configuration.idleTimeoutMs, 60000);
+  assert.equal(status.configuration.fallbackIdleTimeoutMs, 120000);
+  assert.equal(fs.readFileSync(f.file, 'utf8'), plist);
+  assert.equal(f.state.loaded, true);
+  assert.ok(f.calls.every(call => call[1] === 'print'));
+});
+
+test('legacy config retains installed idle fallback and invalid idle changes preserve files and permissions', async t => {
+  const f = fixture(t);
+  const config = path.join(f.home, 'idle-config.json');
+  fs.writeFileSync(config, '{"version":1,"priority":20,"sharing":"local"}');
+  await installService({ ...f.options, config, idleTimeoutMs: 300000 }, f.ctx);
+  assert.equal((await configurePriority({}, f.ctx)).idleTimeoutMs, 300000);
+  assert.deepEqual((await configurePriority({ priority: 30 }, f.ctx)).config,
+    { version: 1, priority: 30, sharing: 'local' });
+  const original = fs.readFileSync(config, 'utf8');
+  f.calls.length = 0;
+  for (const idleTimeoutMs of [0, -1, 86400001, '0.5', '', true, null]) {
+    await assert.rejects(configurePriority({ idleTimeoutMs }, f.ctx), /整数/);
+    assert.equal(fs.readFileSync(config, 'utf8'), original);
+  }
+  const missing = path.join(f.home, 'not-created', 'config.json');
+  await assert.rejects(configurePriority({ config: missing, idleTimeoutMs: 0 }, f.ctx), /整数/);
+  assert.equal(fs.existsSync(path.dirname(missing)), false);
+  assert.deepEqual(f.calls, []);
 });
 
 test('old config and plist retain sharing fallback and only present JSON fields override startup arguments', async t => {
@@ -436,6 +625,11 @@ test('CLI parses separate arguments and rejects unsupported options and missing 
   assert.deepEqual(parseArgs(['config', '--priority', '-30', '--config', '/selected.json']), { command: 'config', options: { priority: '-30', config: '/selected.json' } });
   assert.deepEqual(parseArgs(['config']), { command: 'config', options: {} });
   assert.deepEqual(parseArgs(['config', '--sharing', 'local']), { command: 'config', options: { sharing: 'local' } });
+  assert.deepEqual(parseArgs(['config', '--idle-timeout-ms', '60000']), { command: 'config', options: { idleTimeoutMs: '60000' } });
+  assert.deepEqual(parseArgs(['install', '--gemma-python', '/python', '--gemma-manifest', '/manifest', '--media-root', '/media',
+    '--gemma-port', '8767', '--gemma-modalities', 'vision', '--gemma-max-length', '2048', '--mps-limit-mb', '4096']).options,
+  { gemmaPython: '/python', gemmaManifest: '/manifest', mediaRoot: '/media', gemmaPort: '8767',
+    gemmaModalities: 'vision', gemmaMaxLength: '2048', mpsLimitMb: '4096' });
   assert.deepEqual(parseArgs(['install', '--sharing', 'network']).options, { sharing: 'network' });
   assert.equal(parseArgs(['status', '--config', '/selected.json']).options.config, '/selected.json');
   assert.equal(parseArgs([]).command, 'help');
@@ -447,4 +641,7 @@ test('CLI parses separate arguments and rejects unsupported options and missing 
   assert.throws(() => parseArgs(['status', '--priority', '5']), /不支持参数/);
   assert.throws(() => parseArgs(['status', '--sharing', 'local']), /不支持参数/);
   assert.throws(() => parseArgs(['config', '--sharing']), /缺少值/);
+  assert.throws(() => parseArgs(['config', '--idle-timeout-ms']), /缺少值/);
+  assert.throws(() => parseArgs(['config', '--gemma-python', '/python']), /不支持参数/);
+  assert.throws(() => parseArgs(['status', '--gemma-port', '8767']), /不支持参数/);
 });
