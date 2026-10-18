@@ -178,3 +178,12 @@ npm run test:python
 ## 独立发布
 
 版本维护在本目录的 `package.json` 与 `CHANGELOG.md`。推送 `artifact-index-v<version>` tag 后，独立 workflow 在 Node 22.13/24 验证包、解析器和独立安装，再发布已测试的 tarball。DreamMate Node 使用自己的 `v<version>` tag，两者没有 npm 运行时依赖关系；本版的文档向量能力需要模型设备上的 Node 调度器至少为 `0.14.0`。
+
+
+### Explicit text vector spaces
+
+`client.getTextProfile('qwen3' | 'embeddinggemma2')` inspects a selected provider without loading weights.
+`client.embedDocuments(texts, profile)` encodes documents in exactly that profile, while
+`client.embedQuery(query, profile)` uses query formatting. Both reject model/revision/dimension/task
+mismatches; they do not change to another model on failure. Existing `embedText()` remains Qwen-only.
+These additive APIs are source changes until a new package release is published.

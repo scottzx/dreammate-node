@@ -153,3 +153,36 @@ test('aborting a shared-provider request closes it and pre-aborted calls never d
   await assert.rejects(f.client.getProfile('text', { signal: controller.signal }), /abort/i);
   assert.equal(f.calls.length, count);
 });
+
+
+test('explicit document profiles support Qwen and Gemma without query/document confusion', async t => {
+  const f = await fixture(t);
+  for (const alias of ['qwen3', 'embeddinggemma2']) {
+    const profile = await f.client.getTextProfile(alias);
+    assert.equal(profile.alias, alias);
+    const docs = await f.client.embedDocuments(['中文说明', 'npm dependency'], profile);
+    assert.equal(docs.profile.id, profile.id);
+    assert.equal(docs.vectors.length, 2);
+    const query = await f.client.embedQuery('相关说明', profile);
+    assert.equal(query.profile.id, profile.id);
+    const calls = f.calls.filter(c => c.payload?.method === 'embedding.encode_text');
+    assert.equal(calls.at(-2).payload.params.input_type, 'document');
+    assert.equal(calls.at(-1).payload.params.input_type, 'query');
+    assert.ok(calls.at(-2).url.includes(alias === 'qwen3' ? 'qwen' : 'gemma'));
+  }
+});
+
+test('document profile mismatch and invalid alias fail before encoding', async t => {
+  const f = await fixture(t);
+  await assert.rejects(() => f.client.getTextProfile('other'), /Unknown/);
+  const expected = embeddingProfile({ ...vision, revision: 'not-installed' });
+  await assert.rejects(() => f.client.embedDocuments(['text'], expected), /not available/);
+  assert.equal(f.calls.filter(c => c.payload?.method === 'embedding.encode_text').length, 0);
+  const abort = new AbortController(); abort.abort();
+  await assert.rejects(() => f.client.embedDocuments(['text'], embeddingProfile(doc), { signal: abort.signal }));
+});
+
+test('explicit documents reject incompatible service responses', async t => {
+  const f = await fixture(t, { invalidResult: true });
+  await assert.rejects(() => f.client.embedDocuments(['text'], embeddingProfile(doc)), /incompatible/);
+});

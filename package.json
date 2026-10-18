@@ -70,7 +70,9 @@
     "check:all": "npm run typecheck:all && npm run test:all && npm run test:packages",
     "postinstall": "node scripts/install-skills.mjs --postinstall",
     "skills:install": "node scripts/install-skills.mjs",
-    "prepack": "npm run build"
+    "prepack": "npm run build",
+    "audit:dependencies": "node scripts/audit-dependencies.mjs --root . --json",
+    "test:governance": "node --test test/audit-dependencies.test.mjs"
   },
   "engines": {
     "node": ">=22.5"

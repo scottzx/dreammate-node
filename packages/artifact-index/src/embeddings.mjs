@@ -186,6 +186,18 @@ export function createEmbeddingClient({ agent = 'http://127.0.0.1:36908', mediaR
   }
   return {
     async discover({ signal } = {}) { return discover(budget(signal)); },
+    /** Explicit text provider; selection never loads weights. */
+    async getTextProfile(alias, { signal } = {}) {
+      if (!['qwen3', 'embeddinggemma2'].includes(alias)) throw fail('Unknown text embedding model');
+      return (await select(alias, budget(signal))).profile;
+    },
+    /** Encode documents in an already selected, exact vector space. */
+    async embedDocuments(texts, profile, { signal } = {}) {
+      textsChecked(texts);
+      const expected = embeddingProfile(profile), deadline = budget(signal);
+      const selected = await select(expected.alias, deadline, expected);
+      return encodeTexts(texts, selected, 'document', deadline);
+    },
     async getProfile(kind, { signal } = {}) {
       if (!['text', 'multimodal'].includes(kind)) throw fail('Unknown embedding content type');
       return (await select(kind === 'text' ? 'qwen3' : 'embeddinggemma2', budget(signal))).profile;

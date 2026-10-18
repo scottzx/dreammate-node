@@ -84,6 +84,10 @@ export interface EmbeddingClientOptions {
 }
 
 export interface SharedEmbeddingClient {
+  /** Explicit text model; does not load model weights. */
+  getTextProfile(alias: EmbeddingAlias, options?: EmbeddingOperationOptions): Promise<EmbeddingProfile>;
+  /** Documents must use precisely the selected profile, never a fallback model. */
+  embedDocuments(texts: string[], profile: EmbeddingProfileInput, options?: EmbeddingOperationOptions): Promise<EmbeddingResult>;
   /** Read advertisements without loading weights or extending model idle time. */
   discover(options?: EmbeddingOperationOptions): Promise<DiscoveredEmbeddingProvider[]>;
   /** Inspect current supported profiles without loading model weights. */

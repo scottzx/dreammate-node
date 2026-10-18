@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "exampleOnly": true,
+  "node": null,
+  "profile": null,
+  "sourceCommits": {},
+  "targetPackages": {},
+  "manifestSha256": null,
+  "lockSha256": null,
+  "tarballs": [],
+  "installedAuditFile": null,
+  "runtime": {
+    "verified": false,
+    "pid": null,
+    "executable": null,
+    "workingDirectory": null,
+    "reportedVersion": null,
+    "checkedAt": null
+  },
+  "wireProtocols": {},
+  "embeddingProfiles": {},
+  "validation": [],
+  "rollback": {
+    "previousManifest": null,
+    "previousLock": null,
+    "previousTarballs": []
+  }
+}

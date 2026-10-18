@@ -1,0 +1,415 @@
+{
+  "schemaVersion": 1,
+  "note": "Canonical identity inventory seeded from the 2026-10-18 audit. Audited versions are observations, not deployment targets or proof of runtime compatibility. Unknown repository/status remains unknown.",
+  "projects": [
+    {
+      "id": "reader",
+      "name": "session-reader / 1session",
+      "repository": "https://github.com/scottzx/session-reader",
+      "aliases": [
+        "1session"
+      ],
+      "role": "会话读取、检索、DSH 插件",
+      "maintenanceStatus": "unclassified",
+      "packages": [
+        {
+          "name": "@1agents/session-reader",
+          "auditedVersion": "0.10.0",
+          "evidenceDate": "2026-10-18"
+        }
+      ]
+    },
+    {
+      "id": "node",
+      "name": "DreamMate Node 与同仓工具",
+      "repository": "https://github.com/scottzx/dreammate-node",
+      "aliases": [],
+      "role": "节点运行服务、DSH 启动适配、技能与产物索引",
+      "maintenanceStatus": "unclassified",
+      "packages": [
+        {
+          "name": "@1agents/dreammate-node",
+          "auditedVersion": "0.14.0",
+          "evidenceDate": "2026-10-18"
+        },
+        {
+          "name": "@1agents/dsh-dreammate-node",
+          "auditedVersion": "0.1.0",
+          "evidenceDate": "2026-10-18"
+        },
+        {
+          "name": "@1agents/skill-manager",
+          "auditedVersion": "0.2.0",
+          "evidenceDate": "2026-10-18"
+        },
+        {
+          "name": "@1agents/artifact-index",
+          "auditedVersion": "0.1.0",
+          "evidenceDate": "2026-10-18"
+        }
+      ]
+    },
+    {
+      "id": "network",
+      "name": "DreamMate Network",
+      "repository": "https://github.com/scottzx/dreammate-network",
+      "aliases": [],
+      "role": "网络协议包",
+      "maintenanceStatus": "unclassified",
+      "packages": [
+        {
+          "name": "@1agents/dreammate-network",
+          "auditedVersion": "0.5.0",
+          "evidenceDate": "2026-10-18"
+        }
+      ]
+    },
+    {
+      "id": "acp",
+      "name": "1acp / ACP 服务与历史插件",
+      "repository": "https://github.com/scottzx/1acp",
+      "aliases": [
+        "1acp",
+        "acp-workspace"
+      ],
+      "role": "ACP 运行与服务；当前入口 acp-service",
+      "maintenanceStatus": "unclassified",
+      "packages": [
+        {
+          "name": "@1agents/acp-service",
+          "auditedVersion": "0.7.0",
+          "evidenceDate": "2026-10-18"
+        },
+        {
+          "name": "@1agents/dsh-acp",
+          "auditedVersion": "0.2.2",
+          "evidenceDate": "2026-10-18"
+        },
+        {
+          "name": "@scottzx/1acp",
+          "auditedVersion": "0.16.0",
+          "evidenceDate": "2026-10-18"
+        }
+      ]
+    },
+    {
+      "id": "blueprint",
+      "name": "Feature Blueprint",
+      "repository": "https://github.com/scottzx/feature-blueprint",
+      "aliases": [
+        "dsh-feature-blueprint"
+      ],
+      "role": "DSH 思维导图、白板与 CLI",
+      "maintenanceStatus": "unclassified",
+      "packages": [
+        {
+          "name": "@1agents/feature-blueprint",
+          "auditedVersion": "0.4.1",
+          "evidenceDate": "2026-10-18"
+        }
+      ]
+    },
+    {
+      "id": "voice",
+      "name": "Voice Canvas / laya",
+      "repository": "https://github.com/scottzx/voice-canvas",
+      "aliases": [
+        "laya"
+      ],
+      "role": "语音画布衍生项目",
+      "maintenanceStatus": "unclassified",
+      "packages": [
+        {
+          "name": "@1agents/voice-canvas",
+          "auditedVersion": "0.1.0",
+          "evidenceDate": "2026-10-18"
+        }
+      ]
+    },
+    {
+      "id": "mycontext",
+      "name": "myContext",
+      "repository": "https://github.com/scottzx/myContext",
+      "aliases": [],
+      "role": "上下文工具与平台二进制分发",
+      "maintenanceStatus": "unclassified",
+      "packages": [
+        {
+          "name": "@1agents/mycontext",
+          "auditedVersion": "0.4.0",
+          "evidenceDate": "2026-10-18"
+        },
+        {
+          "name": "@1agents/mycontext-darwin-arm64",
+          "auditedVersion": "0.4.0",
+          "evidenceDate": "2026-10-18"
+        },
+        {
+          "name": "@1agents/mycontext-darwin-x64",
+          "auditedVersion": "0.4.0",
+          "evidenceDate": "2026-10-18"
+        },
+        {
+          "name": "@1agents/mycontext-linux-arm64",
+          "auditedVersion": "0.4.0",
+          "evidenceDate": "2026-10-18"
+        },
+        {
+          "name": "@1agents/mycontext-linux-ia32",
+          "auditedVersion": "0.4.0",
+          "evidenceDate": "2026-10-18"
+        },
+        {
+          "name": "@1agents/mycontext-linux-x64",
+          "auditedVersion": "0.4.0",
+          "evidenceDate": "2026-10-18"
+        }
+      ]
+    },
+    {
+      "id": "1agents",
+      "name": "1agents / 1agents_app 与历史 CLI",
+      "repository": "https://github.com/scottzx/1agents",
+      "aliases": [
+        "1agents_app"
+      ],
+      "role": "历史工作台、CLI 模块；chat-ui 独立被 reader 消费",
+      "maintenanceStatus": "unclassified",
+      "packages": [
+        {
+          "name": "@scottzx/1agents",
+          "auditedVersion": "20260623.1.0",
+          "evidenceDate": "2026-10-18"
+        },
+        {
+          "name": "@1agents/cli",
+          "auditedVersion": "20260721.2.0",
+          "evidenceDate": "2026-10-18"
+        },
+        {
+          "name": "@1agents/acp-bridge",
+          "auditedVersion": "20260721.2.0",
+          "evidenceDate": "2026-10-18"
+        },
+        {
+          "name": "@1agents/acpx",
+          "auditedVersion": "20260721.2.0",
+          "evidenceDate": "2026-10-18"
+        },
+        {
+          "name": "@1agents/cc-connect",
+          "auditedVersion": "20260721.2.0",
+          "evidenceDate": "2026-10-18"
+        },
+        {
+          "name": "@1agents/cc-switch",
+          "auditedVersion": "20260721.2.0",
+          "evidenceDate": "2026-10-18"
+        },
+        {
+          "name": "@1agents/web",
+          "auditedVersion": "20260721.2.0",
+          "evidenceDate": "2026-10-18"
+        },
+        {
+          "name": "@1agents/skills",
+          "auditedVersion": "20260721.2.0",
+          "evidenceDate": "2026-10-18"
+        },
+        {
+          "name": "@1agents/happy",
+          "auditedVersion": "20260721.2.0",
+          "evidenceDate": "2026-10-18"
+        },
+        {
+          "name": "@1agents/cc-connect-darwin-arm64",
+          "auditedVersion": "20260721.2.0",
+          "evidenceDate": "2026-10-18"
+        },
+        {
+          "name": "@1agents/cc-connect-linux-arm64",
+          "auditedVersion": "20260721.2.0",
+          "evidenceDate": "2026-10-18"
+        },
+        {
+          "name": "@1agents/cc-connect-linux-x64",
+          "auditedVersion": "20260721.2.0",
+          "evidenceDate": "2026-10-18"
+        },
+        {
+          "name": "@1agents/cc-switch-darwin-arm64",
+          "auditedVersion": "20260721.2.0",
+          "evidenceDate": "2026-10-18"
+        },
+        {
+          "name": "@1agents/cc-switch-linux-arm64",
+          "auditedVersion": "20260721.2.0",
+          "evidenceDate": "2026-10-18"
+        },
+        {
+          "name": "@1agents/cc-switch-linux-x64",
+          "auditedVersion": "20260721.2.0",
+          "evidenceDate": "2026-10-18"
+        },
+        {
+          "name": "@1agents/core-darwin-arm64",
+          "auditedVersion": "20260721.2.0",
+          "evidenceDate": "2026-10-18"
+        },
+        {
+          "name": "@1agents/core-linux-arm64",
+          "auditedVersion": "20260721.2.0",
+          "evidenceDate": "2026-10-18"
+        },
+        {
+          "name": "@1agents/core-linux-x64",
+          "auditedVersion": "20260721.2.0",
+          "evidenceDate": "2026-10-18"
+        },
+        {
+          "name": "@1agents/chat-ui",
+          "auditedVersion": "0.1.0",
+          "evidenceDate": "2026-10-18"
+        }
+      ]
+    },
+    {
+      "id": "remote",
+      "name": "Remote Agents 旧发布入口",
+      "repository": "https://github.com/scottzx/remote-agents",
+      "aliases": [],
+      "role": "早期远程代理产品",
+      "maintenanceStatus": "unclassified",
+      "packages": [
+        {
+          "name": "@scottzx/remote-agents",
+          "auditedVersion": "20260528.1.0",
+          "evidenceDate": "2026-10-18"
+        }
+      ]
+    },
+    {
+      "id": "server",
+      "name": "1Agents Server / wire",
+      "repository": "https://github.com/scottzx/1Agents_Server",
+      "aliases": [],
+      "role": "服务端 / wire；仓库私有",
+      "maintenanceStatus": "unclassified",
+      "packages": [
+        {
+          "name": "@1agents/wire",
+          "auditedVersion": "0.1.0",
+          "evidenceDate": "2026-10-18"
+        }
+      ]
+    },
+    {
+      "id": "transcribe",
+      "name": "Transcribe",
+      "repository": "https://github.com/scottzx/transcribe",
+      "aliases": [],
+      "role": "语音转写能力服务",
+      "maintenanceStatus": "unclassified",
+      "packages": [
+        {
+          "name": "@1agents/transcribe",
+          "auditedVersion": "0.4.1",
+          "evidenceDate": "2026-10-18"
+        }
+      ]
+    },
+    {
+      "id": "bash",
+      "name": "Bash MCP",
+      "repository": "https://github.com/scottzx/bash-mcp",
+      "aliases": [],
+      "role": "终端执行与异步任务能力",
+      "maintenanceStatus": "unclassified",
+      "packages": [
+        {
+          "name": "@1agents/bash-mcp",
+          "auditedVersion": "0.1.2",
+          "evidenceDate": "2026-10-18"
+        }
+      ]
+    },
+    {
+      "id": "fs",
+      "name": "File System MCP",
+      "repository": "https://github.com/scottzx/file-system-mcp",
+      "aliases": [],
+      "role": "文件系统及基础 MCP 能力",
+      "maintenanceStatus": "unclassified",
+      "packages": [
+        {
+          "name": "@1agents/file-system-mcp",
+          "auditedVersion": "0.2.2",
+          "evidenceDate": "2026-10-18"
+        }
+      ]
+    },
+    {
+      "id": "activepieces",
+      "name": "Activepieces MCP",
+      "repository": null,
+      "aliases": [],
+      "role": "已发布自动化 MCP；仓库地址未确认",
+      "maintenanceStatus": "unclassified",
+      "packages": [
+        {
+          "name": "@1agents/activepieces-mcp",
+          "auditedVersion": "0.1.0",
+          "evidenceDate": "2026-10-18"
+        }
+      ]
+    },
+    {
+      "id": "boss",
+      "name": "老板 IP 工作台",
+      "repository": "https://github.com/scottzx/boss-ip",
+      "aliases": [],
+      "role": "本机同名 manifest 与 Git origin 核实",
+      "maintenanceStatus": "unclassified",
+      "packages": [
+        {
+          "name": "@1agents/boss-ip",
+          "auditedVersion": "0.1.0",
+          "evidenceDate": "2026-10-18"
+        }
+      ]
+    },
+    {
+      "id": "awesome",
+      "name": "Awesome DSH Plugin",
+      "repository": "https://github.com/scottzx/awesome-dsh-plugin",
+      "aliases": [],
+      "role": "插件目录；npm 声明的是上游 awesome-dsh-plugin/awesome-dsh-plugin",
+      "maintenanceStatus": "unclassified",
+      "packages": [
+        {
+          "name": "awesome-dsh-plugin",
+          "auditedVersion": "0.1.0",
+          "evidenceDate": "2026-10-18"
+        }
+      ]
+    },
+    {
+      "id": "phone",
+      "name": "1agents_phone",
+      "repository": "https://github.com/scottzx/1agents_phone",
+      "aliases": [],
+      "role": "用户明确保留的移动端项目；未核实 npm 包",
+      "maintenanceStatus": "unclassified",
+      "packages": []
+    },
+    {
+      "id": "registry",
+      "name": "DSH Plugin Registry",
+      "repository": "https://github.com/scottzx/dsh-plugin-registry",
+      "aliases": [],
+      "role": "插件登记仓库；未核实 npm 包",
+      "maintenanceStatus": "unclassified",
+      "packages": []
+    }
+  ]
+}
