@@ -1,0 +1,6 @@
+packages:
+  - .
+
+minimumReleaseAgeExclude:
+  - "@1agents/dreammate-node@0.15.0"
+  - "@1agents/dreammate-network@0.5.0"

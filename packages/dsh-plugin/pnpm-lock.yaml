@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@1agents/dreammate-node':
-        specifier: ~0.7.1
-        version: 0.7.1(zod@4.6.5)
+        specifier: ^0.15.0
+        version: 0.15.0(zod@4.6.5)
       '@modelcontextprotocol/sdk':
         specifier: ^1.30.0
         version: 1.30.1(zod@4.6.5)
@@ -21,8 +21,8 @@ packages:
     resolution: {integrity: sha512-2zbsna1jZt4bogNRpfJpvrK0xzu8jE1xf9P83LYKLN1E3AUqxk9SOmfzID7Y3c5w59FNQv0FFQBsYPp/R3M5IA==}
     engines: {node: '>=22.5'}
 
-  '@1agents/dreammate-node@0.7.1':
-    resolution: {integrity: sha512-doyV9RuvPPlQcyb2s+/BElOBfBTzfNGelIztm27iWkAI4W8v84iVPV2r5CWb5EIdU1W8ZKr4fg9qjwQgQNcKjg==}
+  '@1agents/dreammate-node@0.15.0':
+    resolution: {integrity: sha512-ouhovUf8Pq+nSf5xhO8Y7Yg3mkwh6jEnZ5PaUseLw7d45OPir4E2ODFDd7hnrTttO0Es/oZSWkFtn2wlUbL3vg==}
     engines: {node: '>=22.5'}
     hasBin: true
 
@@ -416,7 +416,7 @@ snapshots:
 
   '@1agents/dreammate-network@0.5.0': {}
 
-  '@1agents/dreammate-node@0.7.1(zod@4.6.5)':
+  '@1agents/dreammate-node@0.15.0(zod@4.6.5)':
     dependencies:
       '@1agents/dreammate-network': 0.5.0
       '@modelcontextprotocol/sdk': 1.30.1(zod@4.6.5)

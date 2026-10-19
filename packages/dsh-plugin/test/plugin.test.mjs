@@ -12,7 +12,7 @@ test('registers native DSH tools using published schemas, invokes gateway, and r
   const ctx = context();
   t.after(() => ctx.dispose());
   await plugin.apply(ctx, { serviceUrl: gateway.url });
-  assert.equal(ctx.definitions.size, 7);
+  assert.equal(ctx.definitions.size, MCP_TOOLS.length);
   for (const tool of MCP_TOOLS) assert.deepEqual(ctx.definitions.get(tool.name).parameters, tool.inputSchema);
   const tool = ctx.definitions.get('dreammate_list_services');
   const result = await tool.execute({});

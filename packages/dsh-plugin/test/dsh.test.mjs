@@ -1,3 +1,4 @@
+import { MCP_TOOLS } from '@1agents/dreammate-node';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
@@ -24,7 +25,7 @@ test('real DSH native tool execution, schema, business failure and Cordis dispos
   const url = await unused(t);
   const fiber = ctx.plugin(plugin, { serviceUrl: url, serviceHost: '127.0.0.1' });
   await fiber.await();
-  assert.equal(ctx.tools.schemas().filter(t => t.name.startsWith('dreammate_')).length, 7);
+  assert.equal(ctx.tools.schemas().filter(t => t.name.startsWith('dreammate_')).length, MCP_TOOLS.length);
   const success = await ctx.tools.execute({ name: 'dreammate_list_services', arguments: {}, callId: 'test-list', signal: new AbortController().signal });
   assert.equal(success.isError, false, JSON.stringify(success));
   assert.ok(Array.isArray(success.value.content));
@@ -63,7 +64,12 @@ test('real DSH preserves structured data and content in remote MCP results', { s
   await fiber.await();
   const result = await ctx.tools.execute({ name: 'dreammate_invoke', arguments: { service_id: 'fixture', method: 'echo', params: {} }, callId: 'invoke', signal: new AbortController().signal });
   assert.equal(result.isError, false, JSON.stringify(result));
-  assert.deepEqual(result.value, envelope);
+  assert.deepEqual(result.value, {
+    ...envelope,
+    _meta: { ...envelope._meta, dreammate: {
+      http_status: 200, method: 'echo', node: 'local', service_id: 'fixture',
+    } },
+  });
 });
 
 test('HTTP 200 with an MCP business error is a real DSH failure, never retried', { skip: !checkout }, async t => {

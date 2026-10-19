@@ -97,3 +97,8 @@ runtime dependencies beyond the Host-provided `tools` service.
 
 Remove with `pnpm dsh plugin --profile web remove @1agents/dsh-dreammate-node`
 and restart DSH. Existing identity and service registrations are retained.
+
+
+## 0.2.0 dependency transition
+
+Targets DreamMate Node ^0.15.0 / Network 0.5. Existing running local nodes remain externally owned: releasing the DSH plugin does not stop them. Update the profile dependency and lockfile together. The plugin does not install or launch separate embedding workers.
