@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.0 — 2026-10-19
+
+- Explicit getTextProfile(model) and embedDocuments(texts, profile) APIs for Qwen/Gemma text indexing.
+- Preserve query/document task identities and reject incompatible revisions or vector profiles.
+- Existing default Qwen and multimodal callers remain supported.
+
+
 ## 0.1.0 — 2026-10-18
 
 首版独立本地产物索引包，提供 CLI、ESM 库与可选 DreamMate 只读服务。

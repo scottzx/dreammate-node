@@ -1,31 +1,57 @@
 {
   "name": "@1agents/artifact-index",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Local artifact indexing with page, slide, cell-range and video-time locators, using shared offline embedding providers.",
   "type": "module",
   "main": "./src/index.mjs",
   "types": "./src/index.d.ts",
   "exports": {
-    ".": { "types": "./src/index.d.ts", "import": "./src/index.mjs" },
-    "./embeddings": { "types": "./src/embeddings.d.ts", "import": "./src/embeddings.mjs" },
-    "./extract": { "types": "./src/extract.d.ts", "import": "./src/extract.mjs" },
-    "./service": { "types": "./src/service.d.ts", "import": "./src/service.mjs" },
+    ".": {
+      "types": "./src/index.d.ts",
+      "import": "./src/index.mjs"
+    },
+    "./embeddings": {
+      "types": "./src/embeddings.d.ts",
+      "import": "./src/embeddings.mjs"
+    },
+    "./extract": {
+      "types": "./src/extract.d.ts",
+      "import": "./src/extract.mjs"
+    },
+    "./service": {
+      "types": "./src/service.d.ts",
+      "import": "./src/service.mjs"
+    },
     "./package.json": "./package.json"
   },
-  "bin": { "artifact-index": "./bin/artifact-index.mjs" },
-  "files": ["src", "bin", "python/extract.py", "python/requirements.txt", "README.md", "CHANGELOG.md"],
+  "bin": {
+    "artifact-index": "./bin/artifact-index.mjs"
+  },
+  "files": [
+    "src",
+    "bin",
+    "python/extract.py",
+    "python/requirements.txt",
+    "README.md",
+    "CHANGELOG.md"
+  ],
   "scripts": {
     "test": "node --test test/*.test.mjs",
     "test:python": "python3 -m unittest discover -s python -p 'test_*.py'",
     "check": "npm test && npm run test:python",
     "prepublishOnly": "npm run check"
   },
-  "engines": { "node": ">=22.13" },
+  "engines": {
+    "node": ">=22.13"
+  },
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/scottzx/dreammate-node.git",
     "directory": "packages/artifact-index"
   },
-  "publishConfig": { "access": "public", "registry": "https://registry.npmjs.org" }
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  }
 }
