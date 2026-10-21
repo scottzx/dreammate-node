@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Keep gateway requests responsive during identity refreshes: share concurrent Tailscale lookups, cache topology snapshots for five seconds, and bound all CLI candidates by one total deadline with hard child cleanup. Derive identity and peers from the same snapshot and retain the canonical identity when status is temporarily unavailable.
+- Run the macOS HTTP gateway as an Interactive launchd job so background CPU and I/O throttling cannot delay startup, discovery responses or request deadlines.
+
 ## 0.13.0 — 2026-10-18
 
 - Route text embeddings to Qwen and media embeddings to optional offline EmbeddingGemma 2 through one local supervisor; use an explicit multimodal target for text queries against media indexes and preserve separate vector profiles.

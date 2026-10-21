@@ -96,7 +96,9 @@ export function renderPlist(r: Resolved): string {
   <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>${xml(path.join(logs, 'dreammate-node.log'))}</string>
   <key>StandardErrorPath</key><string>${xml(path.join(logs, 'dreammate-node.err.log'))}</string>
-  <key>ProcessType</key><string>Background</string>
+  <!-- HTTP requests are user initiated, without XPC activity to promote an
+       Adaptive job. Background throttling also delays the gateway's deadlines. -->
+  <key>ProcessType</key><string>Interactive</string>
   <!-- launchd 默认只给 /usr/bin:/bin:/usr/sbin:/sbin，找不到 homebrew 里的
        tailscale。identity.ts 还有一层候选路径兜底，这里是第一道。 -->
   <key>EnvironmentVariables</key>

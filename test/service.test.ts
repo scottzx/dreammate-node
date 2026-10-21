@@ -27,6 +27,8 @@ test('plist 带上绝对路径的 node 与脚本', () => {
   assert.match(plist, /<key>Label<\/key><string>work\.dreammate\.node<\/string>/);
   assert.match(plist, /<key>KeepAlive<\/key><true\/>/, '挂了要自动拉起');
   assert.match(plist, /<key>RunAtLoad<\/key><true\/>/, '开机要自启');
+  assert.match(plist, /<key>ProcessType<\/key><string>Interactive<\/string>/,
+    '用户发起的 HTTP 发现请求不能受后台 CPU 与 I/O 节流影响');
   assert.match(plist, /<string>36908<\/string>/);
 });
 

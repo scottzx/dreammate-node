@@ -99,7 +99,7 @@ let resolvedBin: string | undefined;
 function candidates(): string[] {
   const override = process.env.DREAMMATE_TAILSCALE_BIN?.trim();
   if (override) return [override];
-  return resolvedBin ? [resolvedBin, ...TAILSCALE_CANDIDATES] : TAILSCALE_CANDIDATES;
+  return [...new Set(resolvedBin ? [resolvedBin, ...TAILSCALE_CANDIDATES] : TAILSCALE_CANDIDATES)];
 }
 
 /**
@@ -110,39 +110,83 @@ function candidates(): string[] {
  */
 function runOne(bin: string, timeoutMs: number): Promise<RawStatus | undefined> {
   return new Promise((resolve) => {
-    execFile(bin, ['status', '--json'], { timeout: timeoutMs, maxBuffer: 8 << 20 }, (error, stdout) => {
-      if (error || !stdout) return resolve(undefined);
+    let settled = false;
+    const finish = (value?: RawStatus) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    // execFile's callback can wait for inherited pipes even after the child dies.
+    // Resolve independently, and do not let a CLI that ignores SIGTERM linger.
+    const timer = setTimeout(() => {
+      finish();
+      child.kill('SIGKILL');
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+    }, timeoutMs);
+    const child = execFile(bin, ['status', '--json'], { maxBuffer: 8 << 20 }, (error, stdout) => {
+      if (settled) return;
+      if (error || !stdout) return finish();
       try {
-        const parsed = JSON.parse(stdout) as RawStatus;
+        const parsed: unknown = JSON.parse(stdout);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return finish();
         resolvedBin = bin;
-        resolve(parsed);
+        finish(parsed as RawStatus);
       } catch {
-        resolve(undefined);
+        finish();
       }
     });
   });
 }
 
-async function readStatus(timeoutMs: number): Promise<RawStatus | undefined> {
-  for (const bin of candidates()) {
-    const status = await runOne(bin, timeoutMs);
-    if (status) return status;
+interface StatusSnapshot { at: number; value: RawStatus | undefined }
+const STATUS_CACHE_MS = 5_000;
+let statusCache: StatusSnapshot | undefined;
+let statusPending: Promise<StatusSnapshot> | undefined;
+
+/** One total budget across candidates, shared by concurrent identity/topology reads. */
+async function readStatus(timeoutMs: number, force = false): Promise<StatusSnapshot> {
+  if (!force && statusCache && Date.now() - statusCache.at < STATUS_CACHE_MS) return statusCache;
+  if (statusPending) return statusPending;
+  const pending = (async () => {
+    const bins = candidates();
+    const deadline = performance.now() + timeoutMs;
+    let value: RawStatus | undefined;
+    for (const [index, bin] of bins.entries()) {
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) break;
+      // Reserve time for alternatives when the preferred installation stalls.
+      value = await runOne(bin, Math.max(1, Math.floor(remaining / (bins.length - index))));
+      if (value) break;
+    }
+    return { at: Date.now(), value };
+  })();
+  statusPending = pending;
+  try {
+    const snapshot = await pending;
+    if (statusPending === pending) statusCache = snapshot;
+    return snapshot;
   }
-  return undefined;
+  finally { if (statusPending === pending) statusPending = undefined; }
 }
 
 /** 测试用：忘掉已解析的 tailscale 路径。 */
 export function resetBinCache(): void {
   resolvedBin = undefined;
+  statusCache = undefined;
+  statusPending = undefined;
 }
 
 let cache: { at: number; value: NodeIdentity } | undefined;
+let identityPending: Promise<NodeIdentity> | undefined;
 
 /** 身份几乎不变，而每个请求都 fork 一次 CLI 是浪费。 */
 export const CACHE_MS = 60_000;
 
 export function resetIdentityCache(): void {
   cache = undefined;
+  identityPending = undefined;
 }
 
 /**
@@ -151,12 +195,30 @@ export function resetIdentityCache(): void {
  * `DREAMMATE_NODE_ID` / `DREAMMATE_NODE_NAME` 覆盖一切，容器或同机第二个实例用。
  */
 export async function nodeIdentity(options: { force?: boolean; timeoutMs?: number } = {}): Promise<NodeIdentity> {
-  const now = Date.now();
-  if (!options.force && cache && now - cache.at < CACHE_MS) return cache.value;
+  if (!options.force && cache) {
+    // A stable identity must not make health, registration or invocation wait
+    // for the network CLI every minute. Refresh once in the background.
+    if (Date.now() - cache.at >= CACHE_MS) void refreshIdentity(options).catch(() => {});
+    return cache.value;
+  }
+  return refreshIdentity(options);
+}
 
+function refreshIdentity(options: { force?: boolean; timeoutMs?: number }): Promise<NodeIdentity> {
+  if (identityPending) return identityPending;
+  const pending = readStatus(options.timeoutMs ?? 2_000, options.force).then(snapshot => {
+    const identity = identityFromStatus(snapshot.value);
+    if (identityPending === pending) cache = { at: snapshot.at, value: identity };
+    return identity;
+  });
+  identityPending = pending;
+  void pending.finally(() => { if (identityPending === pending) identityPending = undefined; }).catch(() => {});
+  return pending;
+}
+
+function identityFromStatus(status: RawStatus | undefined): NodeIdentity {
   const envId = process.env.DREAMMATE_NODE_ID?.trim();
   const envName = process.env.DREAMMATE_NODE_NAME?.trim();
-  const status = await readStatus(options.timeoutMs ?? 2_000);
   const self = status?.Self;
 
   let identity: NodeIdentity;
@@ -172,11 +234,13 @@ export async function nodeIdentity(options: { force?: boolean; timeoutMs?: numbe
       dnsName,
       ...(self.TailscaleIPs?.find((ip) => ip.includes('.')) ? { ipv4: self.TailscaleIPs.find((ip) => ip.includes('.'))! } : {}),
     };
+  } else if (!status && cache?.value.source === 'tailscale') {
+    // A temporary status failure does not give this device a different ID.
+    identity = { ...cache.value, node_id: envId ?? cache.value.node_id, name: envName ?? cache.value.name };
   } else {
     identity = localIdentity(envId, envName);
   }
 
-  cache = { at: now, value: identity };
   return identity;
 }
 
@@ -209,7 +273,10 @@ function localIdentity(envId?: string, envName?: string): NodeIdentity {
  * 获取局域网 / Tailnet 内已知的所有设备节点（包括本机与对端 Peers）。
  */
 export async function listNetworkNodes(options: { timeoutMs?: number; force?: boolean } = {}): Promise<NetworkNode[]> {
-  const self = await nodeIdentity({ force: options.force, timeoutMs: options.timeoutMs });
+  // Derive identity and peers from the same snapshot, never two CLI rounds.
+  const snapshot = await readStatus(options.timeoutMs ?? 2_000, options.force);
+  const self = identityFromStatus(snapshot.value);
+  cache = { at: snapshot.at, value: self };
   const nodes: NetworkNode[] = [
     {
       node_id: self.node_id,
@@ -222,8 +289,8 @@ export async function listNetworkNodes(options: { timeoutMs?: number; force?: bo
     },
   ];
 
-  const status = await readStatus(options.timeoutMs ?? 2_000);
-  const checkedAt = new Date().toISOString();
+  const status = snapshot.value;
+  const checkedAt = new Date(snapshot.at).toISOString();
   nodes[0]!.network_online = status ? status.BackendState === 'Running' && status.Self?.Online !== false : null;
   nodes[0]!.network_checked_at = checkedAt;
   if (!status || status.BackendState !== 'Running' || !status.Peer) {
