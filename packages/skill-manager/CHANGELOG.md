@@ -2,7 +2,7 @@
 
 本文件只记录 `@1agents/skill-manager` 的版本，与 DreamMate Node 独立维护。
 
-## Unreleased
+## 0.2.1 — 2026-10-22
 
 - 将 macOS 用户服务设为 Interactive，避免后台 CPU 和 I/O 限流导致健康检查、目录读取及语义技能检索在进入模型前超时。
 
