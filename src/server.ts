@@ -20,6 +20,7 @@ import { McpSourceError, McpSourceManager, type McpSourceManagerOptions } from '
 import { CatalogError } from './mcp-catalogs.js';
 import { ToolNameError } from './mcp-tool-names.js';
 import { registeredSkillProvider, requiresLocalMethod, SkillProviderError } from './skill-provider.js';
+import { deviceInfo, DEVICE_INFO_PROTOCOL } from './device-info.js';
 
 /** 固定端口。改它等于让全网的探测方同时失明。 */
 export const NODE_AGENT_PORT: number = DEFAULT_PORTS['node-agent'];
@@ -471,6 +472,7 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
             node_id: identity.node_id,
             service: 'node-agent',
             service_sharing: 'dreammate.service-sharing.v1',
+            device_info: DEVICE_INFO_PROTOCOL,
             services: registry.list().filter(service => canAccessService(service.id)).length,
           });
         }
@@ -483,7 +485,8 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
             type: identity.type,
             tailscale_name: identity.dnsName ?? null,
             online: true,
-            metadata: { protocol_version: PROTOCOL_VERSION, identity_source: identity.source, skill_catalog: '/skills', service_sharing: 'dreammate.service-sharing.v1' },
+            metadata: { protocol_version: PROTOCOL_VERSION, identity_source: identity.source, skill_catalog: '/skills', service_sharing: 'dreammate.service-sharing.v1',
+              device: await deviceInfo(identity.node_id) },
             services: registry.toServices(host, identity.ipv4).filter(service => canAccessService(service.id)),
           };
           return json(res, 200, manifest);
@@ -496,9 +499,14 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
         if (req.method === 'GET' && pathname === '/nodes') {
           const { listNetworkNodes } = await import('./identity.js');
           const nodes = await listNetworkNodes();
+          const self = nodes.find(node => node.is_self);
+          if (self) self.device = await deviceInfo(self.node_id);
           return json(res, 200, { node: identity.name, nodes });
         }
 
+        if (req.method === 'GET' && pathname === '/device') {
+          return json(res, 200, await deviceInfo(identity.node_id));
+        }
         // Publishing a directory is a local management operation; only published skills are readable over the network.
         if (pathname === '/skills/sources' || pathname.startsWith('/skills/sources/')) {
           if (!isLoopback(req)) return json(res, 403, { error: 'Skill source management is loopback-only' });

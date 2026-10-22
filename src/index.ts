@@ -42,6 +42,7 @@ export {
 } from './mcp.js';
 export { exportDirectory, loadDirectory, parseDirectory, saveDirectory, validateDirectory,
   type NodeDirectory, type DirectoryNode } from './node-directory.js';
+export { deviceInfo, DEVICE_INFO_PROTOCOL, type DeviceInfo, type DeviceInterface, type InterfaceAddress } from './device-info.js';
 export {
   EMBEDDING_PROTOCOL,
   discoverEmbeddingProviders,

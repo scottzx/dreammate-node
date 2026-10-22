@@ -1,6 +1,6 @@
 {
   "name": "@1agents/dreammate-node",
-  "version": "0.15.1",
+  "version": "0.16.0",
   "description": "DreamMate Network 的设备网关与一次性 CLI：服务发现、调用与可导入的设备地址簿。",
   "keywords": [
     "dreammate",
@@ -47,6 +47,7 @@
     "docs/local-embeddings.md",
     "docs/tool-search-evaluation.md",
     "docs/custom-mcp.md",
+    "docs/device-info.md",
     "skills/ish/dreammate-node/SKILL.md",
     "skills/terminal/dreammate-node/SKILL.md",
     "README.md",

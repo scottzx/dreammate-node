@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.16.0 — 2026-10-23
+
+- Add read-only local device model, OS name/version, architecture, hostname and interface IP/netmask/MAC information through `/device`, manifest metadata and the local node entry.
+- Include basic device information in MCP/CLI node listings when the gateway advertises support, while preserving older gateway compatibility and existing health semantics.
+- Keep collection local and cached; do not add peer probing, route/neighbor checks, LAN classification or grouping.
+
 ## 0.15.1 — 2026-10-22
 
 - Preserve the full effective search budget for a primary on-demand model with a valid cold-start advertisement instead of cutting it to 70% for an unused backup. Keep explicit total deadlines and early-failure fallback, expose per-attempt budgets and elapsed time, and reload retrieval code with resident MCP handlers.

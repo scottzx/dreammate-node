@@ -12,6 +12,7 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import type { IdentitySource } from '@1agents/dreammate-network';
+import type { DeviceInfo } from './device-info.js';
 
 export interface NodeIdentity {
   node_id: string;
@@ -59,6 +60,8 @@ export interface NetworkNode {
   is_self: boolean;
   dnsName?: string;
   ipv4?: string;
+  /** Self-reported system and interface information; never inferred from a peer's name. */
+  device?: DeviceInfo;
 }
 
 interface PeerStatus {

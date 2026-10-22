@@ -194,6 +194,7 @@ CRM、ERP、项目管理及其他业务系统，可以将已有接口封装为�
          ├─ GET  /manifest                      本机聚合视图：节点身份 + 已报备服务
          ├─ GET  /health
          ├─ GET  /nodes                         本 tailnet 内的设备节点
+         ├─ GET  /device                        设备型号、系统及本地网卡地址/掩码/MAC
          ├─ GET  /services                      各服务的存活与可达性
          ├─ POST /services                      服务报备（**仅接受 localhost**）
          ├─ DELETE /services/:id
@@ -210,6 +211,8 @@ CRM、ERP、项目管理及其他业务系统，可以将已有接口封装为�
 并把「找到能力」和「执行调用」收成同一个入口。
 
 ## 跑起来
+
+基础设备信息附在 `/manifest` 的 `metadata.device` 和 `/nodes` 的本机条目中；新版 MCP/CLI 可读取设备型号、系统、主机名及本地网卡信息。仅采集本机已有信息，不进行节点间探测或局域网分组。见 [基础设备信息](docs/device-info.md)。
 
 DeepSeek Harness 可以直接安装配套插件，复用本机已运行的 node，未启动时自动拉起：
 

@@ -33,6 +33,7 @@ import { discoverEmbeddingProviders } from './embedding-providers.js';
 import { scanSkillCatalog } from './skill-catalog.js';
 import { installMcpReload } from './mcp-runtime.js';
 import { loadPrivateMcpSources, type PrivateMcpSources } from './mcp-client-sources.js';
+import { DEVICE_INFO_PROTOCOL, parseDeviceInfo } from './device-info.js';
 
 // Follow the handler generation during SIGHUP reloads so a resident client does
 // not retain the old search deadlines through Node's dependency module cache.
@@ -345,7 +346,7 @@ export const MCP_TOOLS: Tool[] = [
   {
     name: 'dreammate_list_nodes',
     description:
-      '发现局域网/Tailnet 中所有已知设备节点（包括本机与远端 Linux、Windows PC、Mac、移动设备等），展示网络在线状态、网关探测结果、操作系统与地址；网络在线不代表服务可用。',
+      '发现局域网/Tailnet 中所有已知设备节点，展示原有网络状态、网关探活，以及设备型号、系统和本地网卡信息（需新版网关）；网络在线不代表服务可用。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -688,15 +689,25 @@ export async function callDreammateTool(
                     const url = nodeBaseUrl(agentUrl, n);
                     let reachable = false;
                     let reason: string | undefined;
+                    let device: NetworkNode['device'];
+                    const diagnostics: string[] = [];
                     try {
                       const response = await fetch(`${url}/health`, { signal: AbortSignal.timeout(3000) });
                       if (response.ok) {
-                        const health = await response.json() as { service?: string; status?: string };
-                        reachable = health.service === 'node-agent' && health.status === 'ok';
+                        const health = await response.json() as { service?: string; status?: string; node_id?: string; device_info?: string };
+                        reachable = health.service === 'node-agent' && health.status === 'ok' && (!health.node_id || health.node_id === n.node_id);
                         if (!reachable) reason = 'unexpected_health_response';
+                        if (reachable && health.device_info === DEVICE_INFO_PROTOCOL) {
+                          try {
+                            const result = await fetch(`${url}/device`, { signal: AbortSignal.timeout(1500), redirect: 'error' });
+                            if (!result.ok) { await result.body?.cancel(); throw new Error(); }
+                            device = parseDeviceInfo(await result.json(), n.node_id);
+                          } catch { diagnostics.push('device_info_unavailable'); }
+                        }
                       } else { reason = `HTTP ${response.status}`; await response.body?.cancel(); }
                     } catch (error) { reason = timedOut(error) ? 'timeout' : 'unreachable'; }
-                    return { ...n, network_online: n.network_online !== undefined ? n.network_online : n.is_self ? null : n.online,
+                    return { ...n, device,
+                      ...(diagnostics.length ? { diagnostics } : {}), network_online: n.network_online !== undefined ? n.network_online : n.is_self ? null : n.online,
                       network_checked_at: n.network_checked_at ?? null,
                       online_semantics: 'legacy network presence; self may be local-only',
                       gateway_reachable: reachable, gateway_url: url,

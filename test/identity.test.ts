@@ -30,11 +30,12 @@ function fixture(t: TestContext) {
   };
   t.mock.method(childProcess, 'execFile', ((bin: string, _args: string[], _options: unknown,
     callback: (error: Error | null, stdout: string) => void) => {
-    calls.push(bin);
     const child = Object.assign(new EventEmitter(), {
       stdout: new PassThrough(), stderr: new PassThrough(),
       kill: (signal: string) => { kills.push(signal); return true; },
     });
+    if (_args[0] !== 'status') { queueMicrotask(() => callback(null, '')); return child as unknown as ChildProcess; }
+    calls.push(bin);
     respond(bin, value => callback(null, JSON.stringify(value)));
     return child as unknown as ChildProcess;
   }) as typeof childProcess.execFile);
