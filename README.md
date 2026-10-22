@@ -1,6 +1,185 @@
-# @1agents/dreammate-node
+# DreamMate · Personal Agent Infra
 
-> DreamMate Network 的**本机 node agent**：让设备和软件向智能体公开自己的能力，并提供统一的发现与调用入口。
+**让不同 Agent，共用一套能力网络。**
+
+DreamMate 是面向 Personal Agent 的能力基础设施（Personal Agent Infrastructure）：把分散在设备、项目和业务系统中的工具、技能、业务服务与专职 Agent 组织起来，供接入的不同 Agent 按需发现、调用或委托任务。已经接好的能力，可以在新的 Agent 和项目中继续使用。
+
+Personal Agent 持续围绕用户的目标、上下文和工作习惯处理任务。日常工作中积累的转写环境、业务系统接口、项目技能，以及历史会话和交付文件，需要长期维护并跨场景复用。DreamMate 为这些能力与资产提供独立的维护入口，支持不同 Agent 在后续工作中继续使用。
+
+本仓库提供设备入口 **DreamMate Node**（`@1agents/dreammate-node`），以及同仓的技能管理、产物索引和 DSH 接入包。完整项目关系见下方的[项目族谱与快速跳转](#项目族谱与快速跳转)。
+
+[为什么使用](#为什么使用-dreammate) · [工作方式](#工作方式) · [项目族谱](#项目族谱与快速跳转) · [业务系统接入](#自定义业务能力) · [常驻 A2A Agent](#固定职能的常驻-a2a-agent) · [快速开始](#跑起来) · [技能共享](#让项目里的-skill-可以被搜索和使用) · [MCP 接入](#添加自定义-mcp) · [安全与边界](#当前支持与边界) · [技术文档](#技术文档)
+
+## 为什么使用 DreamMate
+
+Personal Agent 平台已经逐步提供云电脑、连接器、技能库、定时任务和多 Agent 协作。DreamMate 关注的是这些能力在**不同宿主、不同设备和不同项目之间的复用与维护**。
+
+| 工作场景 | DreamMate 提供的价值 |
+| --- | --- |
+| 同时使用多个 Agent，分别配置工具、复制技能，更新时需要修改多份 | 通过统一入口发现能力；技能原件保留在来源目录，接入的 Agent 按需读取 |
+| 软件、脚本、模型和文件分散在多台设备，迁移运行环境很麻烦 | 将已有环境中的服务发布到网络，调用由目标设备执行 |
+| 客户、订单、库存等业务数据分布在 CRM、ERP 等系统，不同 Agent 需要分别接入 | 将业务接口封装为能力服务，统一发现与调用，供不同 Agent 和项目复用 |
+| 研究、报告制作等工作反复发生，每次都需要重新准备角色、技能和执行环境 | 将固定职能配置为常驻 A2A Agent，复用角色与环境，为新任务建立独立会话并回传交付物 |
+| 工具与技能越来越多，难以判断有哪些、怎样使用 | 先按任务搜索摘要，再读取选中方法的参数契约或技能指南 |
+| 过去的工作过程和产物分散在不同工具中 | 通过独立服务检索原始会话、文档页面、表格区域或视频片段，保留出处与定位 |
+
+例如：把已有转写引擎作为服务接入后，负责整理录音和负责撰写报告的 Agent 可以调用同一套实现；把项目技能发布后，不同宿主可以读取同一来源的指南和配套资源。新增一个 Agent 时，已有能力可以继续沿用，仍需完成该宿主的接入与权限配置。
+
+这套方式尤其适合同时使用多种 Agent、有多台设备、自建工具或专业处理环境的人。只使用一个 Agent 和少量标准连接器时，可以先使用平台已有能力，按实际复用需求逐步接入 DreamMate。
+
+## 工作方式
+
+1. **接入能力**：服务在所在设备向 DreamMate Node 报备；已有 MCP 可以作为来源接入。CRM、ERP 等业务系统可通过现有 MCP 或自定义适配服务接入；专职 Agent 由执行宿主与 A2A 网关提供任务入口。技能和产物由各自独立的提供者管理。
+2. **按需发现**：Agent 通过 MCP 或一次性 CLI 搜索工具与技能，只读取当前任务需要的说明。
+3. **在目标设备执行**：确认具体方法与参数后，经目标 Node 调用服务；较完整的工作可经 A2A 网关委托给常驻角色，按任务查询状态并获取交付结果。软件和执行依赖留在实际提供能力的设备上。
+4. **持续复用**：在能力来源维护工具与技能，供后续任务和其他已接入的 Agent 使用。技能源端更新反映在下次查询中，已运行会话按各自宿主的加载方式处理。
+
+MCP/CLI 是 Agent 使用网络的入口，HTTP 是服务报备与节点调用的接口。跨节点调用要求目标网关可达；网络连接仍需通过已有局域网、Tailnet 或其他网络方案准备。
+
+### 与 Personal Agent 平台的关系
+
+Grok Bot 这类平台提供持续工作的 Agent 和执行环境；DreamMate 提供独立维护的能力发现、连接与复用层。平台本身也能接工具和访问设备，DreamMate 的选择理由在于：**同一套能力可以供不同 Agent 与项目沿用，减少重复接入和维护的工作。**
+
+支持 MCP 或 CLI 的宿主具备接入基础，具体权限、网络与工具加载方式仍取决于该宿主。DSH 已有[配套插件](packages/dsh-plugin/README.md)；原生 ACP 会话使用独立的工具配置。提及 Grok Bot 用于说明产品关系，不代表本仓库已经完成该平台的端到端适配。
+
+## 项目族谱与快速跳转
+
+这些项目共同组成 DreamMate 的能力基础设施，各仓库的职责和发布节奏保持独立。下图按职责展示“家族关系”，**不是 npm 依赖树，也不表示需要全部安装**。
+
+```mermaid
+flowchart LR
+    family["DreamMate · Personal Agent Infra"]
+    family --> protocol["dreammate-network<br/>公共协议与类型"]
+    family --> node["dreammate-node · 本仓库<br/>设备入口 / CLI / MCP"]
+    family --> reader["session-reader / 1session<br/>跨宿主会话检索"]
+    family --> acp["1acp / acp-service<br/>原生 Agent 会话与任务委托"]
+    family --> services["可扩展的能力服务"]
+    services --> tools["通用工具<br/>Transcribe / Bash MCP / File System MCP"]
+    services --> business["第三方或自建业务系统<br/>CRM / ERP / 项目管理"]
+    services --> resident["常驻 A2A Agent<br/>固定职能 / 持续接单 / 产物回传"]
+    acp -->|"执行与 A2A 委托"| resident
+    reader -.->|"可选历史检索与追溯"| resident
+    family -.-> phone["1agents_phone<br/>原生设备能力 · 网络接入推进中"]
+    node --> skills["skill-manager<br/>技能来源与版本化读取"]
+    node --> artifacts["artifact-index<br/>本地产物检索与定位"]
+    node --> plugin["dsh-dreammate-node<br/>DSH 接入插件"]
+```
+
+### 核心项目
+
+| 项目与快速跳转 | 职责 | 与其他项目的关系 |
+| --- | --- | --- |
+| [DreamMate Network](https://github.com/scottzx/dreammate-network) · `@1agents/dreammate-network` | Node、Service、Execution 等公共协议、Schema 与类型 | 供各项目使用的公共语言；不运行服务或业务流程 |
+| [DreamMate Node](#dreammate-node-设备入口) · `@1agents/dreammate-node` | 每台设备的登记、发现、探活与调用入口；提供 CLI/MCP | 使用协议包，代理本机 HTTP/CLI 服务，连接其他设备的网关 |
+| [Skill Manager](packages/skill-manager/README.md) · `@1agents/skill-manager` | 技能来源发现、整包版本、指南及资源读取 | 本仓库独立包，通过 HTTP 向 Node 报备；原件保留在项目或共享目录 |
+| [Artifact Index](packages/artifact-index/README.md) · `@1agents/artifact-index` | PDF、PPT、Excel、视频的检索与原始定位 | 本仓库独立包；可向 Node 发布只读服务，复用已登记的本地模型 |
+| [Session Reader / 1session](https://github.com/scottzx/session-reader) · `@1agents/session-reader` | 读取与检索多个宿主的原始落盘会话 | 可独立使用、提供 DSH 历史入口，也可作为网络中的会话读取服务，为常驻角色提供历史查询与工作追溯 |
+| [1ACP](https://github.com/scottzx/1acp) · `@1agents/acp-service` | 原生 Agent 持久会话、ACP 接入与可选 A2A 委托 | 一个公开包包含运行时、服务、CLI 与 DSH 集成；为常驻角色提供执行与派单基础，A2A 网关可向 Node 报备 |
+| [DSH 接入插件](packages/dsh-plugin/README.md) · `@1agents/dsh-dreammate-node` | 在 DeepSeek Harness 中提供能力网络工具 | 本仓库的独立适配包，依赖 Node；复用或按需拉起本机网关 |
+| [1agents_phone](https://github.com/scottzx/1agents_phone) | 原生移动端与设备能力项目 | 独立项目；原生能力存在与通过能力网络可调用是不同阶段，具体入网进度以该项目为准 |
+
+Skill Manager、Artifact Index 与 Node 分别安装、维护版本，通过协议协作；它们之间没有彼此的 npm 运行时依赖。DSH 插件则直接依赖 Node。Session Reader 与 ACP 服务是其他独立仓库，安装条件以各项目说明为准。
+
+[DeepSeek Harness（DSH）](https://github.com/deepseek-ai/deepseek-harness) 是外部 Agent 宿主。Node 插件为其提供网络工具，Session Reader 提供历史浏览，ACP 服务提供原生 Agent 会话；三个入口分别安装，职责独立。
+
+### 可复用的能力服务
+
+能力服务包括通用工具、第三方或自建业务系统，以及固定职能的常驻 A2A Agent。工具与业务接口通过方法调用使用；常驻 Agent 接受完整任务，返回执行状态与交付物。网络提供统一的发现与接入入口，具体执行方式由各服务负责。
+
+#### 通用工具能力
+
+| 项目 | 能力 |
+| --- | --- |
+| [Transcribe](https://github.com/scottzx/transcribe) · `@1agents/transcribe` | 语音转写、逐字稿与字幕输出 |
+| [Bash MCP](https://github.com/scottzx/bash-mcp) · `@1agents/bash-mcp` | 终端执行与异步任务 |
+| [File System MCP](https://github.com/scottzx/file-system-mcp) · `@1agents/file-system-mcp` | 文件系统操作 |
+
+这些服务按需要部署和报备。具备 CLI/MCP 接口、已安装或出现在项目清单中，都不代表已经在当前设备启动或对网络开放。
+
+#### 自定义业务能力
+
+CRM、ERP、项目管理及其他业务系统，可以将已有接口封装为能力服务。适配层声明方法、参数和返回结构，业务数据与规则继续由原系统管理。完成接入后，同一服务可以供不同 Agent 复用，减少按宿主重复编写连接逻辑的工作。
+
+| 业务系统 | 可封装的能力示例 | Agent 使用场景 |
+| --- | --- | --- |
+| CRM | 查询客户与商机、读取跟进记录、更新客户状态 | 整理客户背景、准备跟进材料、记录已确认的跟进结果 |
+| ERP | 查询订单、库存和应收，创建业务单据草稿 | 汇总订单进度、核对库存、准备经营分析 |
+| 项目管理系统 | 查询项目与工作项、创建任务、更新进度 | 拆解需求、整理待办、汇总项目状态 |
+| 自建业务系统 | 按实际接口封装查询、计算、校验和业务操作 | 将已有业务流程接入 Agent 的工作过程 |
+
+上表是能力封装示例，具体可用方法取决于业务系统接口、适配实现与授权范围。
+
+接入方式包括：
+
+- **已有 MCP 服务**：通过[自定义 MCP 接入](docs/custom-mcp.md)连接本地 stdio 或远程 MCP，复用上游工具契约。
+- **已有业务 API 或 SDK**：编写符合 Node 调用约定的 HTTP/CLI 适配服务，或包装为 MCP，再接入能力网络。方法契约与报备方式见[服务报备说明](#服务怎么报备)。
+- **需要隔离调用身份**：通过[客户端私有配置](docs/custom-mcp.md#客户端私有配置独立-token-身份)使用不同上游 Token，权限校验由业务系统执行。
+
+已有[Plane MCP 桥接示例](deploy/plane-bridge/README.md)展示了复用业务系统 MCP、声明方法契约并接入 Node 的路径。[ERP 独立 Token 配置示例](docs/custom-mcp.md#客户端私有配置独立-token-身份)说明了管理员与只读身份的区分方式。
+
+业务写入与审批规则由上游系统及 Agent 宿主落实；当前网络共用模式不会自动增加按用户、Agent 或业务方法划分的权限控制。接口适配与数据同步分别实现，接入能力网络不会自动建立系统间同步流程。
+
+#### 固定职能的常驻 A2A Agent
+
+基于 ACP Service 的执行与 A2A 委托能力，可以将已有技能和执行环境组织为**固定职能、持续接单的常驻智能体**，并按需结合 Session Reader 的历史读取与检索能力。角色长期保留职责范围、技能绑定、工作目录和交付约定，由上游 Agent 按需派发任务。
+
+| 组成 | 职责 |
+| --- | --- |
+| 固定角色与技能 | 定义职能、输入输出、使用规范和验收要求，复用已绑定的技能及运行依赖 |
+| ACP Service 与执行宿主 | 提供原生 Agent 执行和会话承载；新任务建立独立会话，同一任务的补充与返工可沿用原会话 |
+| A2A 网关 | 接收任务委托，跟踪状态，收集结果与产物链接，并将完成通知回投调用方 |
+| Session Reader（可选） | 只读检索原始会话，为任务准备、历史核对和交付追溯提供依据 |
+
+可按固定职能配置的角色示例：
+
+| 常驻角色 | 任务范围 | 交付物示例 |
+| --- | --- | --- |
+| 资料研究 Agent | 围绕指定问题收集材料、核对来源、整理结论 | 研究记录、来源清单与分析报告 |
+| 报告与演示制作 Agent | 按指定资料、模板和要求制作报告或演示 | 文档、演示文件与预览图 |
+| 客户资料整理 Agent | 调用已授权 CRM 等业务能力，整理客户背景与跟进材料 | 客户简报、跟进草稿与业务记录引用 |
+
+角色配置与宿主服务保持可用，模型按任务调用；多个角色可以共享宿主。角色职能持续保留，任务上下文按任务组织，角色划分本身不构成进程或操作系统隔离。
+
+典型过程是：上游提交任务与输入 → 常驻角色在任务会话中执行 → 生成结果与产物链接 → 调用方接收通知或查询结果 → 核验交付并确认处理。Session Reader 为其中的历史查询和过程追溯提供支持，不承担派单或执行。
+
+配置与接口见 [ACP Service / A2A 说明](https://github.com/scottzx/1acp/blob/main/packages/service/README.md)和 [Session Reader](https://github.com/scottzx/session-reader)。当前 A2A 执行端由 DSH 宿主承载，独立 `acp-service serve` 提供 ACP 会话接口。A2A 需显式启用并完成角色、技能和宿主配置；完成通知、产物可访问性及主会话自动唤醒需要分别验证，主会话唤醒依赖接收宿主适配。
+
+### 相关工具与历史分支
+
+| 项目 | 关系与跳转 |
+| --- | --- |
+| [Feature Blueprint / 思维导图](https://github.com/scottzx/feature-blueprint) | 思维导图、自由画布、CLI 与 DSH 工具；可独立使用。Voice Canvas 源码已迁入其 `canvas/`，随根包统一构建与发布 |
+| [Voice Canvas 来源仓](https://github.com/scottzx/voice-canvas) | 画布模块的来源与历史记录，当前安装入口以 Feature Blueprint 为准 |
+| [myContext](https://github.com/scottzx/myContext) | 相关上下文工具；独立项目，不是 Node 的必装组件 |
+| [老板 IP 工作台](https://github.com/scottzx/boss-ip) | 业务应用分支 |
+| [DSH Plugin Registry](https://github.com/scottzx/dsh-plugin-registry) / [Awesome DSH Plugin](https://github.com/scottzx/awesome-dsh-plugin) | 插件登记与目录项目 |
+| [早期 1Agents 工作台](https://github.com/scottzx/1Agents) | 已停止开发的历史工作台，保留源码与沿革；当前能力网络不要求部署该工作台及旧服务端 |
+
+完整名称、别名、仓库和包身份保存在 [项目身份清单](ecosystem/projects.json)；其中版本为审计时点的记录。实际安装与兼容要求以各项目当前说明为准，依赖核验与发布记录方式见[生态维护说明](ecosystem/README.md)。
+
+## 当前支持与边界
+
+- **现有能力**：节点与工具发现、方法契约读取、HTTP/CLI 调用、外部 MCP 接入、技能检索与版本化读取、部分服务启停；会话和产物检索由独立服务提供。
+- **部署条件**：能力需要预先安装或封装、报备并保持可达。只读到技能指南，不会自动获得执行脚本所需的软件、模型或设备；来源设备离线时，无法继续读取其技能。
+- **共享范围**：网络来源支持 `local` / `network`。当前网络共用模式基于可信主机与网络；按客户端 Token 使用独立上游身份另有[私有配置](docs/custom-mcp.md#客户端私有配置独立-token-身份)，尚无覆盖整个共享网络的按用户、Agent、方法细分授权。
+- **历史与产物**：会话读取保留原始记录，产物需显式建立索引并开放共享；各平台的全部记忆、人格与运行状态没有自动同步。
+- **任务协作**：固定职能常驻 Agent 复用角色、技能和执行环境，原生会话与 A2A 由 ACP 服务及执行宿主承载，历史读取由 Session Reader 提供；A2A 默认关闭，完成通知唤醒主 Agent 需要接收宿主适配。
+
+## 技术文档
+
+| 文档 | 内容 |
+| --- | --- |
+| [渐进式能力发现](docs/architecture-mcp-mesh.md) | 工具搜索、按需读取契约及架构演进 |
+| [自定义 MCP 接入](docs/custom-mcp.md) | 外部 MCP、共享范围、客户端私有身份 |
+| [本地向量模型](docs/local-embeddings.md) | 模型准备、按需加载、共享与故障排查 |
+| [工具检索评估](docs/tool-search-evaluation.md) / [产物检索评估](docs/artifact-index-evaluation.md) | 已记录的测评结果与适用范围 |
+| [安全架构设计](docs/security-architecture.md) | 当前安全模型与后续设计，规划项以文档进度为准 |
+
+下面是 DreamMate Node 的安装、服务报备、调用和诊断说明。
+
+## DreamMate Node 设备入口
+
+> DreamMate Network 的**本机 node agent**：让设备和软件向智能体公开自身能力，并提供统一的发现与调用入口。
 > 服务端固定监听 **36908**；`cli` 模式按需执行，不监听端口。运行时依赖 L0 协议包与 MCP SDK。
 
 一台机器跑一个。它是这台机器对网络的唯一入口，负责**登记、发现、执行**——
@@ -39,8 +218,8 @@ pnpm dsh plugin --profile web add @1agents/dsh-dreammate-node
 # 重启 DSH 后生效；desktop 使用 --profile desktop
 ```
 
-当前 DSH 插件依赖 `dreammate-node ~0.7.1`，提供发现、查看契约和调用等 7 个旧工具，默认使用本机 `36908`。
-本仓库网关源码新增的搜索与有界发现功能，可通过构建后的 CLI/MCP 使用；插件需要后续升级其依赖才能提供这些功能。
+当前仓库中的 DSH 插件依赖 `@1agents/dreammate-node ^0.15.0`，直接注册该依赖导出的 MCP 元工具，覆盖工具与技能搜索、契约读取及调用等入口，默认使用本机 `36908`。
+DSH 插件需要 Node.js >=22.19；旧 profile 应按插件说明同步更新依赖与锁文件，已有运行中的网关需单独核对版本。
 配置与进程生命周期见 [DSH 插件说明](packages/dsh-plugin/README.md)。
 
 ```bash
@@ -52,10 +231,10 @@ dreammate-node uninstall
 
 macOS 装 launchd LaunchAgent（`~/Library/LaunchAgents/work.dreammate.node.plist`），
 Linux 装 systemd user unit（`~/.config/systemd/user/dreammate-node.service`），
-**两边都不需要 sudo**——agent 只读本机服务清单，没有要 root 的理由。
-挂了会自动拉起（KeepAlive / Restart=always），日志在 `~/.1agents/logs/`。
+**两边都不需要 sudo**，服务配置、日志与状态文件保存在当前用户目录。
+进程退出后自动重启（KeepAlive / Restart=always），日志位于 `~/.1agents/logs/`。
 
-> Linux 上用户级 systemd 服务在登出后会被停掉，服务器上要真常驻得开 linger：
+> Linux 用户级 systemd 服务在登出后会停止，服务器长期运行需启用 linger：
 > `sudo loginctl enable-linger <user>`。`install` 会检测并提示。
 
 前台跑（调试用）：
@@ -172,11 +351,11 @@ session-reader 提供会话记录的工作目录及归并后的项目路径；�
 异常退出遗留锁时，先检查锁记录中的 PID 已停止，再删除该锁文件并重试，正常写入会自动清理锁。
 
 ```sh
-dreammate-node skills add --name my-project --project /absolute/path/to/project
-dreammate-node skills add --name my-skills --dir /absolute/path/to/skills
+dreammate-node skills add --name sample-project --project /absolute/path/to/project
+dreammate-node skills add --name sample-skills --dir /absolute/path/to/skills
 dreammate-node skills list
-dreammate-node skills refresh skills-my-project
-dreammate-node skills remove skills-my-project
+dreammate-node skills refresh skills-sample-project
+dreammate-node skills remove skills-sample-project
 ```
 
 只登记需要发布的目录：目录中的技能指南和未排除的配套文件可经网关读取。
@@ -189,7 +368,7 @@ dreammate-node skills remove skills-my-project
 
 ```sh
 dreammate-node cli search-skills --agent http://GATEWAY:36908 --query '改进三维场景的灯光和材质'
-dreammate-node cli search-skills --agent http://GATEWAY:36908 --query 'CAD 提取' --source skills-my-skills
+dreammate-node cli search-skills --agent http://GATEWAY:36908 --query 'CAD 提取' --source skills-sample-skills
 dreammate-node cli read-skill --agent http://GATEWAY:36908 --node DEVICE --skill SKILL_ID --revision HASH
 dreammate-node cli read-skill --agent http://GATEWAY:36908 --node DEVICE --skill SKILL_ID --revision HASH --resource references/stages.md
 ```
@@ -253,10 +432,11 @@ dreammate-node embedding uninstall
 `dreammate-node embedding config --priority 100 --sharing local` 修改。
 默认文件 `~/.1agents/embedding-config.json` 的 `priority` 覆盖安装时的 `--priority` 兜底值，数值越大越优先。
 运行中的启动器每 15 秒重读并更新报备，无需重启模型或 MCP；配置变更不延长模型空闲时间。
-详细格式和异常处理见 [本地模型配置](docs/local-embeddings.md#通过配置调整优先级)。
+详细格式和异常处理见 [本地模型配置](docs/local-embeddings.md#通过配置调整优先级与待命时间)。
 
 macOS launchd 只保持轻量 HTTP 启动器在线；首次实际编码请求才启动 Python 和模型。
-最后一个编码请求结束后连续空闲 5 分钟，退出 Python 释放模型内存；下一次检索重新加载。
+最后一个编码请求结束后默认连续空闲 60 秒，退出 Python 释放模型内存；上例通过 `--idle-timeout-ms 300000` 显式设为 5 分钟，下一次检索重新加载。
+已有配置文件中的 `idle_timeout_ms` 优先于安装参数，可通过 `dreammate-node embedding config --idle-timeout-ms 300000` 持久修改。
 健康检查和每 15 秒的服务报备不会加载模型或重置空闲时间，多个 CLI/MCP 共用同一个模型进程。
 `status` 的 `loaded`、`loading`、`worker_pid`、`idle_timeout_ms` 分别报告模型状态，启动器在线不等于模型已加载。
 按需运行器将文档文本哈希及向量保存在 `~/.1agents/cache/embeddings/`，不保存原文或查询。
@@ -267,8 +447,9 @@ macOS launchd 只保持轻量 HTTP 启动器在线；首次实际编码请求才
 本机仍可使用网络共享的远端备用模型。`network` 才会向其他设备开放本模型，旧配置省略时保持网络共享行为。
 显式 `--node localhost` 没有远端回退，与模型共享范围分别配置。
 不设置固定 `DREAMMATE_EMBEDDING_URL`，已有 MCP 可在后续搜索中自动发现新服务。
-首次模型加载和未缓存的目录编码都计入语义预算；当前 Mac 的 MCP 配置为 30 秒，独立 CLI 需显式传
-`DREAMMATE_EMBEDDING_TIMEOUT_MS=30000`，并以 `--timeout-ms 60000` 为整条命令预留发现时间。
+首次模型加载和未缓存的目录编码都计入语义预算，显式超时优先于按需服务声明的冷启动预算。
+独立 CLI 不继承 MCP 宿主的专属配置；若需 30 秒语义预算，可显式设置 `DREAMMATE_EMBEDDING_TIMEOUT_MS=30000`，
+并以 `--timeout-ms 60000` 为整条命令预留发现时间。
 这一步不下载模型，安装路径、完整生命周期及故障说明见 [本地模型文档](docs/local-embeddings.md)。
 
 ## iSH / 无常驻进程的客户端
@@ -278,7 +459,7 @@ macOS launchd 只保持轻量 HTTP 启动器在线；首次实际编码请求才
 Tailscale CLI，不生成本机身份或服务注册表。可以手动导入一份持久化的设备地址簿；日常调用只读缓存，不后台刷新。桌面和服务器上的常驻模式继续可用。
 
 ```bash
-# 指向已有的、从 iSH 可以访问的网关；把地址替换成自己的设备地址
+# 地址应替换为可由 iSH 访问的已运行网关地址
 export DREAMMATE_AGENT_URL=http://100.x.y.z:36908
 
 dreammate-node cli nodes
@@ -286,9 +467,9 @@ dreammate-node cli search --query '读取笔记'           # 默认跨已知节�
 dreammate-node cli search --query '读取笔记' --node localhost # 只搜入口网关所在设备
 dreammate-node cli services                 # 分页浏览入口网关上的服务摘要
 dreammate-node cli services --node all      # 显式浏览：从入口网关取清单，再直连各节点
-dreammate-node cli inspect --node my-mac --service notes # 仅分页方法摘要
-dreammate-node cli inspect --node my-mac --service notes --method read
-dreammate-node cli invoke --node my-mac --service notes --method read --params '{"id":"123"}'
+dreammate-node cli inspect --node sample-mac --service notes # 仅分页方法摘要
+dreammate-node cli inspect --node sample-mac --service notes --method read
+dreammate-node cli invoke --node sample-mac --service notes --method read --params '{"id":"123"}'
 
 # 较大参数可通过标准输入提供
 cat params.json | dreammate-node cli invoke --service notes --method read --params -
@@ -417,14 +598,14 @@ await reportAndHoldRegistration({
 });
 ```
 
-**报备是可选的，而且永不抛错。** agent 没装、没起、版本对不上，服务都该照常
-工作——返回值告诉你成没成，要不要提示用户由你决定。不报备也能被发现，只是
-外部得靠[约定端口](https://github.com/scottzx/dreammate-network)碰运气。
+**服务报备是可选的。** Node 未安装、未启动或报备请求失败时，客户端通过 `ok` / `reason`
+返回结果，业务服务可据此处理并继续运行。监听[协议约定端口](https://github.com/scottzx/dreammate-network)
+且提供 `/manifest` 的服务，还可在 Node 启动时被探测登记。
 
 ## 两件容易想错的事
 
 **Node 在线 ≠ Service 在线。** tailnet 的 `Online` 只说明机器开着；进程被 kill
-了它照样报在线。所以 agent 必须自己定期探各服务的 `/health`，连续失败 5 次
+后仍会报告在线。因此 Node 必须定期探测各服务的 `/health`，连续失败 5 次
 才移除——抖一下不该被清掉。
 
 **reachability 不是「能不能被调用」。** `localhost` 表示服务只监听回环，远端调用方**不能直接**连那个端口；`network` 表示服务可被直连。manifest 仍然如实报告可达性，避免给一个看着能连、连上却超时的地址。
@@ -466,7 +647,7 @@ HTTP 侧对应 `GET /nodes`、`POST /services/:id/invoke`、`POST /capabilities/
 在运行网关的机器上粘贴标准 `mcpServers` JSON，即可连接本地 stdio 或远程 Streamable HTTP / SSE MCP，自动发现工具并接入现有搜索、inspect 和调用：
 
 ```bash
-dreammate-node mcp add --config '{"mcpServers":{"demo":{"command":"npx","args":["-y","your-mcp-server"]}}}'
+dreammate-node mcp add --config '{"mcpServers":{"demo":{"command":"npx","args":["-y","example-mcp-server"]}}}'
 dreammate-node mcp add --file ./mcp.json
 cat ./mcp.json | dreammate-node mcp add --file -
 dreammate-node mcp list
@@ -504,7 +685,7 @@ node scripts/local-embeddings/serve.mjs --model qwen3 --port 8766 --agent http:/
 
 > ⚠️ **澄清认知误区：回环 ≠ 100% 绝对安全。**  
 > `127.0.0.1` 只能防止外部网络机器直连，但**不防同机其他非受信任进程**——任何本地进程都能向 `POST /services` 报备。当前 MVP 基于**受信任主机（Trusted Host）威胁模型**。  
-> 长期架构演进中（Phase 2），我们将升级为 **Unix Domain Socket (UDS)**，结合操作系统内核鉴真（`SO_PEERCRED` 提取进程 PID 与可执行文件指纹）并由 Node 权威签发短期 **Capability Lease** 租约，实现真正的双向零信任。  
+> 后续架构设计（Phase 2）计划引入 **Unix Domain Socket (UDS)**，结合操作系统内核鉴真（`SO_PEERCRED` 提取进程 PID 与可执行文件指纹），并由 Node 权威签发短期 **Capability Lease** 租约，以支持双向身份校验与授权。
 > 完整设计见 [安全架构规范文档](docs/security-architecture.md)。
 
 ## 节点身份

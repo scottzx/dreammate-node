@@ -6,7 +6,7 @@ No separate global install, MCP configuration or daemon command is required.
 
 ## Install
 
-From your DSH checkout (tested with DSH 0.1.7-rc.2, Node.js >=22.19):
+From a DSH checkout (tested with DSH 0.1.7-rc.2, Node.js >=22.19):
 
 ```sh
 pnpm dsh plugin --profile web add @1agents/dsh-dreammate-node
@@ -16,27 +16,30 @@ pnpm dsh web
 Restart an already running DSH after installation. Use `desktop` instead of `web`
 for that profile; omit `pnpm` when using an installed `dsh` executable.
 The package's `dsh.bundle.patch` registers the Host plugin automatically.
-Installing the package alone starts no processes and runs no install scripts.
+The plugin defines no install-time scripts, and installing it starts no services.
+Its `dreammate-node` dependency can install bundled skill guides through npm
+`postinstall`; see [automatic skill installation](../../README.md#npm-安装时自动安装对应-skill).
 
 Ask the DSH Agent to find devices/services, inspect a method, then call it:
 
 > 查看 DreamMate 网络中有哪些设备，查找转写服务，读取它的方法契约。
 
-The current plugin depends on `@1agents/dreammate-node ~0.7.1` and exposes seven tools:
-`dreammate_list_nodes`, `dreammate_list_services`, `dreammate_list_capabilities` (compatibility alias),
-`dreammate_inspect`, `dreammate_invoke`, `dreammate_download_skill`, and
-`dreammate_manage_service`. Their original JSON schemas and descriptions are used.
+The current source package depends on `@1agents/dreammate-node ^0.15.0` and registers
+the dependency's exported `MCP_TOOLS`, including tool search, skill search and
+versioned skill reads alongside discovery, inspection, invocation and lifecycle
+tools. Their original JSON schemas and descriptions are used.
 Results retain the complete MCP envelope as JSON, including structured data and
 non-text blocks; MCP business errors also become DSH tool failures. Calls pass
 through the normal DSH tool policy pipeline. Native ACP sessions execute their
 own Agent tools and do not automatically gain these DSH tools.
 
-The gateway source in this repository adds `dreammate_search_tools`, bounded
-directory results and optional local embeddings. These changes are available
-through the built gateway's CLI/MCP; this plugin will gain them only after its
-gateway dependency and lockfile are upgraded. This change does not upgrade or
-publish the plugin. See the [gateway discovery guide](../../README.md#智能体怎么发现和调用)
-and [local embeddings](../../docs/local-embeddings.md) for the source implementation.
+Tool and skill discovery use bounded results and load full method contracts or
+skill resources only when requested. Optional local embeddings use separately
+prepared model services. See the [gateway discovery guide](../../README.md#智能体怎么发现和调用)
+and [local embeddings](../../docs/local-embeddings.md). Update an older DSH profile's
+dependency and lockfile together; an already running external node must be checked
+and upgraded separately. This documentation update does not publish a package or
+change a running deployment.
 
 This plugin lets DSH consume the capability network. It does not publish DSH
 sessions as a remotely callable service.
