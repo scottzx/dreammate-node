@@ -28,11 +28,18 @@ import type { NetworkNode } from './identity.js';
 import { directoryNodeUrl, findDirectoryNode, type NodeDirectory } from './node-directory.js';
 import { installSkillPackage, listSkillArchive } from './skills.js';
 import { withRequestTimeout } from './request-timeout.js';
-import { pageResponse, parsePageOptions, searchTools, searchSkills } from './tool-search.js';
+import { pageResponse, parsePageOptions } from './tool-search.js';
 import { discoverEmbeddingProviders } from './embedding-providers.js';
 import { scanSkillCatalog } from './skill-catalog.js';
 import { installMcpReload } from './mcp-runtime.js';
 import { loadPrivateMcpSources, type PrivateMcpSources } from './mcp-client-sources.js';
+
+// Follow the handler generation during SIGHUP reloads so a resident client does
+// not retain the old search deadlines through Node's dependency module cache.
+const retrievalUrl = new URL(new URL(import.meta.url).pathname.endsWith('.ts') ? './tool-search.ts' : './tool-search.js', import.meta.url);
+const generation = new URL(import.meta.url).searchParams.get('build');
+if (generation) retrievalUrl.searchParams.set('build', generation);
+const { searchTools, searchSkills } = await import(retrievalUrl.href) as typeof import('./tool-search.js');
 
 export interface McpOptions {
   agentUrl?: string;

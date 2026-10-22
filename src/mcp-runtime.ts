@@ -6,7 +6,8 @@ import type { McpOptions } from './mcp.js';
 /** Reload future requests without replacing the transport or replaying in-flight calls. */
 export async function reloadMcpHandlers(server: Server, options: McpOptions = {}): Promise<void> {
   const url = new URL(import.meta.url.endsWith('.ts') ? './mcp.ts' : './mcp.js', import.meta.url);
-  url.searchParams.set('build', String(fs.statSync(url).mtimeMs));
+  const retrieval = new URL(import.meta.url.endsWith('.ts') ? './tool-search.ts' : './tool-search.js', import.meta.url);
+  url.searchParams.set('build', `${fs.statSync(url).mtimeMs}:${fs.statSync(retrieval).mtimeMs}`);
   const current = await import(url.href) as typeof import('./mcp.js');
   if (!Array.isArray(current.MCP_TOOLS) || typeof current.callDreammateTool !== 'function') throw new Error('Invalid MCP runtime');
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: current.MCP_TOOLS }));

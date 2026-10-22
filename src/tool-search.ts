@@ -203,16 +203,19 @@ export interface ToolSearchOptions {
   responseBase?: Record<string, unknown>;
 }
 
+function coldStartTimeout(provider?: Pick<EmbeddingProvider, 'lifecycle' | 'coldStartTimeoutMs'>): number | undefined {
+  const advertised = provider?.lifecycle === 'on_demand' ? provider.coldStartTimeoutMs : undefined;
+  // Validate again because callers can also supply providers without discovery.
+  return typeof advertised === 'number' && Number.isSafeInteger(advertised)
+    && advertised >= 1 && advertised <= 60000 ? advertised : undefined;
+}
+
 /** One shared search budget; explicit caller/environment settings always win. */
 export function embeddingSearchTimeoutMs(options: Pick<ToolSearchOptions, 'embeddingTimeoutMs'>,
   firstProvider?: Pick<EmbeddingProvider, 'lifecycle' | 'coldStartTimeoutMs'>,
   environmentTimeout: string | undefined = process.env.DREAMMATE_EMBEDDING_TIMEOUT_MS): number {
-  const advertised = firstProvider?.lifecycle === 'on_demand' ? firstProvider.coldStartTimeoutMs : undefined;
-  // Validate again because callers can also supply providers without discovery.
-  const coldStartTimeoutMs = typeof advertised === 'number' && Number.isSafeInteger(advertised)
-    && advertised >= 1 && advertised <= 60000 ? advertised : undefined;
   const timeoutMs = options.embeddingTimeoutMs ?? (environmentTimeout === undefined
-    ? coldStartTimeoutMs ?? 5000 : Number(environmentTimeout));
+    ? coldStartTimeout(firstProvider) ?? 5000 : Number(environmentTimeout));
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60000) throw new Error('embeddingTimeoutMs 必须是 1–60000');
   return timeoutMs;
 }
@@ -393,6 +396,7 @@ async function rankCards(index: IndexedCard[], args: Record<string, unknown>, op
       if (!Number.isFinite(minSimilarity) || minSimilarity < -1 || minSimilarity > 1) throw new Error('DREAMMATE_EMBEDDING_MIN_SCORE 必须是 -1–1');
       const started = performance.now();
       const attempts: Record<string, unknown>[] = [];
+      search.timeout_ms = timeoutMs;
       if (automatic) search.provider_attempts = attempts;
       for (let i = 0; i < candidates.length; i++) {
         const candidate = candidates[i]!;
@@ -401,13 +405,18 @@ async function rankCards(index: IndexedCard[], args: Record<string, unknown>, op
           Object.assign(search, { semantic_status: 'unavailable', fallback_reason: '本地 embedding 总时间预算已耗尽' });
           break;
         }
-        // Reserve time for a warm backup without multiplying the total deadline.
-        const budget = i === 0 && candidates.length > 1 ? Math.max(1, Math.floor(remaining * 0.7)) : remaining;
+        // A cold-start grant cannot be shortened just because a backup exists.
+        // Early failures can still use the remaining shared budget; a completed
+        // primary deadline cannot create extra time for another cold start.
+        const reserveBackup = i === 0 && candidates.length > 1 && coldStartTimeout(candidate.provider) === undefined;
+        const budget = reserveBackup ? Math.max(1, Math.floor(remaining * 0.7)) : remaining;
         const identity = candidate.provider ? { node: clip(candidate.provider.node, 40), service_id: clip(candidate.provider.service_id, 100) } : {};
+        const attemptStarted = performance.now();
+        const diagnostics = () => ({ ...identity, budget_ms: budget, elapsed_ms: Math.round(performance.now() - attemptStarted) });
         try {
           const retrieved = await semanticScores(index, query, candidate, budget);
           semantic = retrieved.scores;
-          if (automatic) attempts.push({ ...identity, status: 'ok' });
+          if (automatic) attempts.push({ ...diagnostics(), status: 'ok' });
           Object.assign(search, { mode: 'hybrid', ranking: 'semantic_then_keywords', semantic_status: 'ok', model: retrieved.model, min_similarity: minSimilarity,
             ...(automatic ? { provider: { source: 'discovered', ...identity }, encoding: candidate.provider!.encoding } : {}),
             score_semantics: 'ranking only: semantic = 1 + cosine; keyword-only = 1/(60 + rank); exact method first' });
@@ -415,7 +424,7 @@ async function rankCards(index: IndexedCard[], args: Record<string, unknown>, op
           break;
         } catch (error) {
           const reason = clip(error instanceof Error ? error.message : String(error), 160);
-          if (automatic) attempts.push({ ...identity, status: 'failed', reason: clip(reason, 80) });
+          if (automatic) attempts.push({ ...diagnostics(), status: 'failed', reason: clip(reason, 80) });
           Object.assign(search, { semantic_status: 'unavailable', fallback_reason: reason });
         }
       }

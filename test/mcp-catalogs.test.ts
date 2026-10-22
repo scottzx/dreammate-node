@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { AddressInfo } from 'node:net';
+import { createServer } from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { createAgent } from '../src/server.js';
 import { ServiceRegistry } from '../src/registry.js';
@@ -95,6 +96,46 @@ test('a resident MCP connection reloads legacy inspect handlers and fetches only
       assert.ok(Object.values(directory.methods).every(value => !(value as { parameters?: unknown }).parameters));
       const stats = await manager.invoke('mcp-fixture', { method: 'fixture_stats' });
       assert.equal((stats.data as { structuredContent: { calls: { name: string }[] } }).structuredContent.calls.filter(c => c.name === 'catalog_describe').length, 1);
+    } finally { await client.close(); }
+  });
+});
+
+test('resident MCP reload also replaces the cached retrieval dependency without replacing the connection', async t => {
+  let documents = 0;
+  const upstream = createServer((req, res) => {
+    let raw = '';
+    req.on('data', chunk => { raw += chunk; });
+    req.on('end', () => {
+      const body = JSON.parse(raw) as { texts: string[]; input_type: string };
+      if (body.input_type === 'document') documents += body.texts.length;
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ model: 'qwen3@reload-revision', encoding: 'reload-profile', embeddings: body.texts.map(() => [1, 0]) }));
+    });
+  });
+  await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise<void>(resolve => upstream.close(() => resolve())));
+  await withCatalog('generic', async ({ base, registry }) => {
+    registry.register({ id: 'reload-embedding', port: (upstream.address() as AddressInfo).port, execution: 'http',
+      metadata: { embedding_provider: { protocol: 'dreammate.embedding.v1', ready: true, model: 'qwen3',
+        revision: 'reload-revision', dimensions: 2, encoding: 'reload-profile' } } });
+    const client = new Client({ name: 'reload-retrieval-test', version: '1' });
+    const transport = new StdioClientTransport({ command: process.execPath,
+      args: ['--import', 'tsx', fileURLToPath(new URL('./fixtures/mcp-reload-server.mjs', import.meta.url)), base], stderr: 'pipe' });
+    transport.stderr?.on('data', () => {});
+    try {
+      await client.connect(transport);
+      const search = async () => data(CallToolResultSchema.parse(await client.callTool({ name: 'dreammate_search_tools',
+        arguments: { node: 'localhost', query: 'GitHub list repositories' } })));
+      assert.equal((await search()).search.semantic_status, 'ok');
+      const initial = documents;
+      assert.ok(initial > 0);
+      assert.equal((await search()).search.semantic_status, 'ok');
+      assert.equal(documents, initial, 'the current retrieval generation reuses validated vectors');
+      const pid = transport.pid!;
+      process.kill(pid, 'SIGHUP');
+      await until(async () => (await search()).search.semantic_status === 'ok' && documents > initial);
+      assert.equal(transport.pid, pid);
+      await client.ping();
     } finally { await client.close(); }
   });
 });

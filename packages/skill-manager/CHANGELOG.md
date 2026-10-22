@@ -2,6 +2,10 @@
 
 本文件只记录 `@1agents/skill-manager` 的版本，与 DreamMate Node 独立维护。
 
+## Unreleased
+
+- 将 macOS 用户服务设为 Interactive，避免后台 CPU 和 I/O 限流导致健康检查、目录读取及语义技能检索在进入模型前超时。
+
 ## 0.2.0
 
 - 提供独立 HTTP 服务与 `dreammate-skills serve`，默认监听本机 `127.0.0.1:36909`。

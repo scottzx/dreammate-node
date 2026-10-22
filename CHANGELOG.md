@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Preserve the full effective search budget for a primary on-demand model with a valid cold-start advertisement instead of cutting it to 70% for an unused backup. Keep explicit total deadlines and early-failure fallback, expose per-attempt budgets and elapsed time, and reload retrieval code with resident MCP handlers.
+- Keep macOS Skill Manager catalog and health requests responsive with Interactive scheduling, avoiding discovery timeouts before semantic skill retrieval can begin.
 - Keep gateway requests responsive during identity refreshes: share concurrent Tailscale lookups, cache topology snapshots for five seconds, and bound all CLI candidates by one total deadline with hard child cleanup. Derive identity and peers from the same snapshot and retain the canonical identity when status is temporarily unavailable.
 - Run the macOS HTTP gateway as an Interactive launchd job so background CPU and I/O throttling cannot delay startup, discovery responses or request deadlines.
 

@@ -88,7 +88,8 @@ export function renderSkillServicePlist(options: SkillServiceInstallOptions = {}
 <key>EnvironmentVariables</key><dict><key>PATH</key><string>${xml(runtimePath)}</string>${discoveryEnvironment().map(([key, value]) => `<key>${key}</key><string>${xml(value)}</string>`).join('')}</dict>
 <key>StandardOutPath</key><string>${xml(path.join(logs, 'dreammate-skills.log'))}</string>
 <key>StandardErrorPath</key><string>${xml(path.join(logs, 'dreammate-skills.err.log'))}</string>
-<key>ProcessType</key><string>Background</string>
+<!-- Catalog reads and health probes must respond to user HTTP requests promptly. -->
+<key>ProcessType</key><string>Interactive</string>
 </dict></plist>
 `;
 }

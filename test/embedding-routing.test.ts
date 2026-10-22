@@ -90,6 +90,95 @@ test('the first on-demand provider gets its advertised shared budget after more 
   assert.ok(endpoints.every(endpoint => endpoint === first.endpoint), 'a backup cannot extend the first ordinary provider’s default budget');
 });
 
+for (const explicit of [false, true]) {
+  test(`a slow on-demand primary keeps its full ${explicit ? 'explicit' : 'advertised'} budget when a backup exists`, async t => {
+    const previous = process.env.DREAMMATE_EMBEDDING_TIMEOUT_MS;
+    delete process.env.DREAMMATE_EMBEDDING_TIMEOUT_MS;
+    t.after(() => {
+      if (previous === undefined) delete process.env.DREAMMATE_EMBEDDING_TIMEOUT_MS;
+      else process.env.DREAMMATE_EMBEDDING_TIMEOUT_MS = previous;
+    });
+    let clock = 0;
+    t.mock.method(performance, 'now', () => clock);
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const budget = explicit ? 100 : 60000;
+    const delay = budget * 0.8;
+    const first = { ...provider(`cold-full-${explicit}`), lifecycle: 'on_demand' as const, coldStartTimeoutMs: 60000 };
+    const backup = provider(`cold-unused-${explicit}`);
+    const endpoints: string[] = [];
+    t.mock.method(globalThis, 'fetch', async (rawUrl: unknown, init?: RequestInit) => {
+      const recorded = request(rawUrl, init);
+      endpoints.push(recorded.endpoint);
+      if (recorded.endpoint === backup.endpoint) return new Promise<Response>(() => {});
+      await new Promise(resolve => setTimeout(resolve, delay));
+      return Response.json(response(first, recorded.body));
+    });
+    const pending = searchTools(corpus(3), { query: '查询保存的实体' }, {
+      embeddingProviders: [first, backup], ...(explicit ? { embeddingTimeoutMs: budget } : {}),
+    });
+    clock = delay;
+    t.mock.timers.tick(delay);
+    // Let response parsing, vector validation and failover finish before the next tick.
+    for (let i = 0; i < 40; i++) await Promise.resolve();
+    clock = budget + 1;
+    t.mock.timers.tick(budget + 1 - delay);
+    const result = await pending;
+    assert.equal(searchOf(result).semantic_status, 'ok');
+    assert.equal(searchOf(result).timeout_ms, budget);
+    assert.equal(searchOf(result).provider_attempts[0].budget_ms, budget);
+    assert.equal(searchOf(result).provider_attempts[0].elapsed_ms, delay);
+    assert.equal(searchOf(result).provider.service_id, first.service_id);
+    assert.ok(endpoints.every(endpoint => endpoint === first.endpoint), 'an unused backup must not cut short a successful cold start');
+  });
+}
+
+test('a stalled on-demand primary cannot extend the explicit total deadline for its backup', async t => {
+  let clock = 0;
+  t.mock.method(performance, 'now', () => clock);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const first = { ...provider('cold-stalled'), lifecycle: 'on_demand' as const, coldStartTimeoutMs: 60000 };
+  const backup = provider('cold-no-extra-time');
+  const endpoints: string[] = [];
+  t.mock.method(globalThis, 'fetch', async (rawUrl: unknown, init?: RequestInit) => {
+    endpoints.push(request(rawUrl, init).endpoint);
+    return new Promise<Response>(() => {});
+  });
+  const pending = searchTools(corpus(3), { query: '音频' }, { embeddingProviders: [first, backup], embeddingTimeoutMs: 100 });
+  clock = 100;
+  t.mock.timers.tick(100);
+  const result = await pending;
+  assert.equal(searchOf(result).semantic_status, 'unavailable');
+  assert.equal(searchOf(result).provider_attempts.length, 1);
+  assert.equal(searchOf(result).provider_attempts[0].budget_ms, 100);
+  assert.equal(searchOf(result).provider_attempts[0].elapsed_ms, 100);
+  assert.ok(endpoints.every(endpoint => endpoint === first.endpoint));
+});
+
+test('an early cold-start failure leaves only the remaining total budget for the backup', async t => {
+  let clock = 0;
+  t.mock.method(performance, 'now', () => clock);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const first = { ...provider('cold-early-failure'), lifecycle: 'on_demand' as const, coldStartTimeoutMs: 60000 };
+  const backup = provider('cold-remaining-backup');
+  t.mock.method(globalThis, 'fetch', async (rawUrl: unknown, init?: RequestInit) => {
+    const recorded = request(rawUrl, init);
+    await new Promise(resolve => setTimeout(resolve, recorded.endpoint === first.endpoint ? 20 : 10));
+    return recorded.endpoint === first.endpoint ? Response.json({ error: 'startup failed' }, { status: 503 })
+      : Response.json(response(backup, recorded.body));
+  });
+  const pending = searchTools(corpus(3), { query: '查询实体' }, { embeddingProviders: [first, backup], embeddingTimeoutMs: 100 });
+  clock = 20;
+  t.mock.timers.tick(20);
+  for (let i = 0; i < 40; i++) await Promise.resolve();
+  clock = 30;
+  t.mock.timers.tick(10);
+  const result = await pending;
+  assert.equal(searchOf(result).semantic_status, 'ok');
+  assert.equal(searchOf(result).model, backup.expectedModel);
+  assert.deepEqual(searchOf(result).provider_attempts.map((attempt: any) => ({ status: attempt.status, budget: attempt.budget_ms, elapsed: attempt.elapsed_ms })),
+    [{ status: 'failed', budget: 100, elapsed: 20 }, { status: 'ok', budget: 80, elapsed: 10 }]);
+});
+
 test('no discovered provider keeps lexical retrieval bounded without making model requests', async t => {
   const fetch = t.mock.method(globalThis, 'fetch', () => { throw new Error('no provider must mean no embedding request'); });
   const result = await searchTools(corpus(40), { query: '音频', limit: 2, max_chars: 3000 }, { embeddingProviders: [] });

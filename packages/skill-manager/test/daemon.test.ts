@@ -23,6 +23,8 @@ test('the independent process manager command preserves the exact config and Nod
   assert.ok(plist.includes('<string>http://localhost:37908</string>'));
   assert.ok(plist.includes('<string>'+options.config+'</string>'));
   assert.ok(plist.includes('<key>PATH</key>'));
+  assert.ok(plist.includes('<key>ProcessType</key><string>Interactive</string>'),
+    'catalog reads and health probes must not be throttled as background maintenance');
   const unit = renderSkillServiceUnit(options);
   assert.ok(unit.includes(`"${script}" "serve"`));
   assert.ok(unit.includes('"--config" "'+options.config+'"'));
