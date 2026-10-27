@@ -1,6 +1,6 @@
 ---
 name: dreammate-node
-description: 在普通桌面或服务器终端使用 DreamMate，发现本机或其他设备的服务、查看契约并调用能力，也支持按需管理本机网关、服务报备与 MCP 接入。用户提到 DreamMate、dreammate-node、跨设备服务调用、本机节点安装或网关故障时使用；仅远程调用时优先一次性 CLI。
+description: 在普通桌面或服务器终端使用 DreamMate，发现本机或其他设备的服务、查看契约并调用能力，也支持按需管理本机网关、服务报备与 MCP 接入。用户提到 DreamMate、一芥天地、dreammate-node、跨设备服务调用、本机节点安装或网关故障时使用；仅远程调用时优先一次性 CLI。
 compatibility: 需要 Node.js 22.5 或更新版本和 dreammate-node；自动常驻安装支持 macOS launchd 与 Linux systemd user。
 metadata:
   profile: terminal

@@ -30,7 +30,7 @@
 
 参考云原生与零信任标准（如 [SPIFFE/SPIRE Workload Endpoint](https://spiffe.io/docs/latest/spiffe-specs/spiffe_workload_endpoint/)），真正的零信任工作负载验证必须结合**内核元数据、操作系统文件级访问控制以及进程身份鉴真**。
 
-为了兼顾当前 MVP 的极致轻量与未来长期的架构健壮性，DreamMate 确立明确的两阶段演进路线。
+为了兼顾当前 MVP 的极致轻量与未来长期的架构健壮性，一芥天地（DreamMate World）确立明确的两阶段演进路线。
 
 ---
 
@@ -71,7 +71,7 @@
 
 ## 4. Phase 2：零信任与双向通信安全架构（Zero Trust via UDS & Capability Lease）
 
-进入 Phase 2 后，DreamMate 将从“信任主机”演进至“基于租约的零信任双向通信架构”，全面解决同机进程鉴真与权限收敛。
+进入 Phase 2 后，一芥天地将从“信任主机”演进至“基于租约的零信任双向通信架构”，全面解决同机进程鉴真与权限收敛。
 
 ### 4.1 通信通道演进：Unix Domain Socket (UDS)
 
@@ -111,7 +111,7 @@
 
 在传统幼稚设计中，往往是“Service 自己生成一个 Secret 告知 Node”。这存在致命漏洞：**谁来证明提供 Secret 的人就是拥有该能力的人？**
 
-在 DreamMate Phase 2 零信任架构中，**权威必须反转**：
+在一芥天地 Phase 2 零信任架构中，**权威必须反转**：
 > **不是 Service 自己生成 Secret 给 Node；**  
 > **而是 Node 在严格验证 Service 的进程身份后，由 Node 向 Service 签发短期凭据——Capability Lease（能力租约）。**
 

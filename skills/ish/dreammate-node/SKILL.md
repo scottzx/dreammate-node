@@ -1,6 +1,6 @@
 ---
 name: dreammate-node
-description: 在 iOS iSH 中通过 DreamMate 一次性 CLI 导入设备地址簿、发现设备、查询远端服务、查看方法契约并调用能力。用户提到 DreamMate、dreammate-node、查其他设备的服务、跨设备调用或 iSH 不适合常驻进程时使用。只调用已有网关，不在 iSH 安装或启动守护进程。
+description: 在 iOS iSH 中通过 DreamMate 一次性 CLI 导入设备地址簿、发现设备、查询远端服务、查看方法契约并调用能力。用户提到 DreamMate、一芥天地、dreammate-node、查其他设备的服务、跨设备调用或 iSH 不适合常驻进程时使用。只调用已有网关，不在 iSH 安装或启动守护进程。
 compatibility: 需要可执行短命令的 Node.js 22.5 或更新版本、dreammate-node CLI，以及可达的远端网关。
 metadata:
   profile: ish
