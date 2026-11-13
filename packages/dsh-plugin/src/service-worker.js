@@ -1,6 +1,7 @@
 // IPC ownership ensures an abruptly terminated DSH host leaves no orphan daemon.
 let server;
 let registry;
+let access;
 let stopping = false;
 let shutdownTimeoutMs = 5000;
 
@@ -9,6 +10,7 @@ async function shutdown() {
   stopping = true;
   const timer = setTimeout(() => process.exit(1), shutdownTimeoutMs);
   registry?.stop();
+  await access?.close().catch(() => {});
   if (server?.listening) {
     server.closeAllConnections();
     await new Promise(resolve => server.close(resolve));
@@ -29,15 +31,23 @@ process.once('message', async message => {
       throw new Error('Invalid DreamMate worker configuration');
     }
     shutdownTimeoutMs = message.shutdownTimeoutMs;
-    const { createAgent, rediscover, nodeIdentity } = await import('@1agents/dreammate-node');
+    const { createAgent, rediscover, nodeIdentity, startAccessControl } = await import('@1agents/dreammate-node');
     if (stopping) return;
-    ({ server, registry } = createAgent());
+    // 跟 `dreammate-node` 常驻进程一样：公网默认关闭，可信网段免 token。
+    // 访问控制面只听回环；端口已被常驻进程占用时沿用那一个写入方。
+    ({ server, registry } = createAgent({ enforcePublicAccess: true }));
     await new Promise((resolve, reject) => {
       server.once('error', reject);
       server.listen(port, host, () => { server.removeListener('error', reject); resolve(); });
     });
     const identity = await nodeIdentity();
     await rediscover(registry, identity.ipv4 ? { ipv4: identity.ipv4 } : {}).catch(() => 0);
+    if (stopping) return;
+    try {
+      access = await startAccessControl();
+    } catch (error) {
+      if (!error || error.code !== 'EADDRINUSE') throw error;
+    }
     if (stopping) return;
     registry.start();
     if (process.connected) process.send({ type: 'ready' });

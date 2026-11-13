@@ -10,6 +10,9 @@ export const inject = ['tools'];
 
 // Keep the complete MCP envelope, including structuredContent and non-text blocks.
 // DSH's native tool output is JSON; nothing is silently flattened or discarded.
+// dreammate_access 只属于本机 stdio / `dreammate-node access`。DSH 会话可以被远程接着用，
+// 不能从工具列表里开关公网访问或读出明文 token。
+export const DSH_TOOLS = MCP_TOOLS.filter(tool => tool.name !== 'dreammate_access');
 const render = (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }];
 const legacyInvoke = createRequire(import.meta.url)('@1agents/dreammate-node/package.json').version === '0.7.1';
 
@@ -34,7 +37,7 @@ export async function apply(ctx, input = {}) {
   // on an unpublished callDreammateTool export. No extra MCP process is needed.
   const client = new Client({ name: '@1agents/dsh-dreammate-node', version: '0.1.0' });
   await ctx.effect(async () => {
-    const server = createMcpServer({ agentUrl: options.serviceUrl });
+    const server = createMcpServer({ agentUrl: options.serviceUrl, exposeAccessControl: false });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     try {
       await server.connect(serverTransport);
@@ -45,7 +48,7 @@ export async function apply(ctx, input = {}) {
     }
     return async () => { await Promise.allSettled([client.close(), server.close()]); };
   });
-  for (const tool of MCP_TOOLS) {
+  for (const tool of DSH_TOOLS) {
     ctx.effect(() => ctx.tools.register({
       name: tool.name,
       description: tool.description,

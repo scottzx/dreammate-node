@@ -1,6 +1,5 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { MCP_TOOLS } from '@1agents/dreammate-node';
 import * as plugin from '../src/index.js';
 import { context, endpoint, unused, health } from './helpers.mjs';
 
@@ -12,8 +11,9 @@ test('registers native DSH tools using published schemas, invokes gateway, and r
   const ctx = context();
   t.after(() => ctx.dispose());
   await plugin.apply(ctx, { serviceUrl: gateway.url });
-  assert.equal(ctx.definitions.size, MCP_TOOLS.length);
-  for (const tool of MCP_TOOLS) assert.deepEqual(ctx.definitions.get(tool.name).parameters, tool.inputSchema);
+  assert.equal(ctx.definitions.has('dreammate_access'), false);
+  assert.equal(ctx.definitions.size, plugin.DSH_TOOLS.length);
+  for (const tool of plugin.DSH_TOOLS) assert.deepEqual(ctx.definitions.get(tool.name).parameters, tool.inputSchema);
   const tool = ctx.definitions.get('dreammate_list_services');
   const result = await tool.execute({});
   assert.ok(Array.isArray(result.content));

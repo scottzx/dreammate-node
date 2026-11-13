@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@1agents/dreammate-node':
-        specifier: ^0.15.0
-        version: 0.15.0(zod@4.6.5)
+        specifier: ^0.17.0
+        version: 0.17.0(zod@4.6.5)
       '@modelcontextprotocol/sdk':
         specifier: ^1.30.0
         version: 1.30.1(zod@4.6.5)
@@ -21,8 +21,8 @@ packages:
     resolution: {integrity: sha512-2zbsna1jZt4bogNRpfJpvrK0xzu8jE1xf9P83LYKLN1E3AUqxk9SOmfzID7Y3c5w59FNQv0FFQBsYPp/R3M5IA==}
     engines: {node: '>=22.5'}
 
-  '@1agents/dreammate-node@0.15.0':
-    resolution: {integrity: sha512-ouhovUf8Pq+nSf5xhO8Y7Yg3mkwh6jEnZ5PaUseLw7d45OPir4E2ODFDd7hnrTttO0Es/oZSWkFtn2wlUbL3vg==}
+  '@1agents/dreammate-node@0.17.0':
+    resolution: {integrity: sha512-F1w5P8ECNMEXoh2keRW3VLmsxfwAEgx9cSJO0rx8wTkgyAzEyx/A+7WuZ/4OGP7eCOsO9BJL5F8hRizJE52zFQ==}
     engines: {node: '>=22.5'}
     hasBin: true
 
@@ -48,11 +48,6 @@ packages:
 
   ajv-formats@3.0.1:
     resolution: {integrity: sha512-8iUql50EUR+uUcdRQ3HDqa6EVyo3docL8g5WJ3FNcWmu62IbkGUue/pEyLBW8VGKKucTPgqeks4fIU1DA4yowQ==}
-    peerDependencies:
-      ajv: ^8.0.0
-    peerDependenciesMeta:
-      ajv:
-        optional: true
 
   ajv@8.20.0:
     resolution: {integrity: sha512-Thbli+OlOj+iMPYFBVBfJ3OmCAnaSyNn4M1vz9T6Gka5Jt9ba/HIR56joy65tY6kx/FCF5VXNB819Y7/GUrBGA==}
@@ -416,7 +411,7 @@ snapshots:
 
   '@1agents/dreammate-network@0.5.0': {}
 
-  '@1agents/dreammate-node@0.15.0(zod@4.6.5)':
+  '@1agents/dreammate-node@0.17.0(zod@4.6.5)':
     dependencies:
       '@1agents/dreammate-network': 0.5.0
       '@modelcontextprotocol/sdk': 1.30.1(zod@4.6.5)
@@ -433,7 +428,7 @@ snapshots:
     dependencies:
       '@hono/node-server': 2.1.1(hono@4.13.10)
       ajv: 8.20.0
-      ajv-formats: 3.0.1(ajv@8.20.0)
+      ajv-formats: 3.0.1
       content-type: 1.0.5
       cors: 2.8.6
       cross-spawn: 7.0.6
@@ -456,8 +451,8 @@ snapshots:
       mime-types: 3.0.2
       negotiator: 1.1.0
 
-  ajv-formats@3.0.1(ajv@8.20.0):
-    optionalDependencies:
+  ajv-formats@3.0.1:
+    dependencies:
       ajv: 8.20.0
 
   ajv@8.20.0:

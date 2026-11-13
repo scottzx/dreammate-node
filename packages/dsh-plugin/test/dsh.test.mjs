@@ -1,4 +1,3 @@
-import { MCP_TOOLS } from '@1agents/dreammate-node';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
@@ -25,7 +24,8 @@ test('real DSH native tool execution, schema, business failure and Cordis dispos
   const url = await unused(t);
   const fiber = ctx.plugin(plugin, { serviceUrl: url, serviceHost: '127.0.0.1' });
   await fiber.await();
-  assert.equal(ctx.tools.schemas().filter(t => t.name.startsWith('dreammate_')).length, MCP_TOOLS.length);
+  assert.equal(ctx.tools.get('dreammate_access'), undefined);
+  assert.equal(ctx.tools.schemas().filter(t => t.name.startsWith('dreammate_')).length, plugin.DSH_TOOLS.length);
   const success = await ctx.tools.execute({ name: 'dreammate_list_services', arguments: {}, callId: 'test-list', signal: new AbortController().signal });
   assert.equal(success.isError, false, JSON.stringify(success));
   assert.ok(Array.isArray(success.value.content));

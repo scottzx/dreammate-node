@@ -24,10 +24,12 @@ Ask the DSH Agent to find devices/services, inspect a method, then call it:
 
 > 查看 DreamMate 网络中有哪些设备，查找转写服务，读取它的方法契约。
 
-The current source package depends on `@1agents/dreammate-node ^0.15.0` and registers
-the dependency's exported `MCP_TOOLS`, including tool search, skill search and
-versioned skill reads alongside discovery, inspection, invocation and lifecycle
-tools. Their original JSON schemas and descriptions are used.
+The current source package depends on `@1agents/dreammate-node ^0.17.0` and registers
+the dependency's exported tools, except `dreammate_access`. Tool search, skill search and
+versioned skill reads sit alongside discovery, inspection, invocation and lifecycle
+tools. Their original JSON schemas and descriptions are used. Public-access tokens stay
+on the loopback control port and the `dreammate-node access` command; a DSH tool cannot
+enable public access or reveal the token.
 Results retain the complete MCP envelope as JSON, including structured data and
 non-text blocks; MCP business errors also become DSH tool failures. Calls pass
 through the normal DSH tool policy pipeline. Native ACP sessions execute their
@@ -72,6 +74,13 @@ existing machine identity, registry and local service rediscovery; it does not
 install launchd/systemd services or alter DSH source. Use matching address families
 for `serviceUrl` and `serviceHost`.
 
+A node started by this plugin enforces the same public-access rule as `dreammate-node`:
+loopback and trusted zones are admitted, and everyone else is refused until public
+access is enabled. It also listens on `127.0.0.1:36910` for that switch when the port
+is free. An existing access listener is left alone, and releasing the plugin stops
+only the listener it opened. An already running external node keeps whatever access
+plane its own process started.
+
 Concurrent instances in one Host share a process lease. Disposal releases tools
 and stops only the child started by this plugin, after its last lease is released.
 An existing node is never stopped. The child also exits on parent IPC loss. For a
@@ -101,6 +110,12 @@ runtime dependencies beyond the Host-provided `tools` service.
 Remove with `pnpm dsh plugin --profile web remove @1agents/dsh-dreammate-node`
 and restart DSH. Existing identity and service registrations are retained.
 
+
+## 0.3.0
+
+Targets DreamMate Node ^0.17.0. Managed gateways enforce public access and start the
+loopback access control port when it is free. `dreammate_access` is not registered as
+a DSH tool. Existing running local nodes remain externally owned.
 
 ## 0.2.0 dependency transition
 
