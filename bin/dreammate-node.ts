@@ -26,6 +26,8 @@ const USAGE = `dreammate-node — DreamMate Network 本机 node agent
   dreammate-node cli <nodes|search|search-skills|read-skill|services|inspect|invoke|manage|tools>  一次性调用（cli --help）
   dreammate-node mcp [--agent http://127.0.0.1:${NODE_AGENT_PORT}] [--mcp-config PATH|none]
                                                            MCP Stdio；私有配置默认 ~/.1agents/mcp-client.json
+  dreammate-node mcp --transport http [--port 8787] [--agent URL] --api-key TOKEN
+                                                           本机回环 Streamable HTTP，无会话；不监听公网
   dreammate-node mcp add --config JSON | --file PATH|-        添加本地/远程 MCP，自动发现工具
   dreammate-node mcp list|remove ID|refresh ID                管理本机自定义 MCP 数据源
   dreammate-node mcp share ID --scope local|network           单独修改共享范围（默认 network）
@@ -94,14 +96,40 @@ try {
         break;
       }
       if (argv[1] && !argv[1].startsWith('-')) {
-        throw new Error('MCP 子命令必须是 add、list、remove、refresh 或 share；不带子命令启动 Stdio 网关');
+        throw new Error('MCP 子命令必须是 add、list、remove、refresh 或 share；不带子命令启动 MCP 网关');
       }
-      const { runMcpServer } = await import('../src/mcp.js');
       const { values } = parseArgs({ args: argv.slice(1), strict: true, options: {
-        agent: { type: 'string' }, port: { type: 'string' }, host: { type: 'string' }, 'mcp-config': { type: 'string' },
+        agent: { type: 'string' },
+        port: { type: 'string' },
+        host: { type: 'string' },
+        'mcp-config': { type: 'string' },
+        transport: { type: 'string' },
+        'api-key': { type: 'string' },
       } });
-      const agentUrl = values.agent ?? `http://127.0.0.1:${values.port ?? port}`;
-      await runMcpServer({ agentUrl, mcpConfig: values['mcp-config'] });
+      const transport = values.transport ?? 'stdio';
+      if (transport === 'stdio') {
+        const { runMcpServer } = await import('../src/mcp.js');
+        const agentUrl = values.agent ?? `http://127.0.0.1:${values.port ?? port}`;
+        await runMcpServer({ agentUrl, mcpConfig: values['mcp-config'] });
+      } else if (transport === 'http') {
+        const { startMcpHttpServer } = await import('../src/mcp-http.js');
+        const apiKey = values['api-key'] ?? process.env.DREAMMATE_MCP_API_KEY ?? '';
+        const endpoint = await startMcpHttpServer({
+          agentUrl: values.agent ?? `http://127.0.0.1:${NODE_AGENT_PORT}`,
+          mcpConfig: values['mcp-config'],
+          apiKey,
+          port: values.port === undefined ? 8787 : Number(values.port),
+          host: values.host,
+        });
+        console.error(`DreamMate MCP HTTP ${endpoint.url}（stateless，仅本机回环）`);
+        await new Promise<void>(resolve => {
+          const stop = () => { void endpoint.close().finally(resolve); };
+          process.once('SIGINT', stop);
+          process.once('SIGTERM', stop);
+        });
+      } else {
+        throw new Error('--transport 只能是 stdio 或 http');
+      }
       break;
     }
 

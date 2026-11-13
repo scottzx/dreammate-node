@@ -123,10 +123,14 @@ test('local embedding services are hidden on every gateway route without waking 
     await response.json();
   }
   assert.equal(f.calls.length, 0, 'hidden requests must never wake the model');
-  const local = await request(f.base, '/services/on-demand-model/embed', 'POST', payload, { 'X-Forwarded-For': '198.51.100.7' });
-  assert.equal(local.status, 200, 'loopback is shared by every local agent regardless of forwarded headers');
+  const local = await request(f.base, '/services/on-demand-model/embed', 'POST', payload);
+  assert.equal(local.status, 200, 'a loopback socket without forwarding headers is a local request');
   assert.deepEqual(await local.json(), answer);
   assert.equal(f.calls.length, 1);
+  // 带转发头说明请求经过了代理，不再算本机请求，local 共享的服务对它隐藏。
+  const forwarded = await request(f.base, '/services/on-demand-model/embed', 'POST', payload, { 'X-Forwarded-For': '198.51.100.7' });
+  assert.equal(forwarded.status, 404, 'a forwarded request is not a local request');
+  assert.equal(f.calls.length, 1, 'a forwarded request must never wake the hidden service');
 });
 
 test('embedding sharing changes take effect immediately without changing the listening address', async t => {

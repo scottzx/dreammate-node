@@ -145,15 +145,19 @@ test('MCP sharing updates validate input and preserve the active connection', { 
     assert.equal(missing.status, 404);
     await missing.json();
 
-    const changed = await request(base, '/mcp/sources/mcp-private/sharing', 'PATCH', { sharing: 'network' }, { 'X-Forwarded-For': '198.51.100.7' });
-    assert.equal(changed.status, 200, 'a loopback socket remains trusted regardless of forwarded headers');
+    const changed = await request(base, '/mcp/sources/mcp-private/sharing', 'PATCH', { sharing: 'network' });
+    assert.equal(changed.status, 200, 'a loopback socket without forwarding headers is a local request');
+    // 带转发头说明请求经过了代理，本机管理操作不再对它开放。
+    const forwardedManagement = await request(base, '/mcp/sources/mcp-private/sharing', 'PATCH', { sharing: 'network' }, { 'X-Forwarded-For': '198.51.100.7' });
+    assert.equal(forwardedManagement.status, 403, 'a forwarded request is not a local request');
+    await forwardedManagement.json();
     assert.equal((await changed.json() as { sharing: string }).sharing, 'network');
     assert.equal(registry.get('mcp-private')!.metadata?.mcp_sharing, 'network');
     await mcpSources.setSharing('mcp-private', 'local');
     assert.equal(registry.get('mcp-private')!.metadata?.mcp_sharing, 'local');
     assert.deepEqual(fixture.methods, connectionRequests, 'sharing changes must not reconnect or rediscover upstream tools');
 
-    const invoke = await request(base, '/services/mcp-private/invoke', 'POST', { method: 'mcp-private.echo', params: { message: 'still connected' } }, { 'X-Forwarded-For': '198.51.100.7' });
+    const invoke = await request(base, '/services/mcp-private/invoke', 'POST', { method: 'mcp-private.echo', params: { message: 'still connected' } });
     assert.equal(invoke.status, 200);
     assert.deepEqual((await invoke.json() as { structuredContent: unknown }).structuredContent, { received: { message: 'still connected' } });
     assert.deepEqual(fixture.calls, [{ message: 'still connected' }]);
@@ -228,9 +232,13 @@ test('MCP local sharing hides discovery and every service route from non-loopbac
     assert.equal(fixture.ordinaryCalls.length, 1, 'ordinary localhost services retain their existing gateway behavior');
 
     for (const route of ['/services/mcp-private', '/services/mcp-private/methods/mcp-private.echo']) {
-      const response = await request(base, route, 'GET', undefined, { 'X-Forwarded-For': address });
-      assert.equal(response.status, 200, 'loopback visibility depends on the socket rather than forwarded headers');
-      await response.json();
+      const local = await request(base, route, 'GET');
+      assert.equal(local.status, 200, 'a loopback socket without forwarding headers is a local request');
+      await local.json();
+      // 带转发头说明请求经过了代理，不再算本机请求，local 共享的来源对它隐藏。
+      const forwarded = await request(base, route, 'GET', undefined, { 'X-Forwarded-For': address });
+      assert.equal(forwarded.status, 404, 'a forwarded request is not a local request');
+      await forwarded.json();
     }
   }, '0.0.0.0'));
 });

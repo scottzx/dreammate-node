@@ -21,6 +21,7 @@ import { CatalogError } from './mcp-catalogs.js';
 import { ToolNameError } from './mcp-tool-names.js';
 import { registeredSkillProvider, requiresLocalMethod, SkillProviderError } from './skill-provider.js';
 import { deviceInfo, DEVICE_INFO_PROTOCOL } from './device-info.js';
+import { parseTrustedProxyIps, resolveRequestOrigin, type RequestOrigin } from './request-origin.js';
 
 /** 固定端口。改它等于让全网的探测方同时失明。 */
 export const NODE_AGENT_PORT: number = DEFAULT_PORTS['node-agent'];
@@ -37,6 +38,11 @@ export interface AgentOptions {
   rediscover?: boolean;
   /** Custom MCP connections are owned by this node, separately from the public registry. */
   mcpSources?: McpSourceManagerOptions;
+  /**
+   * 已登记的可信反向代理地址。只有它们说出来的客户端 IP 才采信。
+   * 默认读 DREAMMATE_TRUSTED_PROXY_IPS。
+   */
+  trustedProxyIps?: string[];
 }
 
 const json = (res: http.ServerResponse, status: number, body: unknown): void => {
@@ -69,20 +75,14 @@ function serviceEtag(service: RegisteredService): string {
 }
 
 /**
- * 报备只接受来自回环的请求。
+ * 报备只接受来自本机的请求。
  *
  * 否则网络上任何人都能往你的节点里塞一个假服务，把调用方引到别处去——
  * 服务报备和 MCP 数据源管理都沿用这个本机写入边界。
+ *
+ * 判定本身在 request-origin.ts：只看 socket 对端地址会被反向代理绕过，
+ * 经过转发的请求一律不算本机请求。
  */
-function isLoopback(req: http.IncomingMessage): boolean {
-  const address = req.socket.remoteAddress ?? '';
-  return (
-    address === '127.0.0.1' ||
-    address === '::1' ||
-    address === '::ffff:127.0.0.1' ||
-    address.startsWith('127.')
-  );
-}
 
 function readBody(req: http.IncomingMessage, limitBytes = 64 * 1024): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -452,6 +452,7 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
   const mcpSources = new McpSourceManager(registry, options.mcpSources);
   const execute = (service: RegisteredService, payload: { method: string; capability?: string; params?: unknown }): Promise<ExecutionResult> =>
     mcpSources.owns(service.id) ? mcpSources.invoke(service.id, payload) : executeService(service, payload);
+  const trustedProxies = options.trustedProxyIps ?? parseTrustedProxyIps(process.env.DREAMMATE_TRUSTED_PROXY_IPS);
   const server = http.createServer((req, res) => {
     void (async () => {
       try {
@@ -459,8 +460,11 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
         const { pathname } = url;
         const identity = await nodeIdentity();
         // Sharing belongs to the owning source, independently of the upstream
-        // transport/reachability. Never trust forwarding headers for local access.
-        const local = isLoopback(req);
+        // transport/reachability. A forwarded request never counts as local:
+        // a proxy in front of the gateway would otherwise turn the public
+        // internet into the owning machine.
+        const origin: RequestOrigin = resolveRequestOrigin(req, trustedProxies);
+        const local = origin.isLoopback;
         const canAccessService = (id: string): boolean => local
           || (mcpSources.sharing(id) ?? registry.get(id)?.sharing) !== 'local';
         const skillRequest = (method: string, params: unknown = {}): Promise<ExecutionResult> =>
@@ -509,7 +513,7 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
         }
         // Publishing a directory is a local management operation; only published skills are readable over the network.
         if (pathname === '/skills/sources' || pathname.startsWith('/skills/sources/')) {
-          if (!isLoopback(req)) return json(res, 403, { error: 'Skill source management is loopback-only' });
+          if (!local) return json(res, 403, { error: 'Skill source management is loopback-only' });
           if (pathname === '/skills/sources' && req.method === 'GET') {
             const result = await skillRequest('sources');
             return json(res, result.status, result.data);
@@ -573,7 +577,7 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
         // Only the owning machine can configure connections and sharing. The
         // sharing policy controls publication independently of the connection.
         if (pathname === '/mcp/sources' || pathname.startsWith('/mcp/sources/')) {
-          if (!isLoopback(req)) return json(res, 403, { error: 'MCP source management is loopback-only' });
+          if (!local) return json(res, 403, { error: 'MCP source management is loopback-only' });
           if (pathname === '/mcp/sources' && req.method === 'GET') {
             return json(res, 200, { sources: mcpSources.list() });
           }
@@ -682,7 +686,7 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
         }
 
         if (req.method === 'POST' && pathname === '/services') {
-          if (!isLoopback(req)) {
+          if (!local) {
             return json(res, 403, { error: 'registration is loopback-only' });
           }
           const entry = validate(JSON.parse(await readBody(req)));
@@ -706,7 +710,7 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
           const payload = raw ? JSON.parse(raw) : {};
           // Recheck after reading the body: sharing may have changed meanwhile.
           if (!registry.get(id) || !canAccessService(id)) return json(res, 404, { error: 'no such service' });
-          if (!isLoopback(req) && requiresLocalMethod(service, payload)) {
+          if (!local && requiresLocalMethod(service, payload)) {
             return json(res, 403, { error: 'Service method is loopback-only' });
           }
           const result = await execute(service, payload);
@@ -730,7 +734,7 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
           const payload = raw ? JSON.parse(raw) : {};
           const invocation = { method: capability, capability, ...payload };
           if (!registry.get(target.id) || !canAccessService(target.id)) return json(res, 404, { error: 'no active service found for capability/method' });
-          if (!isLoopback(req) && requiresLocalMethod(target, invocation, capability)) {
+          if (!local && requiresLocalMethod(target, invocation, capability)) {
             return json(res, 403, { error: 'Service method is loopback-only' });
           }
           const result = await execute(target, invocation);
@@ -823,7 +827,7 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
 
         const remove = /^\/services\/([^/]+)$/.exec(pathname);
         if (req.method === 'DELETE' && remove) {
-          if (!isLoopback(req)) {
+          if (!local) {
             return json(res, 403, { error: 'deregistration is loopback-only' });
           }
           const id = decodeURIComponent(remove[1]!);

@@ -40,6 +40,7 @@ export {
   MCP_TOOLS,
   type McpOptions,
 } from './mcp.js';
+export { startMcpHttpServer, type McpHttpOptions, type McpHttpEndpoint } from './mcp-http.js';
 export { exportDirectory, loadDirectory, parseDirectory, saveDirectory, validateDirectory,
   type NodeDirectory, type DirectoryNode } from './node-directory.js';
 export { deviceInfo, DEVICE_INFO_PROTOCOL, type DeviceInfo, type DeviceInterface, type InterfaceAddress } from './device-info.js';
