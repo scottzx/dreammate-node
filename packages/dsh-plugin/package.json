@@ -1,6 +1,6 @@
 {
   "name": "@1agents/dsh-dreammate-node",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "DreamMate Network discovery and invocation tools for DeepSeek Harness, with automatic local node startup",
   "type": "module",
   "exports": {
@@ -27,7 +27,7 @@
     "node": ">=22.19.0"
   },
   "dependencies": {
-    "@1agents/dreammate-node": "^0.17.0",
+    "@1agents/dreammate-node": "^0.18.0",
     "@modelcontextprotocol/sdk": "^1.30.0"
   },
   "repository": {

@@ -36,6 +36,7 @@ const USAGE = `dreammate-node — DreamMate Network 本机 node agent
   dreammate-node uninstall                                  卸载
   dreammate-node access <status|enable|disable|rotate|show-token|forget-token|zones>
                                                            管理本机公网访问开关（仅本机回环可用）
+  dreammate-node tunnel [--url http://127.0.0.1:8787]      用可选依赖 cloudflared 临时公开本机回环服务
   dreammate-node embedding install|status|config|uninstall   管理按需本地向量模型（macOS）
   dreammate-node skills install [--profile auto|ish|terminal]  安装/更新对应环境的 skill
   dreammate-node skills add --name NAME --project PATH|--dir PATH  登记本机 Skill 来源
@@ -52,7 +53,7 @@ const USAGE = `dreammate-node — DreamMate Network 本机 node agent
 install 在 macOS 上装 launchd LaunchAgent、Linux 上装 systemd user unit，都不需要 sudo。`;
 
 const sourceCommand = command === 'mcp' && ['add', 'list', 'remove', 'refresh', 'share'].includes(argv[1] ?? '');
-if (!['cli', 'skills', 'embedding', 'access'].includes(command) && !sourceCommand && (argv.includes('--help') || argv.includes('-h') || command === 'help')) {
+if (!['cli', 'skills', 'embedding', 'access', 'tunnel'].includes(command) && !sourceCommand && (argv.includes('--help') || argv.includes('-h') || command === 'help')) {
   console.log(USAGE);
   process.exit(0);
 }
@@ -94,6 +95,12 @@ try {
     case 'access': {
       const { runAccessCli } = await import('../src/access-cli.js');
       process.exitCode = await runAccessCli(argv.slice(1));
+      break;
+    }
+
+    case 'tunnel': {
+      const { runTunnelCli } = await import('../src/tunnel-cli.js');
+      process.exitCode = await runTunnelCli(argv.slice(1));
       break;
     }
 

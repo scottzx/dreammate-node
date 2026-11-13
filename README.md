@@ -251,6 +251,15 @@ dreammate-node                        # 0.0.0.0:36908
 dreammate-node --host 127.0.0.1       # 只对本机可见
 ```
 
+临时把已经在本机回环上的 HTTP MCP 公开出去时，先启动只听回环的 MCP，再前台打开 Quick Tunnel：
+
+```bash
+dreammate-node mcp --transport http --port 8787 --api-key "$TOKEN"
+dreammate-node tunnel    # 默认 http://127.0.0.1:8787，stdout 打印 https://*.trycloudflare.com
+```
+
+`cloudflared` 是可选依赖，装不上时不影响其余命令。隧道不启动 MCP，也不打开网关的公网访问开关。域名不固定，进程退出即失效；客户端地址是该域名下的 `/mcp`，仍要带 Bearer token。Cloudflare 终结 TLS。`--url` 只接受回环地址。
+
 ### npm 安装时自动安装对应 skill
 
 包内包含两份同名 `dreammate-node` skill，安装时只选择一种：

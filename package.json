@@ -1,6 +1,6 @@
 {
   "name": "@1agents/dreammate-node",
-  "version": "0.17.0",
+  "version": "0.18.0",
   "description": "DreamMate Network 的设备网关与一次性 CLI：服务发现、调用与可导入的设备地址簿。",
   "keywords": [
     "dreammate",
@@ -83,6 +83,9 @@
   "dependencies": {
     "@1agents/dreammate-network": "^0.5.0",
     "@modelcontextprotocol/sdk": "^1.30.0"
+  },
+  "optionalDependencies": {
+    "cloudflared": "^0.7.3"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

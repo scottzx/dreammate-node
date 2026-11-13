@@ -24,7 +24,7 @@ Ask the DSH Agent to find devices/services, inspect a method, then call it:
 
 > 查看 DreamMate 网络中有哪些设备，查找转写服务，读取它的方法契约。
 
-The current source package depends on `@1agents/dreammate-node ^0.17.0` and registers
+The current source package depends on `@1agents/dreammate-node ^0.18.0` and registers
 the dependency's exported tools, except `dreammate_access`. Tool search, skill search and
 versioned skill reads sit alongside discovery, inspection, invocation and lifecycle
 tools. Their original JSON schemas and descriptions are used. Public-access tokens stay
@@ -110,6 +110,11 @@ runtime dependencies beyond the Host-provided `tools` service.
 Remove with `pnpm dsh plugin --profile web remove @1agents/dsh-dreammate-node`
 and restart DSH. Existing identity and service registrations are retained.
 
+
+## 0.4.0
+
+Targets DreamMate Node ^0.18.0. Node can open a temporary cloudflared Quick Tunnel with
+`dreammate-node tunnel`; this plugin does not register that command or expose the tunnel.
 
 ## 0.3.0
 

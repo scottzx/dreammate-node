@@ -110,6 +110,8 @@ dreammate-node cli nodes export --agent http://127.0.0.1:36908 --default-node sc
 
 宿主明确需要 MCP 时配置 stdio 命令 `dreammate-node mcp --agent http://GATEWAY:36908`。MCP 进程由宿主按会话管理；该命令是客户端适配层，不会自动启动目标 HTTP 网关。不要把 MCP 协议日志写入 stdout。
 
+用户明确要求把本机 HTTP MCP 临时暴露到公网时，先另开 `dreammate-node mcp --transport http --port 8787 --api-key TOKEN`（只听回环），再前台运行 `dreammate-node tunnel`。它使用可选依赖 `cloudflared` 开 Quick Tunnel，默认指向 `http://127.0.0.1:8787`，并把 Host 改回该回环地址。stdout 只打印公网源地址；客户端地址是该域名下的 `/mcp`，仍要带 Bearer token。域名不固定，进程退出即失效。Cloudflare 终结 TLS，能看到隧道里的请求。不要在用户没要求时启动，也不要用它暴露没有鉴权的端口。`--url` 只接受无账号、查询串和路径的回环地址。这条命令不启动 MCP，也不打开网关公网访问开关。
+
 业务任务使用 `dreammate_search_tools`（必填 `query`）→ `dreammate_inspect`（指定 `method`）→ `dreammate_invoke`。`dreammate_list_nodes` 用于节点发现，`dreammate_list_services` 用于显式目录浏览。元工具的 `service_id` 和 `method` 来自真实搜索与契约；上下文中只展开当前需要的 Schema。
 搜索自动从本次扫描到的全部服务发现就绪模型，其他设备无需安装权重或逐个配置模型 URL。发现范围随 `--node`，显式 `localhost` 只看入口设备；`--service ID`／`service_id` 只筛业务方法，不排除同一节点范围内其他服务提供的模型。没有可见就绪 provider 时返回 `search.semantic_status=no_provider` 和有界词法结果；结合 `partial`、`discovery`、`scans` 说明范围，不能据此称全网没安装模型。模型请求失败同样有界降级。
 多个 provider 按 priority 高优先、健康状态、稳定 URL 选择，最多尝试两个，共享一次搜索的总语义预算。普通 provider 默认 5 秒；自动发现首选的 `lifecycle: on_demand` provider 声明合法 `cold_start_timeout_ms` 时，在调用方与环境均未显式设置超时的条件下使用该冷启动预算（1–60000 ms）。显式超时始终优先；不为第二个 provider 重新增加预算。自动发现路径下，一次尝试的 query 与 documents 固定 provider、revision、维度和编码配置；切备用不能混用向量。显式 `DREAMMATE_EMBEDDING_URL` 优先并固定地址，失败不自动切到其他模型；`DREAMMATE_EMBEDDING_MODEL` 可限定别名。

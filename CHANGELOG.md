@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.18.0 — 2026-11-13
+
+- Add optional `cloudflared` and `dreammate-node tunnel` to open a temporary Quick Tunnel to a loopback origin. The default target is the HTTP MCP listener at `127.0.0.1:8787`. The command does not start MCP or enable gateway public access, and the hostname dies with the process.
+
 ## 0.17.0 — 2026-11-13
 
 - Add a loopback-only Streamable HTTP MCP transport. It requires a bearer token, never exposes the access-control tool, and can publish an allowlisted tool catalog.
