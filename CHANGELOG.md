@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.17.0 — 2026-11-13
+
+- Add a loopback-only Streamable HTTP MCP transport. It requires a bearer token, never exposes the access-control tool, and can publish an allowlisted tool catalog.
+- Add loopback-only public access control on port 36910, with `dreammate-node access` to enable, disable, rotate and show the token. Public access is off by default.
+- Treat a verified public token as the owner: it can see `sharing: local` services. Trusted-zone peers without a token only see `sharing: network`. Registration, source management and `local_only` methods stay on the loopback socket.
+- Ignore client-supplied forwarding headers unless the immediate peer is a configured trusted proxy, so a reverse proxy cannot present public traffic as loopback.
+- Restore numeric parameter types that MCP hosts stringify, using the method schema.
+
 ## 0.16.0 — 2026-10-23
 
 - Add read-only local device model, OS name/version, architecture, hostname and interface IP/netmask/MAC information through `/device`, manifest metadata and the local node entry.
