@@ -237,7 +237,7 @@ export interface AccessDecision {
 
 /**
  * 数据面准入：回环和可信网段免 token；公网在开关打开时要 token，关着则直接拒绝。
- * token 只决定进不进得来，不提高 local 共享服务的可见性。
+ * token 回答的是「来的人是不是本人或已授权的人」，不管服务的 sharing。
  */
 export function decidePublicAccess(input: {
   isLoopback: boolean;

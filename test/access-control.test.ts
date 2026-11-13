@@ -102,7 +102,7 @@ test('控制面只在回环上签发、掩码和展示 token', async () => {
   }
 });
 
-test('公网来源在关闭时被拒，打开后凭 token 进入，但仍看不到 local 服务', async () => {
+test('公网来源在关闭时被拒；有效 token 视为授权访问，能看到 sharing: local', async () => {
   const dir = tempDir();
   const statePath = path.join(dir, 'access.json');
   const token = 'dmk_gatewaytesttoken0123456789abcd';
@@ -130,8 +130,10 @@ test('公网来源在关闭时被拒，打开后凭 token 进入，但仍看不�
     const closed = await fetch(`${base}/health`, { headers: publicHeaders });
     assert.equal(closed.status, 403);
 
-    const lan = await fetch(`${base}/health`, { headers: lanHeaders });
+    const lan = await fetch(`${base}/services`, { headers: lanHeaders });
     assert.equal(lan.status, 200);
+    const lanBody = await lan.json() as { services: { id: string }[] };
+    assert.deepEqual(lanBody.services.map(service => service.id), ['shared']);
 
     state.public_access.enabled = true;
     writeAccessState(state, statePath);
@@ -142,7 +144,13 @@ test('公网来源在关闭时被拒，打开后凭 token 进入，但仍看不�
     });
     assert.equal(opened.status, 200);
     const body = await opened.json() as { services: { id: string }[] };
-    assert.deepEqual(body.services.map(service => service.id), ['shared']);
+    assert.deepEqual(body.services.map(service => service.id).sort(), ['secret', 'shared']);
+    const management = await fetch(`${base}/services`, {
+      method: 'POST',
+      headers: { ...publicHeaders, authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ id: 'planted', capabilities: ['x'], port: 9 }),
+    });
+    assert.equal(management.status, 403);
   } finally {
     await new Promise<void>(resolve => server.close(() => resolve()));
     fs.rmSync(dir, { recursive: true, force: true });

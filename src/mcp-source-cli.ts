@@ -17,7 +17,7 @@ export const MCP_SOURCE_USAGE = `dreammate-node mcp — 管理本机自定义 MC
 {"mcpServers":{"名称":{"url":"https://example.com/mcp","headers":{"Authorization":"Bearer ..."}}}}
 或单个 command/url 对象（此时必须指定 --name）。远程 type 支持 http、streamable-http、sse。
 支持已有 OAuth refresh token 自动续期（oauth.tokenUrl/clientId/refreshToken）；不提供浏览器首次授权。
-接入配置可指定 sharing: local|network，默认 network。local 仅供网关所在设备使用，不区分本机 Agent。
+接入配置可指定 sharing: local|network，默认 network。local 不向未持有公网 token 的外部调用方公开；有效 token 表示本人或已授权访问，仍可见。
 --agent URL：默认 DREAMMATE_AGENT_URL 或 http://127.0.0.1:36908；管理操作仅支持 loopback。
 --timeout-ms N：1–3600000，默认 30000。stdout 输出 JSON；退出码 0 成功、1 连接失败、2 参数错误。
 配置保存在本机；env/headers/URL/oauth 中的凭据不会出现在数据源清单中。`;

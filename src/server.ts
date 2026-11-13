@@ -22,7 +22,7 @@ import { ToolNameError } from './mcp-tool-names.js';
 import { registeredSkillProvider, requiresLocalMethod, SkillProviderError } from './skill-provider.js';
 import { deviceInfo, DEVICE_INFO_PROTOCOL } from './device-info.js';
 import { parseTrustedProxyIps, resolveRequestOrigin, type RequestOrigin } from './request-origin.js';
-import { accessStatePath, decidePublicAccess, readAccessState } from './access-control.js';
+import { accessStatePath, decidePublicAccess, readAccessState, verifyToken } from './access-control.js';
 
 /** 固定端口。改它等于让全网的探测方同时失明。 */
 export const NODE_AGENT_PORT: number = DEFAULT_PORTS['node-agent'];
@@ -473,8 +473,10 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
         // internet into the owning machine.
         const origin: RequestOrigin = resolveRequestOrigin(req, trustedProxies);
         const local = origin.isLoopback;
-        const canAccessService = (id: string): boolean => local
-          || (mcpSources.sharing(id) ?? registry.get(id)?.sharing) !== 'local';
+        const presented = presentedAccessToken(req);
+        // 公网 token 证明来访者是本人或已授权的人。sharing 是另一件事：
+        // local 表示这个服务不向未授权的外部调用方公开，授权访问仍可见。
+        let authorized = local;
         if (options.enforcePublicAccess) {
           let snapshot;
           try {
@@ -488,14 +490,20 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
               isLoopback: local,
               clientIp: origin.clientIp,
               snapshot,
-              token: presentedAccessToken(req),
+              token: presented,
             });
             if (!decision.allow) {
               if (decision.status === 401) res.setHeader('www-authenticate', 'Bearer');
               return json(res, decision.status ?? 403, { error: decision.error ?? '公网访问被拒绝' });
             }
+            if (!snapshot.corrupt && snapshot.public_access.enabled
+              && presented && verifyToken(presented, snapshot.public_access.token_hash)) {
+              authorized = true;
+            }
           }
         }
+        const canAccessService = (id: string): boolean => authorized
+          || (mcpSources.sharing(id) ?? registry.get(id)?.sharing) !== 'local';
         const skillRequest = (method: string, params: unknown = {}): Promise<ExecutionResult> =>
           execute(registeredSkillProvider(registry, service => canAccessService(service.id)), { method, params });
 
