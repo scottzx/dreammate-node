@@ -34,6 +34,7 @@ import { scanSkillCatalog } from './skill-catalog.js';
 import { installMcpReload } from './mcp-runtime.js';
 import { loadPrivateMcpSources, type PrivateMcpSources } from './mcp-client-sources.js';
 import { DEVICE_INFO_PROTOCOL, parseDeviceInfo } from './device-info.js';
+import { needsTypeRestore, restoreTypedParams } from './param-types.js';
 
 // Follow the handler generation during SIGHUP reloads so a resident client does
 // not retain the old search deadlines through Node's dependency module cache.
@@ -472,7 +473,8 @@ export const MCP_TOOLS: Tool[] = [
         },
         params: {
           type: 'object',
-          description: '传递给该方法的参数键值对对象',
+          additionalProperties: true,
+          description: '传递给该方法的参数键值对。数字和布尔值保持 JSON 类型，不要写成字符串。',
         },
       },
       required: ['service_id'],
@@ -557,6 +559,61 @@ export function createMcpServer(options: McpOptions = {}): Server {
   );
 
   return server;
+}
+
+/**
+ * 宿主把无类型 params 里的数字收成字符串。方法 Schema 仍在服务契约里，转发前按契约还原。
+ * 读不到 Schema 或超时则原样转发，不把一次类型修复变成调用失败。
+ */
+async function methodParameterSchema(
+  agentUrl: string,
+  node: string | undefined,
+  serviceId: string,
+  method: string,
+  options: McpOptions,
+): Promise<unknown> {
+  if (node === '@client') {
+    const details = await options.privateMcpSources?.describe(serviceId, method);
+    return details?.details.parameters;
+  }
+  const targetUrl = await resolveNodeBaseUrl(agentUrl, node, options.nodeDirectory);
+  const response = await fetch(`${targetUrl}/services/${encodeURIComponent(serviceId)}`, {
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!response.ok) return undefined;
+  const service = await response.json() as RegisteredService;
+  const declared = service.methods?.[method] as (MethodDescriptor & { schema_loaded?: boolean }) | undefined;
+  if (declared?.parameters && declared.schema_loaded !== false) return declared.parameters;
+  if (!service.metadata?.mcp_source) return declared?.parameters;
+  const details = await withRequestTimeout(async signal => {
+    const methodResponse = await fetch(
+      `${targetUrl}/services/${encodeURIComponent(serviceId)}/methods/${encodeURIComponent(method)}`,
+      { signal },
+    );
+    return {
+      ok: methodResponse.ok,
+      data: await methodResponse.json() as { details?: { parameters?: unknown; schema_loaded?: boolean } },
+    };
+  }, 8000);
+  if (!details.ok || details.data.details?.schema_loaded === false) return declared?.parameters;
+  return details.data.details?.parameters ?? declared?.parameters;
+}
+
+async function typedInvokeParams(
+  agentUrl: string,
+  node: string | undefined,
+  serviceId: string,
+  method: string,
+  params: Record<string, unknown>,
+  options: McpOptions,
+): Promise<Record<string, unknown>> {
+  if (!needsTypeRestore(params)) return params;
+  try {
+    const restored = restoreTypedParams(params, await methodParameterSchema(agentUrl, node, serviceId, method, options));
+    return restored && typeof restored === 'object' && !Array.isArray(restored) ? restored : params;
+  } catch {
+    return params;
+  }
 }
 
 /** One request, no listener, registration, identity file or background probe. */
@@ -945,13 +1002,17 @@ export async function callDreammateTool(
         const node = args.node as string | undefined;
         const serviceId = args.service_id as string;
         const method = (args.method as string | undefined) ?? (args.capability as string | undefined);
-        const params = (args.params as Record<string, unknown> | undefined) ?? {};
+        const supplied = args.params;
+        let params = (supplied === undefined ? {} : supplied) as Record<string, unknown>;
 
         if (!serviceId || !method) {
           return {
             content: [{ type: 'text', text: '缺少必填参数: service_id 和 method (或 capability)' }],
             isError: true,
           };
+        }
+        if (supplied && typeof supplied === 'object' && !Array.isArray(supplied)) {
+          params = await typedInvokeParams(agentUrl, node, serviceId, method, params, options);
         }
 
         if (node === '@client') {

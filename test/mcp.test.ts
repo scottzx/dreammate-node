@@ -321,6 +321,62 @@ test('MCP: dreammate_invoke 能够通过通用路由触发下游业务服务', a
   }
 });
 
+test('MCP: dreammate_invoke 按方法 Schema 还原被收成字符串的数值', async () => {
+  let receivedParams: Record<string, unknown> | undefined;
+  const downstream = createServer((req, res) => {
+    if (req.method === 'POST' && req.url === '/invoke') {
+      let body = '';
+      req.on('data', (c) => (body += c));
+      req.on('end', () => {
+        receivedParams = (JSON.parse(body) as { params: Record<string, unknown> }).params;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      });
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  await new Promise<void>((resolve) => downstream.listen(0, '127.0.0.1', resolve));
+  const downstreamPort = (downstream.address() as AddressInfo).port;
+
+  try {
+    const registry = new ServiceRegistry();
+    registry.register({
+      id: 'files',
+      port: downstreamPort,
+      methods: {
+        'filesystem.read_text_file': {
+          description: '读取文本',
+          parameters: {
+            type: 'object',
+            properties: {
+              path: { type: 'string' },
+              head: { type: 'number' },
+              tail: { type: 'integer' },
+            },
+          },
+        },
+      },
+    });
+    await withTestAgent(registry, async (agentUrl) => {
+      await withMcpClient(agentUrl, async (client) => {
+        const invokeRes = await client.callTool({
+          name: 'dreammate_invoke',
+          arguments: {
+            service_id: 'files',
+            method: 'filesystem.read_text_file',
+            params: { path: 'notes.txt', head: '6', tail: '2', ids: '012' },
+          },
+        });
+        assert.equal(invokeRes.isError, undefined);
+        assert.deepEqual(receivedParams, { path: 'notes.txt', head: 6, tail: 2, ids: '012' });
+      });
+    });
+  } finally {
+    await new Promise<void>((resolve) => downstream.close(() => resolve()));
+  }
+});
+
 test('MCP: 在 node-agent 未启动时返回友好引导提示', async () => {
   // 连到一个无效端口
   await withMcpClient('http://127.0.0.1:1', async (client) => {
