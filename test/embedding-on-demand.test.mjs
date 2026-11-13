@@ -166,7 +166,9 @@ test('priority file updates register live without restarting the worker; invalid
   assert.equal(f.children.length, 1); assert.deepEqual(f.children[0].kills, []);
 
   await writeFile(config, '{"version":1,"priority":200,"unknown":true}');
-  await until(() => Boolean(f.provider.health().config.last_error));
+  // writeFile is not atomic. A refresh can observe a partial file as invalid JSON
+  // before the completed document is rejected for its unknown field.
+  await until(() => /integer priority/.test(f.provider.health().config.last_error ?? ''));
   assert.match(f.provider.health().config.last_error, /integer priority/);
   assert.equal(f.provider.health().embedding_provider.priority, -2);
   assert.equal(f.provider.health().config.source, 'file');
