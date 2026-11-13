@@ -3,10 +3,12 @@
  * Loopback only. Each POST gets its own Server and transport so sessions cannot cross.
  */
 import { timingSafeEqual } from 'node:crypto';
+import fs from 'node:fs';
 import http from 'node:http';
+import path from 'node:path';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { createMcpServer, type McpOptions } from './mcp.js';
+import { createMcpServer, visibleMcpTools, type McpOptions } from './mcp.js';
 import { loadPrivateMcpSources, type PrivateMcpSources } from './mcp-client-sources.js';
 
 const MAX_BODY_BYTES = 10 * 1024 * 1024;
@@ -17,11 +19,19 @@ export interface McpHttpOptions extends McpOptions {
   port?: number;
   /** Only loopback is accepted. Defaults to 127.0.0.1. */
   host?: string;
+  /** 只暴露这些工具名。本机管理工具始终排除。 */
+  allowedTools?: readonly string[];
+  /** 启动时把可见工具清单写到这里。 */
+  catalogPath?: string;
+  /** 启动时把可见工具清单 POST 到这个地址。失败只记在返回值里，不阻止监听。 */
+  reportUrl?: string;
 }
 
 export interface McpHttpEndpoint {
   url: string;
   port: number;
+  tools: string[];
+  catalogReported: boolean;
   close: () => Promise<void>;
 }
 
@@ -64,11 +74,16 @@ export async function startMcpHttpServer(options: McpHttpOptions): Promise<McpHt
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('HTTP MCP 端口无效');
 
   let ownedSources: PrivateMcpSources | undefined;
-  let mcpOptions: McpOptions = options;
+  let mcpOptions: McpOptions = {
+    ...options,
+    exposeAccessControl: false,
+    allowedTools: options.allowedTools,
+  };
   if (!options.privateMcpSources) {
     await loadPrivateMcpSources(options.mcpConfig, source => { ownedSources = source; });
-    if (ownedSources) mcpOptions = { ...options, privateMcpSources: ownedSources };
+    if (ownedSources) mcpOptions = { ...mcpOptions, privateMcpSources: ownedSources };
   }
+  const tools = visibleMcpTools(mcpOptions).map(tool => tool.name);
 
   const allowedHosts = [`127.0.0.1:${port}`, `localhost:${port}`];
   const server = http.createServer((req, res) => {
@@ -95,15 +110,51 @@ export async function startMcpHttpServer(options: McpHttpOptions): Promise<McpHt
   }
   const actualPort = bound.port;
   allowedHosts.splice(0, allowedHosts.length, `127.0.0.1:${actualPort}`, `localhost:${actualPort}`);
+  const catalogReported = await reportCatalog({
+    url: `http://127.0.0.1:${actualPort}/mcp`,
+    tools,
+    catalogPath: options.catalogPath,
+    reportUrl: options.reportUrl,
+  });
   return {
     url: `http://127.0.0.1:${actualPort}/mcp`,
     port: actualPort,
+    tools,
+    catalogReported,
     close: async () => {
       server.closeAllConnections();
       await new Promise<void>(resolve => server.close(() => resolve()));
       await ownedSources?.stop();
     },
   };
+}
+
+async function reportCatalog(input: {
+  url: string;
+  tools: string[];
+  catalogPath?: string;
+  reportUrl?: string;
+}): Promise<boolean> {
+  const body = { url: input.url, tools: input.tools, reported_at: new Date().toISOString() };
+  let wrote = false;
+  if (input.catalogPath) {
+    fs.mkdirSync(path.dirname(input.catalogPath), { recursive: true });
+    fs.writeFileSync(input.catalogPath, `${JSON.stringify(body, null, 2)}\n`, { mode: 0o600 });
+    wrote = true;
+  }
+  if (!input.reportUrl) return wrote;
+  try {
+    const response = await fetch(input.reportUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(3000),
+      redirect: 'error',
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
 }
 
 async function handle(

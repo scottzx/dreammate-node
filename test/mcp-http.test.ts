@@ -1,5 +1,10 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
+import fs from 'node:fs';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -47,6 +52,7 @@ test('HTTP MCP stays on loopback, requires the bearer token, and lists tools wit
     try {
       const listed = await client.listTools();
       assert.ok(listed.tools.some(tool => tool.name === 'dreammate_invoke'));
+      assert.equal(listed.tools.some(tool => tool.name === 'dreammate_access'), false);
       assert.equal(transport.sessionId, undefined);
     } finally {
       await client.close();
@@ -69,4 +75,52 @@ test('HTTP transport refuses to start without an API key', async () => {
   assert.equal(result.code, 1);
   assert.match(result.stderr, /API key/);
   assert.doesNotMatch(result.stderr, /0\.0\.0\.0/);
+});
+
+test('HTTP MCP 按名单过滤工具，本机访问控制工具不可调用，并上报清单', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dreammate-catalog-'));
+  const catalogPath = path.join(dir, 'catalog.json');
+  let reported: { tools?: string[] } | undefined;
+  const sink = http.createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    req.on('end', () => {
+      reported = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { tools?: string[] };
+      res.writeHead(204).end();
+    });
+  });
+  await new Promise<void>(resolve => sink.listen(0, '127.0.0.1', () => resolve()));
+  const sinkPort = (sink.address() as AddressInfo).port;
+  const endpoint = await startMcpHttpServer({
+    apiKey,
+    port: 0,
+    mcpConfig: 'none',
+    allowedTools: ['dreammate_search_tools'],
+    catalogPath,
+    reportUrl: `http://127.0.0.1:${sinkPort}/catalog`,
+  });
+  try {
+    assert.deepEqual(endpoint.tools, ['dreammate_search_tools']);
+    assert.equal(endpoint.catalogReported, true);
+    assert.deepEqual(JSON.parse(fs.readFileSync(catalogPath, 'utf8')).tools, ['dreammate_search_tools']);
+    assert.deepEqual(reported?.tools, ['dreammate_search_tools']);
+
+    const transport = new StreamableHTTPClientTransport(new URL(endpoint.url), {
+      requestInit: { headers: { authorization: `Bearer ${apiKey}` } },
+    });
+    const client = new Client({ name: 'filter-test', version: '1.0.0' });
+    await client.connect(transport);
+    try {
+      const listed = await client.listTools();
+      assert.deepEqual(listed.tools.map(tool => tool.name), ['dreammate_search_tools']);
+      const denied = await client.callTool({ name: 'dreammate_access', arguments: { action: 'status' } });
+      assert.equal(denied.isError, true);
+    } finally {
+      await client.close();
+    }
+  } finally {
+    await endpoint.close();
+    await new Promise<void>(resolve => sink.close(() => resolve()));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

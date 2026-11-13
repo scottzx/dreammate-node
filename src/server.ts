@@ -22,6 +22,7 @@ import { ToolNameError } from './mcp-tool-names.js';
 import { registeredSkillProvider, requiresLocalMethod, SkillProviderError } from './skill-provider.js';
 import { deviceInfo, DEVICE_INFO_PROTOCOL } from './device-info.js';
 import { parseTrustedProxyIps, resolveRequestOrigin, type RequestOrigin } from './request-origin.js';
+import { accessStatePath, decidePublicAccess, readAccessState } from './access-control.js';
 
 /** 固定端口。改它等于让全网的探测方同时失明。 */
 export const NODE_AGENT_PORT: number = DEFAULT_PORTS['node-agent'];
@@ -43,6 +44,13 @@ export interface AgentOptions {
    * 默认读 DREAMMATE_TRUSTED_PROXY_IPS。
    */
   trustedProxyIps?: string[];
+  /**
+   * 公网分区。默认关闭，避免测试读到本机真实的 access.json。
+   * serveAgent 会打开它。
+   */
+  enforcePublicAccess?: boolean;
+  /** 覆盖 ~/.1agents/access.json，测试用。 */
+  accessStatePath?: string;
 }
 
 const json = (res: http.ServerResponse, status: number, body: unknown): void => {
@@ -467,6 +475,27 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
         const local = origin.isLoopback;
         const canAccessService = (id: string): boolean => local
           || (mcpSources.sharing(id) ?? registry.get(id)?.sharing) !== 'local';
+        if (options.enforcePublicAccess) {
+          let snapshot;
+          try {
+            snapshot = readAccessState(options.accessStatePath ?? accessStatePath());
+          } catch {
+            if (!local) return json(res, 403, { error: '公网访问状态不可读' });
+            snapshot = undefined;
+          }
+          if (snapshot) {
+            const decision = decidePublicAccess({
+              isLoopback: local,
+              clientIp: origin.clientIp,
+              snapshot,
+              token: presentedAccessToken(req),
+            });
+            if (!decision.allow) {
+              if (decision.status === 401) res.setHeader('www-authenticate', 'Bearer');
+              return json(res, decision.status ?? 403, { error: decision.error ?? '公网访问被拒绝' });
+            }
+          }
+        }
         const skillRequest = (method: string, params: unknown = {}): Promise<ExecutionResult> =>
           execute(registeredSkillProvider(registry, service => canAccessService(service.id)), { method, params });
 
@@ -862,10 +891,20 @@ export function createAgent(options: AgentOptions = {}): { server: http.Server; 
   return { server, registry, mcpSources };
 }
 
+function presentedAccessToken(req: http.IncomingMessage): string | undefined {
+  const header = req.headers.authorization;
+  if (typeof header === 'string') {
+    const match = /^Bearer\s+(\S+)$/.exec(header);
+    if (match?.[1]) return match[1];
+  }
+  const alternate = req.headers['x-dreammate-token'];
+  return typeof alternate === 'string' && alternate.trim() ? alternate.trim() : undefined;
+}
+
 export async function serveAgent(
   options: AgentOptions = {},
 ): Promise<{ server: http.Server; registry: ServiceRegistry; mcpSources: McpSourceManager; port: number; rebuilt: number }> {
-  const { server, registry, mcpSources } = createAgent(options);
+  const { server, registry, mcpSources } = createAgent({ ...options, enforcePublicAccess: options.enforcePublicAccess ?? true });
   const host = options.host ?? '0.0.0.0';
   const port = options.port ?? NODE_AGENT_PORT;
   await new Promise<void>((resolve) => server.listen(port, host, resolve));

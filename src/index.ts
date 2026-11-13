@@ -41,6 +41,23 @@ export {
   type McpOptions,
 } from './mcp.js';
 export { startMcpHttpServer, type McpHttpOptions, type McpHttpEndpoint } from './mcp-http.js';
+export {
+  ACCESS_CONTROL_PORT,
+  createAccessControl,
+  startAccessControl,
+  type AccessControlOptions,
+} from './access-server.js';
+export {
+  decidePublicAccess,
+  readAccessState,
+  writeAccessState,
+  generateToken,
+  hashToken,
+  verifyToken,
+  DEFAULT_TRUSTED_ZONES,
+  type AccessSnapshot,
+  type AccessDecision,
+} from './access-control.js';
 export { exportDirectory, loadDirectory, parseDirectory, saveDirectory, validateDirectory,
   type NodeDirectory, type DirectoryNode } from './node-directory.js';
 export { deviceInfo, DEVICE_INFO_PROTOCOL, type DeviceInfo, type DeviceInterface, type InterfaceAddress } from './device-info.js';

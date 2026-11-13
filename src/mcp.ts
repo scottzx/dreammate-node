@@ -55,6 +55,11 @@ export interface McpOptions {
   embeddingUrl?: string;
   embeddingModel?: string;
   embeddingTimeoutMs?: number;
+  /** 本机访问控制面。stdio 入口默认可用；公网 HTTP 入口必须关掉。 */
+  exposeAccessControl?: boolean;
+  accessUrl?: string;
+  /** 只暴露这些工具。不设则暴露当前入口允许的全部工具。 */
+  allowedTools?: readonly string[];
 }
 
 const DEFAULT_AGENT_URL = `http://127.0.0.1:${DEFAULT_PORTS['node-agent']}`;
@@ -535,7 +540,31 @@ export const MCP_TOOLS: Tool[] = [
       required: ['service_id', 'action'],
     },
   },
+  {
+    name: 'dreammate_access',
+    description: '管理本机公网访问开关。只在本机 stdio 入口可用；明文 token 不会出现在公网 HTTP 入口。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['status', 'enable', 'disable', 'rotate', 'show-token'],
+          description: 'status 只返回掩码；enable/rotate/show-token 在本机返回明文 token。',
+        },
+      },
+      required: ['action'],
+    },
+  },
 ];
+
+/** 公网 HTTP 入口永远不暴露的本机管理工具。 */
+export const LOCAL_ONLY_MCP_TOOLS = ['dreammate_access'] as const;
+
+export function visibleMcpTools(options: McpOptions = {}): typeof MCP_TOOLS {
+  const hidden = options.exposeAccessControl === false ? new Set<string>(LOCAL_ONLY_MCP_TOOLS) : new Set<string>();
+  const allow = options.allowedTools ? new Set(options.allowedTools) : undefined;
+  return MCP_TOOLS.filter(tool => !hidden.has(tool.name) && (!allow || allow.has(tool.name)));
+}
 
 export function createMcpServer(options: McpOptions = {}): Server {
   const server = new Server(
@@ -551,7 +580,7 @@ export function createMcpServer(options: McpOptions = {}): Server {
   );
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    return { tools: MCP_TOOLS };
+    return { tools: visibleMcpTools(options) };
   });
 
   server.setRequestHandler(CallToolRequestSchema, async (request) =>
@@ -616,6 +645,34 @@ async function typedInvokeParams(
   }
 }
 
+async function callAccessTool(args: Record<string, unknown>, options: McpOptions): Promise<CallToolResult> {
+  const action = args.action;
+  if (action !== 'status' && action !== 'enable' && action !== 'disable' && action !== 'rotate' && action !== 'show-token') {
+    return jsonResult({ error: 'action 必须是 status、enable、disable、rotate 或 show-token' }, true);
+  }
+  const accessUrl = (options.accessUrl ?? 'http://127.0.0.1:36910').replace(/\/+$/, '');
+  let parsed: URL;
+  try { parsed = new URL(accessUrl); } catch { return jsonResult({ error: '访问控制地址无效' }, true); }
+  const host = parsed.hostname.toLowerCase();
+  if (!['http:', 'https:'].includes(parsed.protocol) || !(host === 'localhost' || host === '127.0.0.1' || host === '::1')) {
+    return jsonResult({ error: '访问控制只能连本机回环' }, true);
+  }
+  try {
+    const response = await fetch(`${parsed.origin}/access`, {
+      method: action === 'status' ? 'GET' : 'POST',
+      headers: action === 'status' ? undefined : { 'content-type': 'application/json' },
+      body: action === 'status' ? undefined : JSON.stringify({ action }),
+      signal: AbortSignal.timeout(5000),
+      redirect: 'error',
+    });
+    const data = await response.json() as Record<string, unknown>;
+    if (!response.ok) return jsonResult({ ...data, http_status: response.status }, true);
+    return jsonResult(data);
+  } catch (error) {
+    return jsonResult({ error: `无法连接本机访问控制面: ${error instanceof Error ? error.message : String(error)}` }, true);
+  }
+}
+
 /** One request, no listener, registration, identity file or background probe. */
 export async function callDreammateTool(
   name: string,
@@ -625,6 +682,12 @@ export async function callDreammateTool(
   const agentUrl = (options.agentUrl ?? DEFAULT_AGENT_URL).replace(/\/+$/, '');
 
     try {
+      if (!visibleMcpTools(options).some(tool => tool.name === name)) {
+        return jsonResult({ error: `工具不可用: ${name}`, code: 'TOOL_NOT_ALLOWED' }, true);
+      }
+      if (name === 'dreammate_access') {
+        return callAccessTool(args, options);
+      }
       if (name === 'dreammate_search_skills') {
         if (typeof args.query !== 'string' || !args.query.trim() || args.query.length > 2000) {
           return jsonResult({ error: 'query 必须是 1–2000 字符的非空任务描述' }, true);

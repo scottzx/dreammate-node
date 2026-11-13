@@ -34,6 +34,8 @@ const USAGE = `dreammate-node — DreamMate Network 本机 node agent
   dreammate-node install [--host ...] [--port ...]          装成常驻服务（开机自启）
   dreammate-node status                                     服务与端口状态
   dreammate-node uninstall                                  卸载
+  dreammate-node access <status|enable|disable|rotate|show-token|forget-token|zones>
+                                                           管理本机公网访问开关（仅本机回环可用）
   dreammate-node embedding install|status|config|uninstall   管理按需本地向量模型（macOS）
   dreammate-node skills install [--profile auto|ish|terminal]  安装/更新对应环境的 skill
   dreammate-node skills add --name NAME --project PATH|--dir PATH  登记本机 Skill 来源
@@ -50,7 +52,7 @@ const USAGE = `dreammate-node — DreamMate Network 本机 node agent
 install 在 macOS 上装 launchd LaunchAgent、Linux 上装 systemd user unit，都不需要 sudo。`;
 
 const sourceCommand = command === 'mcp' && ['add', 'list', 'remove', 'refresh', 'share'].includes(argv[1] ?? '');
-if (!['cli', 'skills', 'embedding'].includes(command) && !sourceCommand && (argv.includes('--help') || argv.includes('-h') || command === 'help')) {
+if (!['cli', 'skills', 'embedding', 'access'].includes(command) && !sourceCommand && (argv.includes('--help') || argv.includes('-h') || command === 'help')) {
   console.log(USAGE);
   process.exit(0);
 }
@@ -86,6 +88,12 @@ try {
     case 'cli': {
       const { runCliProcess } = await import('../src/cli-process.js');
       await runCliProcess(argv.slice(1));
+      break;
+    }
+
+    case 'access': {
+      const { runAccessCli } = await import('../src/access-cli.js');
+      process.exitCode = await runAccessCli(argv.slice(1));
       break;
     }
 
@@ -167,8 +175,11 @@ try {
 
     case 'run': {
       const { serveAgent } = await import('../src/server.js');
+      const { startAccessControl } = await import('../src/access-server.js');
       const { nodeIdentity } = await import('../src/identity.js');
       const { server, registry, mcpSources, rebuilt } = await serveAgent({ port, host });
+      // 访问控制面单独绑一个只听回环的端口：公网够不到它，状态也只有一个写入方。
+      const access = await startAccessControl();
       let stopping = false;
       const shutdown = (): void => {
         if (stopping) return;
@@ -176,7 +187,10 @@ try {
         registry.stop();
         const deadline = setTimeout(() => process.exit(1), 5000);
         deadline.unref();
-        void mcpSources.stop().finally(() => {
+        void Promise.all([
+          mcpSources.stop(),
+          access.close(),
+        ]).finally(() => {
           server.close(() => { clearTimeout(deadline); });
           server.closeIdleConnections();
         });
@@ -186,6 +200,7 @@ try {
       const identity = await nodeIdentity();
       console.log(`dreammate-node — ${identity.name} (${identity.node_id})  [${identity.source}]`);
       console.log(`  http://${host}:${port}/manifest`);
+      console.log(`  访问控制面 http://127.0.0.1:${access.port}/access（仅本机回环）`);
       console.log(
         `  服务报备仅接受 localhost；已注册 ${registry.list().length} 个服务` +
           (rebuilt > 0 ? `（其中 ${rebuilt} 个是扫约定端口捡回来的）` : ''),
