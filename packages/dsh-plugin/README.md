@@ -117,6 +117,14 @@ Targets DreamMate Node ^0.17.0. Managed gateways enforce public access and start
 loopback access control port when it is free. `dreammate_access` is not registered as
 a DSH tool. Existing running local nodes remain externally owned.
 
+## Releases
+
+This package keeps its own version numbers. What tracks DreamMate Node is the
+dependency's major and minor: `^0.18.0` accepts `0.18.x` and not `0.19.0`.
+Pushing `v0.18.0` publishes Node and, in the same workflow, this package when its
+version is not on npm yet. A Node patch such as `0.18.1` does not publish the plugin.
+The plugin version does not jump to `0.18.0` just to match Node.
+
 ## 0.2.0 dependency transition
 
 Targets DreamMate Node ^0.15.0 / Network 0.5. Existing running local nodes remain externally owned: releasing the DSH plugin does not stop them. Update the profile dependency and lockfile together. The plugin does not install or launch separate embedding workers.

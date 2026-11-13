@@ -1,8 +1,12 @@
 # 发布 @1agents/dreammate-node 到 npm。
 #
-# 触发：推一个 v* tag（例如 v0.1.0），或在 Actions 页手动 Run workflow。
+# 触发：推一个 v* tag（例如 v0.18.0），或在 Actions 页手动 Run workflow。
 # tag 上的版本号必须与 package.json 对得上，否则直接失败——版本对不上的包
 # 发出去就收不回来了。
+#
+# 同一个 tag 也会发出 @1agents/dsh-dreammate-node，但只在它的版本还没上 npm 时。
+# 两个包的版本号不对齐。插件依赖的大、小版本必须接得住这次 Node：
+# 0.18.0 要插件依赖 ^0.18.0 并且插件自己的版本加一档；0.18.1 这种补丁不用发插件。
 name: publish
 
 on:
@@ -30,6 +34,10 @@ jobs:
         with:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '11.14.0'
 
       - run: npm ci
 
@@ -61,8 +69,55 @@ jobs:
           npm run skill-manager:build
           node scripts/check-package-boundary.mjs
 
+      - name: 插件依赖必须接得住这次 Node 版本
+        id: plugin
+        run: |
+          set -eu
+          plugin_ver="$(node -p "require('./packages/dsh-plugin/package.json').version")"
+          published=false
+          published_dep=""
+          if view="$(npm view "@1agents/dsh-dreammate-node@${plugin_ver}" dependencies.@1agents/dreammate-node 2>/tmp/plugin-view.err)"; then
+            published=true
+            published_dep="$view"
+          elif grep -q E404 /tmp/plugin-view.err; then
+            published=false
+          else
+            cat /tmp/plugin-view.err >&2
+            exit 1
+          fi
+          action="$(node scripts/check-release-coupling.mjs --plugin-published "$published" --published-dependency "$published_dep")"
+          echo "action=$action" >> "$GITHUB_OUTPUT"
+          echo "plugin $plugin_ver → $action"
+
       - name: Publish
         if: ${{ github.event_name == 'push' || !inputs.dry_run }}
-        run: npm publish --provenance --access public --workspaces=false
+        run: |
+          set -eu
+          ver="$(node -p "require('./package.json').version")"
+          if npm view "@1agents/dreammate-node@${ver}" version >/dev/null 2>&1; then
+            echo "@1agents/dreammate-node@${ver} 已经在 npm 上，跳过"
+          else
+            npm publish --provenance --access public --workspaces=false
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish DSH plugin
+        if: ${{ steps.plugin.outputs.action == 'publish-plugin' && (github.event_name == 'push' || !inputs.dry_run) }}
+        working-directory: packages/dsh-plugin
+        run: |
+          set -eu
+          node_ver="$(node -p "require('../../package.json').version")"
+          for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18; do
+            if npm view "@1agents/dreammate-node@${node_ver}" version >/dev/null 2>&1; then
+              break
+            fi
+            sleep 10
+          done
+          npm view "@1agents/dreammate-node@${node_ver}" version >/dev/null
+          # 小版本刚发出去时，锁文件里还没有那一版的完整性校验。这里按 package.json 的范围重解。
+          pnpm install --no-frozen-lockfile --ignore-scripts --registry https://registry.npmjs.org
+          pnpm test
+          npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
