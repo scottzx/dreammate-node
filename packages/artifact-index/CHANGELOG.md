@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.1 — 2026-11-19
+
+- 修复：文本分块会把 emoji 等代理对从中间切开，留下半个码元；序列化成 JSON 后本地编码器抛 `TypeError`，整批返回 503。分块现在按码元边界回退，入库前再兜底把孤立代理项替换为 U+FFFD。
+- 修复：一处 503 就打掉整组表示——45 个大文本文件共 5608 条表示曾因此全部掉线。现在按批重试（默认 2 次，2s/15s 退避，覆盖编码器重启窗口），单批失败只标记该批并继续。
+- 新增按批对半拆分：反复失败的批次自动二分重试，能定位到真正无法编码的单条表示，其余正常入库；连续 4 批失败才熔断。
+- 新增 `textRetries` / `mediaRetries` / `maxConsecutiveFailures` / `retryDelays` 选项；`diagnostics.embedding_errors` 区分单批失败（`circuit_open: false`）与熔断（`circuit_open: true`）。
+- 只对传输与服务端错误重试；被拒绝的批次参数不重试。
+- 嵌入失败信息带上游原因（如 `Local encoder returned an invalid response`），不再只有 HTTP 状态码。
+
 ## 0.3.0 — 2026-11-18
 
 - 新增 Word（`.docx`/`.docm`）、纯文本与 Markdown（`.txt`/`.md`/`.markdown`）解析，单元按内容块定位（`{"block": N}`）。

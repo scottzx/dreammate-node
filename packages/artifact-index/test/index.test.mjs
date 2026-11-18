@@ -25,7 +25,7 @@ async function fixture(t, options = {}) {
     embedQuery: async (query, profile) => { calls.push(['query', profile.id]); return { profile, vectors: [profile.id === qwen.id ? [1, 0] : [0, 1]] }; },
   };
   const dbPath = join(dir, 'index.sqlite');
-  const index = new ArtifactIndex({ dbPath, cacheDir: join(dir, 'cache'), sourceNode: 'test-node', extractor: async () => parsed, embeddings, ...options });
+  const index = new ArtifactIndex({ dbPath, cacheDir: join(dir, 'cache'), sourceNode: 'test-node', extractor: async () => parsed, embeddings, retryDelays: [0], ...options });
   t.after(() => index.close());
   return { index, dir, paths, dbPath, calls, embeddings, setParsed: value => { parsed = value; }, getParsed: () => parsed };
 }
@@ -279,15 +279,31 @@ test('a different query profile is rejected instead of comparing incompatible ve
   assert.equal(result.results.length, 1);
 });
 
-test('backend failure opens a circuit instead of waiting once per remaining batch', async t => {
+test('a failing backend is retried, then the circuit stops the remaining batches', async t => {
   const f = await fixture(t);
   let calls = 0;
   f.setParsed({ ...f.getParsed(), units: Array.from({ length: 40 }, (_, i) => page(i + 1, `unique page ${i}`)) });
-  f.embeddings.embedText = async () => { calls++; throw new Error('provider down'); };
-  const result = await f.index.index([f.paths[0]], { textBatchSize: 1 });
-  assert.equal(calls, 1);
+  f.embeddings.embedText = async () => { calls++; throw new Error('Local embedding request failed (HTTP 503)'); };
+  const result = await f.index.index([f.paths[0]], { textBatchSize: 1, textRetries: 1, maxConsecutiveFailures: 2 });
+  // Two batches, each attempted once plus one retry, before the circuit opens.
+  assert.equal(calls, 4);
   assert.equal(result.resources[0].representations.pending, 40);
-  assert.equal(result.diagnostics.embedding_errors[0].circuit_open, true);
+  assert.ok(result.diagnostics.embedding_errors.some(error => error.circuit_open), 'the remaining batches are not attempted');
+  assert.ok(result.diagnostics.embedding_errors.some(error => !error.circuit_open), 'the failed batches are reported individually');
+});
+
+test('a transient embedding failure is retried and the batch still lands', async t => {
+  const f = await fixture(t);
+  let first = true;
+  const original = f.embeddings.embedText;
+  f.embeddings.embedText = async texts => {
+    if (first) { first = false; throw new Error('Local embedding request failed (HTTP 503)'); }
+    return original(texts);
+  };
+  const result = await f.index.index([f.paths[0]]);
+  assert.equal(result.resources[0].representations.vectorized_text, 1);
+  assert.equal(result.resources[0].representations.pending, 0);
+  assert.deepEqual(result.diagnostics.embedding_errors, []);
 });
 
 test('page text is split into overlapping vectors while its page locator stays intact', async t => {
@@ -557,4 +573,17 @@ test('a twin indexed without visuals is not reused when visuals are requested', 
   assert.equal(second.diagnostics.reused, 0, 'a visual-less twin cannot satisfy a visual run');
   const units = f.index.store.unitsWithRepresentations(second.resources[0].resource_id);
   assert.ok(units.some(unit => unit.representations.some(rep => rep.modality === 'image')));
+});
+
+test('emoji-heavy text never stores half a surrogate pair', async t => {
+  const f = await fixture(t);
+  const source = '👋😊🧒👧👨‍🏫'.repeat(400) + '中文段落'.repeat(120) + '结尾';
+  f.setParsed({ ...f.getParsed(), kind: 'text', mime: 'text/plain', parser_version: PARSER_VERSION, units: [{ kind: 'block', locator: { block: 1 }, text: source }] });
+  const out = await f.index.index([f.paths[0]], { semantic: false });
+  const units = f.index.store.unitsWithRepresentations(out.resources[0].resource_id);
+  const chunks = units.flatMap(unit => unit.representations.map(rep => rep.text).filter(Boolean));
+  assert.ok(chunks.length > 1, 'a long block is split into overlapping chunks');
+  const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+  for (const chunk of chunks) assert.ok(!lone.test(chunk), 'no chunk may hold half a surrogate pair');
+  assert.ok(chunks.some(chunk => chunk.endsWith('结尾')), 'the tail of the source is still indexed');
 });

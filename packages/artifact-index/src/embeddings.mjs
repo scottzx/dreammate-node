@@ -70,7 +70,13 @@ async function requestJson(url, { body, timeoutMs, signal }) {
       response.on('error', reject);
       response.on('end', () => {
         try {
-          if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) throw fail(`Local embedding request failed (HTTP ${response.statusCode})`);
+          if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) {
+            // The upstream reason matters: a queue rejection and a model error
+            // both arrive as 5xx, and they need different handling.
+            let detail = '';
+            try { detail = String(JSON.parse(Buffer.concat(chunks).toString('utf8'))?.error ?? '').slice(0, 200); } catch { /* Not JSON. */ }
+            throw fail(`Local embedding request failed (HTTP ${response.statusCode})${detail ? `: ${detail}` : ''}`);
+          }
           const result = JSON.parse(Buffer.concat(chunks).toString('utf8'));
           if (!result || typeof result !== 'object' || Array.isArray(result)) throw fail('Invalid local embedding response');
           resolve(result);

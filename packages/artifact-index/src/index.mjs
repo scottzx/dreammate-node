@@ -118,6 +118,29 @@ const WEAK_PATH_HINTS = [['检索', 1], ['findings', 1], ['summary', 1]];
 // The multimodal profile holds page renders, slide images and video clips;
 // the Qwen document profile holds text only. An image query can only enter
 // the former, so a text-only space is skipped instead of failing the search.
+// Transient embedding failures are worth another attempt: a supervisor that
+// is switching models can return 503 for a batch that would succeed seconds
+// later. Rejected payloads are not retried.
+// A supervisor that retires a wedged worker needs ~10 s to load a new one, so
+// the backoff must outlast a reload instead of retrying into the same window.
+const RETRY_DELAYS = [2000, 15000, 30000];
+const RETRYABLE_EMBEDDING = /(?:HTTP (?:429|5\d\d)|\b(?:429|503|504)\b|timed out|timeout|ECONN|EPIPE|ECONNRESET|socket|fetch failed|network|queue is full|cancelled)/i;
+const PERMANENT_EMBEDDING = /(?:invalid|mismatch|must |unsupported|not support|unknown)/i;
+
+function retryableEmbeddingError(detail) {
+  return !PERMANENT_EMBEDDING.test(detail) && RETRYABLE_EMBEDDING.test(detail);
+}
+
+/** Sleep that reacts to cancellation instead of holding the run open. */
+function pause(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason ?? new Error('Embedding request cancelled'));
+    const onAbort = () => { clearTimeout(timer); reject(signal.reason ?? new Error('Embedding request cancelled')); };
+    const timer = setTimeout(() => { signal?.removeEventListener('abort', onAbort); resolve(); }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 // Formats whose parser renders pages, slides or video frames. A copy may adopt
 // a twin's units only when that twin already carries those renders, otherwise
 // an earlier `--no-visual` run would silently strip visuals from the copy.
@@ -162,17 +185,33 @@ function snippet(text, query, max = 600) {
   return `${start ? '…' : ''}${text.slice(start, start + max)}${start + max < text.length ? '…' : ''}`;
 }
 
+/** Replace halves of a surrogate pair that lost their partner. */
+function withoutLoneSurrogates(value) {
+  return value.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '\uFFFD');
+}
+
+const isLowSurrogate = code => code >= 0xDC00 && code <= 0xDFFF;
+const isHighSurrogate = code => code >= 0xD800 && code <= 0xDBFF;
+
+/** Split text without ever cutting an emoji or other surrogate pair in half. */
 function textChunks(text, configuredLimit) {
   // The shared Qwen document profile has a 512-token window. A page remains
   // one addressable unit, but several overlapping representations ensure its
   // final paragraphs are searchable instead of silently being truncated.
   const size = boundedInt(configuredLimit, /\p{Script=Han}/u.test(text) ? 384 : 1400, 64, 4000);
   if (text.length <= size) return [text];
-  const result = [], overlap = Math.min(64, Math.floor(size / 8));
-  for (let start = 0; start < text.length; start += size - overlap) {
-    const value = text.slice(start, start + size);
+  const result = [], overlap = Math.min(64, Math.floor(size / 8)), step = size - overlap;
+  for (let start = 0; start < text.length;) {
+    let end = Math.min(text.length, start + size);
+    // A slice boundary inside a surrogate pair yields half an emoji, which
+    // serialises as a lone surrogate and makes the tokenizer throw.
+    if (end < text.length && isLowSurrogate(text.charCodeAt(end))) end -= 1;
+    const value = text.slice(start, end);
     if (value.trim()) result.push(value);
-    if (start + size >= text.length) break;
+    if (end >= text.length) break;
+    let next = start + step;
+    if (next > start && isLowSurrogate(text.charCodeAt(next))) next -= 1;
+    start = Math.max(next, start + 1);
   }
   return result;
 }
@@ -188,6 +227,8 @@ export class ArtifactIndex {
     if (!SHARING_VALUES.includes(this.sharing)) throw new Error('Invalid sharing value');
     this.extractor = options.extractor ?? (async (file, opts) => (await import('./extract.mjs')).extractArtifact(file, opts));
     this.embeddings = options.embeddings;
+    // Tests and hosts can shorten the backoff without touching defaults.
+    this.retryDelays = Array.isArray(options.retryDelays) ? options.retryDelays : undefined;
     this.store = new ArtifactStore(this.dbPath);
     this.mutationTail = Promise.resolve();
     this.closed = false;
@@ -359,7 +400,7 @@ export class ArtifactIndex {
           const id = `unit:${hash(`${resourceId}\0${stableJSON(locator)}`)}`;
           if (unitIds.has(id)) throw new Error('Extractor returned duplicate unit locators');
           unitIds.add(id);
-          const text = String(sourceUnit.text ?? '');
+          const text = withoutLoneSurrogates(String(sourceUnit.text ?? ''));
           if (text.length > 10_000_000) throw new Error('An extracted unit exceeds the 10 MB text limit');
           const representations = [], repIds = new Set();
           let rawReps = [...(sourceUnit.representations ?? [])];
@@ -450,25 +491,59 @@ export class ArtifactIndex {
     }
     const errors = [];
     const encodeGroups = async (pending, media) => {
-      const batches = chunks(pending, boundedInt(media ? options.mediaBatchSize : options.textBatchSize, media ? 8 : 32, 1, 128));
-      for (const [batchIndex, batch] of batches.entries()) {
-        try {
-          const method = media ? this.embeddings?.embedMedia : this.embeddings?.embedText;
-          if (typeof method !== 'function') throw new Error('No local embedding provider configured');
-          const inputs = batch.map(reps => media ? { modality: reps[0].modality, path: reps[0].path, content_hash: reps[0].content_hash } : reps[0].text);
-          const result = await timed(signal => method.call(this.embeddings, inputs, { inputType: 'document', signal }), boundedInt(options.embeddingTimeoutMs, 60000, 1, 600000), options.signal);
-          const profile = normalizeProfile(result.profile);
-          if (!Array.isArray(result.vectors) || result.vectors.length !== batch.length) throw new Error('Embedding provider returned the wrong vector count');
-          // Validate the complete batch before attaching a single vector.
-          result.vectors.forEach(vector => vectorToBlob(vector, profile.dimensions));
-          result.vectors.forEach((vector, index) => { for (const rep of batch[index]) Object.assign(rep, { vector, profile }); });
-        } catch (error) {
-          const detail = message(error);
-          const remaining = batches.slice(batchIndex).flat();
-          errors.push({ modality: media ? 'visual' : 'text', error: detail, representations: remaining.reduce((sum, reps) => sum + reps.length, 0), circuit_open: true });
-          for (const reps of remaining) for (const rep of reps) rep.error = detail;
-          break;
+      const size = boundedInt(media ? options.mediaBatchSize : options.textBatchSize, media ? 8 : 32, 1, 128);
+      const retries = boundedInt(media ? options.mediaRetries : options.textRetries, 2, 0, 5);
+      const budget = boundedInt(options.maxConsecutiveFailures, 4, 1, 100);
+      const delays = Array.isArray(options.retryDelays) ? options.retryDelays : (this.retryDelays ?? RETRY_DELAYS);
+      const label = media ? 'visual' : 'text';
+      const attempt = async batch => {
+        let failure;
+        for (let round = 0; round <= retries; round++) {
+          if (round) await pause(delays[Math.min(round - 1, delays.length - 1)] ?? 0, options.signal);
+          try {
+            const method = media ? this.embeddings?.embedMedia : this.embeddings?.embedText;
+            if (typeof method !== 'function') throw new Error('No local embedding provider configured');
+            const inputs = batch.map(reps => media ? { modality: reps[0].modality, path: reps[0].path, content_hash: reps[0].content_hash } : reps[0].text);
+            const result = await timed(signal => method.call(this.embeddings, inputs, { inputType: 'document', signal }), boundedInt(options.embeddingTimeoutMs, 60000, 1, 600000), options.signal);
+            const profile = normalizeProfile(result.profile);
+            if (!Array.isArray(result.vectors) || result.vectors.length !== batch.length) throw new Error('Embedding provider returned the wrong vector count');
+            // Validate the complete batch before attaching a single vector.
+            result.vectors.forEach(vector => vectorToBlob(vector, profile.dimensions));
+            result.vectors.forEach((vector, index) => { for (const rep of batch[index]) Object.assign(rep, { vector, profile }); });
+            return undefined;
+          } catch (error) {
+            failure = error;
+            // A rejected batch payload will fail again; only transport and
+            // service-side failures are worth another attempt.
+            if (!retryableEmbeddingError(message(error))) break;
+          }
         }
+        return failure;
+      };
+      const jobs = chunks(pending, size);
+      let consecutive = 0;
+      while (jobs.length) {
+        const batch = jobs.shift();
+        const failure = await attempt(batch);
+        if (!failure) { consecutive = 0; continue; }
+        // Some batches fail because of their size on a memory-constrained
+        // encoder. Halving isolates the real culprit instead of losing every
+        // representation in the batch.
+        if (batch.length > 1 && consecutive === 0) {
+          const middle = Math.ceil(batch.length / 2);
+          jobs.unshift(batch.slice(0, middle), batch.slice(middle));
+          continue;
+        }
+        const detail = message(failure);
+        for (const reps of batch) for (const rep of reps) rep.error = detail;
+        errors.push({ modality: label, error: detail, representations: batch.reduce((sum, reps) => sum + reps.length, 0), circuit_open: false });
+        consecutive += 1;
+        if (consecutive < budget) continue;
+        const remaining = jobs.flat();
+        if (!remaining.length) break;
+        errors.push({ modality: label, error: detail, representations: remaining.reduce((sum, reps) => sum + reps.length, 0), circuit_open: true });
+        for (const reps of remaining) for (const rep of reps) rep.error = detail;
+        jobs.length = 0;
       }
     };
     // Batch all documents by backend so a PDF with many pages does not switch
