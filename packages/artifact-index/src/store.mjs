@@ -64,6 +64,48 @@ export class ArtifactStore {
       .map(row => ({ ...row, profile: JSON.parse(row.metadata_json) }));
   }
 
+  /** True when a resource still has text representations without a vector. */
+  hasPendingVectors(resourceId) {
+    // A representation marked as disabled is not pending: the run deliberately
+    // produced no vector for it. A failed attempt, however, must be retried.
+    const row = this.db.prepare(`SELECT COUNT(*) AS n FROM representations rp JOIN units u ON u.id = rp.unit_id WHERE u.resource_id = ? AND rp.modality = 'text' AND rp.vector_id IS NULL AND (rp.error IS NULL OR rp.error <> 'embedding_disabled')`).get(resourceId);
+    return row.n > 0;
+  }
+
+  /**
+   * Another ready resource holding the same bytes and parser version. A copy
+   * of an already parsed document can adopt its units instead of being parsed
+   * again; the copy keeps its own path, sharing and title.
+   */
+  twin(revision, parserVersion, excludePath) {
+    return this.db.prepare(`SELECT * FROM resources WHERE revision = ? AND parser_version = ? AND status = 'ready'
+      AND canonical_path <> ? ORDER BY indexed_at, id LIMIT 1`).get(revision, parserVersion, excludePath);
+  }
+
+  /** Stored units plus their representations, for adopting a parsed twin. */
+  unitsWithRepresentations(resourceId) {
+    const units = this.db.prepare('SELECT * FROM units WHERE resource_id = ? ORDER BY ordinal').all(resourceId);
+    const strings = this.db.prepare(`SELECT rp.* FROM representations rp JOIN units u ON u.id = rp.unit_id
+      WHERE u.resource_id = ? ORDER BY rp.modality, rp.content_hash`).all(resourceId);
+    const byUnit = new Map();
+    for (const row of strings) {
+      if (!byUnit.has(row.unit_id)) byUnit.set(row.unit_id, []);
+      byUnit.get(row.unit_id).push(row);
+    }
+    return units.map(unit => ({ ...unit, representations: byUnit.get(unit.id) ?? [] }));
+  }
+
+  /**
+   * True when a resource carries usable page renders, slide images or clips.
+   * A run that deliberately skipped visuals records the representation with
+   * `embedding_disabled`, which must not count as coverage for a copy.
+   */
+  hasVisualRepresentations(resourceId) {
+    return this.db.prepare(`SELECT 1 AS found FROM representations rp JOIN units u ON u.id = rp.unit_id
+      WHERE u.resource_id = ? AND rp.modality <> 'text'
+        AND (rp.error IS NULL OR rp.error <> 'embedding_disabled') LIMIT 1`).get(resourceId) !== undefined;
+  }
+
   transaction(fn) {
     this.db.exec('BEGIN IMMEDIATE');
     try { const value = fn(); this.db.exec('COMMIT'); return value; }

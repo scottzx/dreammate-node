@@ -128,10 +128,17 @@ export function createEmbeddingClient({ agent = 'http://127.0.0.1:36908', mediaR
     return requestJson(new URL(route, origin), { body, timeoutMs: remaining, signal: deadline.signal });
   };
   const invoke = (provider, method, params, deadline) => request(`/services/${encodeURIComponent(provider.id)}/invoke`, { method, params }, deadline);
+  // The gateway catalog can be many megabytes and includes unrelated
+  // services. Discover once per client and reuse the small provider list.
+  let providerCache = null;
+  const inspectCache = new Map();
   async function discover(deadline) {
+    // A cached catalog must still honour an already aborted request.
+    deadline.signal?.throwIfAborted();
+    if (providerCache) return providerCache;
     const response = await request('/services', undefined, deadline);
     if (!Array.isArray(response.services)) throw fail('Invalid local service catalog');
-    return response.services.flatMap(service => {
+    providerCache = response.services.flatMap(service => {
       const ad = service?.metadata?.embedding_provider;
       if (!service || !canonical(service.id) || service.metadata?.enabled === false || service.liveness === 'down'
         || !Number.isSafeInteger(service.port) || service.port < 1 || service.port > 65535 || service.command !== undefined
@@ -142,10 +149,18 @@ export function createEmbeddingClient({ agent = 'http://127.0.0.1:36908', mediaR
       return [{ id: service.id, alias: ad.model, revision: ad.revision, dimensions: ad.dimensions, encoding: ad.encoding,
         priority: ad.priority ?? 0, healthy: service.liveness === 'up', methods: service.methods }];
     }).sort((a, b) => b.priority - a.priority || Number(b.healthy) - Number(a.healthy) || a.id.localeCompare(b.id));
+    return providerCache;
   }
   async function inspect(provider, deadline) {
+    deadline.signal?.throwIfAborted();
     if (provider.alias === 'embeddinggemma2') return { provider, profile: embeddingProfile({ model: provider.alias, revision: provider.revision, dimensions: provider.dimensions, encoding: provider.encoding }) };
-    const status = await invoke(provider, 'embedding.status', {}, deadline);
+    // The profile fingerprint is a property of the running model, not of the
+    // request. Read it once per provider and reuse it across a batch run.
+    let status = inspectCache.get(provider.id);
+    if (!status) {
+      status = await invoke(provider, 'embedding.status', {}, deadline);
+      inspectCache.set(provider.id, status);
+    }
     const doc = status.embedding_profiles?.find(value => value?.task === 'document_search' && value.model === provider.alias
       && value.revision === provider.revision && value.dimensions === provider.dimensions
       && value.encoding === provider.encoding.replace('dreammate.tool-search.v1:', 'dreammate.artifact-search.v1:'));

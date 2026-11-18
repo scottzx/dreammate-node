@@ -40,21 +40,26 @@ export interface SearchOptions {
   mode?: 'hybrid' | 'lexical' | 'semantic'; limit?: number; offset?: number; maxChars?: number;
   types?: ArtifactKind[] | ArtifactKind; sharing?: Sharing | Sharing[]; perResourceLimit?: number;
   candidateLimit?: number; maxProfiles?: number; minSimilarity?: number; embeddingTimeoutMs?: number; signal?: AbortSignal; modalities?: Modality[]; includeStale?: boolean;
+  /** Absolute path of a local image to search with instead of words (hybrid/semantic only). */
+  queryImage?: string;
+  /** Collapse byte-identical copies into one hit that lists them under `duplicates`; default true. */
+  collapseDuplicates?: boolean;
 }
 export interface SearchResult {
   unit_id: string; resource_id: string; title: string; kind: ArtifactKind; unit_kind: string; locator: Locator;
-  snippet: string; source_node: string; source_uri: string; sharing: Sharing; score: number; matched_modality: Modality[]; status: 'ready' | 'stale'; last_error?: string;
+  snippet: string; source_node: string; source_uri: string; sharing: Sharing; score: number; similarity?: number; matched_modality: Modality[]; status: 'ready' | 'stale'; last_error?: string;
+  duplicates?: Array<{resource_id: string; title: string; source_uri: string; source_node: string; sharing: Sharing}>;
   matches: Array<{modality: Modality; profile_id: string | null; rank: number; similarity?: number}>;
 }
 export interface SearchResponse {
-  schema_version: number; query: string; mode: 'hybrid' | 'lexical' | 'semantic'; results: SearchResult[]; total: number;
+  schema_version: number; query: string; query_image?: string; mode: 'hybrid' | 'lexical' | 'semantic'; results: SearchResult[]; total: number;
   semantic_status: 'not_requested' | 'unavailable' | 'partial' | 'available'; fallback: boolean;
-  diagnostics: {elapsed_ms: number; candidates: number; candidate_limit: number; candidates_truncated: boolean; vector_spaces: number; successful_vector_spaces: number; visual_vectors: number; errors: Array<{profile_id?: string; error: string}>; visual_search_unavailable: boolean; chars: number; per_resource_limit: number};
+  diagnostics: {elapsed_ms: number; candidates: number; candidate_limit: number; candidates_truncated: boolean; vector_spaces: number; successful_vector_spaces: number; visual_vectors: number; errors: Array<{profile_id?: string; error: string}>; visual_search_unavailable: boolean; chars: number; per_resource_limit: number; duplicates_collapsed: number};
 }
 export interface IndexResponse {
   schema_version: number;
-  resources: Array<{path: string; resource_id?: string; status: 'indexed' | 'parsed' | 'failed' | 'skipped'; units?: number; warnings?: unknown[]; reason?: string; error?: string; snapshot_status?: 'ready' | 'stale'; representations?: {text: number; visual: number; vectorized_text: number; vectorized_visual: number; pending: number}}>;
-  diagnostics: {parsed: number; indexed: number; failed: number; skipped: number; cached_representations: number; vectorized_text: number; vectorized_visual: number; embedding_errors: Array<{modality: string; error: string; representations: number; circuit_open: boolean}>};
+  resources: Array<{path: string; resource_id?: string; status: 'indexed' | 'parsed' | 'failed' | 'skipped'; reused_from?: string; units?: number; warnings?: unknown[]; reason?: string; error?: string; snapshot_status?: 'ready' | 'stale'; representations?: {text: number; visual: number; vectorized_text: number; vectorized_visual: number; pending: number}}>;
+  diagnostics: {parsed: number; indexed: number; reused: number; failed: number; skipped: number; cached_representations: number; vectorized_text: number; vectorized_visual: number; embedding_errors: Array<{modality: string; error: string; representations: number; circuit_open: boolean}>};
 }
 export interface IndexStats {schema_version: number; db_path: string; resources: number; stale_resources: number; units: number; representations: number; vectors: number; profiles: number; pending_representations: number}
 export const SCHEMA_VERSION: number;

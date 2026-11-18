@@ -14,6 +14,7 @@ test('standalone CLI supports help, SQLite stats and bounded empty search',async
   const version = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version;
   assert.equal((await run(linked,['--version'])).stdout.trim(),version);
   assert.match((await run(linked,['--help'])).stdout,/--modalities/);
+  assert.match((await run(linked,['--help'])).stdout,/--query-image/);
   assert.match((await run(process.execPath,[cli,'--help'])).stdout,/--modalities/);
   assert.equal((await run(process.execPath,[cli,'--version'])).stdout.trim(),version);
   assert.equal(JSON.parse((await run(process.execPath,[cli,'stats','--db',db])).stdout).resources,0);

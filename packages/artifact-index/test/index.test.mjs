@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, writeFile, rm, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { ArtifactIndex } from '../src/index.mjs';
+import { PARSER_VERSION } from '../src/extract.mjs';
 
 const qwen = { id: 'qwen-r1', model: 'qwen3@revision-one', alias: 'qwen3', revision: 'revision-one', dimensions: 2, encoding: 'qwen:fp32:max512', task: 'document_search' };
 const gemma = { id: 'gemma-r1', model: 'embeddinggemma2@revision-two', alias: 'embeddinggemma2', revision: 'revision-two', dimensions: 2, encoding: 'gemma:fp32:max2048', task: 'multimodal' };
@@ -362,4 +363,198 @@ test('newer database schema is refused without rewriting user_version', async t 
   const check = new DatabaseSync(f.dbPath);
   assert.equal(check.prepare('PRAGMA user_version').get().user_version, 999);
   check.close();
+});
+
+test('word and plain text units are searchable by heading and body', async t => {
+  const f = await fixture(t);
+  f.setParsed({
+    kind: 'text', mime: 'text/markdown', title: '张三的简历', parser_version: 'fixture-v1',
+    units: [
+      { kind: 'heading', locator: { block: 1 }, text: '张三的简历' },
+      { kind: 'block', locator: { block: 2 }, text: '姓名：张三\n负责 B 端 SaaS 产品规划', section: '张三的简历' },
+    ],
+    warnings: [],
+  });
+  await f.index.index([f.paths[0]]);
+  // A heading is addressable on its own.
+  const heading = await f.index.search('简历', { mode: 'lexical' });
+  assert.equal(heading.results.length, 1);
+  assert.deepEqual(heading.results[0].locator, { block: 1 });
+  assert.equal(heading.results[0].kind, 'text');
+  // The body unit keeps its own block locator and the heading as context.
+  const body = await f.index.search('产品规划', { mode: 'lexical' });
+  assert.deepEqual(body.results[0].locator, { block: 2 });
+  const unit = f.index.read(body.results[0].unit_id);
+  assert.equal(unit.metadata.section, '张三的简历');
+  assert.equal(unit.text, '姓名：张三\n负责 B 端 SaaS 产品规划');
+});
+
+test('a directory scan indexes supported files and leaves unchanged sources alone', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'artifact-walk-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const markdown = join(dir, 'resume.md');
+  const notes = join(dir, 'notes.txt');
+  await writeFile(markdown, '# 简历\n');
+  await writeFile(notes, '面试安排\n');
+  const dbPath = join(dir, 'index.sqlite');
+  const index = new ArtifactIndex({
+    dbPath, cacheDir: join(dir, 'cache'), sourceNode: 'test-node',
+    extractor: async file => ({ kind: 'text', mime: 'text/plain', title: file.split('/').pop(), parser_version: 'fixture-v1', units: [{ kind: 'block', locator: { block: 1 }, text: '简历内容' }], warnings: [] }),
+  });
+  t.after(() => index.close());
+  const first = await index.index([dir], { parserVersion: 'fixture-v1' });
+  assert.equal(first.diagnostics.indexed, 2);
+  assert.ok(first.diagnostics.scanned_directories >= 1);
+  assert.equal(first.diagnostics.discovered_files, 2);
+  const second = await index.index([dir], { parserVersion: 'fixture-v1' });
+  assert.equal(second.diagnostics.indexed, 0);
+  assert.equal(second.diagnostics.skipped, 2);
+  assert.ok(second.resources.every(item => item.status === 'skipped' && item.reason === 'unchanged'));
+  // A changed source is re-read even without an explicit request.
+  await writeFile(notes, '面试改期\n');
+  const third = await index.index([dir], { parserVersion: 'fixture-v1' });
+  assert.equal(third.diagnostics.indexed, 1);
+  assert.equal(third.diagnostics.skipped, 1);
+});
+
+test('a newer parser re-reads a source whose bytes did not change', async t => {
+  const f = await fixture(t);
+  await f.index.index([f.paths[0]], { parserVersion: 'fixture-v1' });
+  const again = await f.index.index([f.paths[0]], { parserVersion: 'fixture-v2' });
+  assert.equal(again.diagnostics.indexed, 1);
+  assert.equal(again.diagnostics.skipped, 0);
+});
+
+test('a resource whose vectors never landed is retried on the next run', async t => {
+  const f = await fixture(t);
+  const working = f.embeddings.embedText;
+  f.embeddings.embedText = async () => { throw new Error('provider down'); };
+  const failed = await f.index.index([f.paths[0]]);
+  assert.equal(failed.resources[0].representations.vectorized_text, 0);
+  assert.ok(f.index.stats().pending_representations > 0);
+  // The bytes did not change, but the missing vectors must still be retried.
+  f.embeddings.embedText = working;
+  const retry = await f.index.index([f.paths[0]]);
+  assert.equal(retry.diagnostics.indexed, 1);
+  assert.equal(retry.resources[0].representations.vectorized_text, 1);
+  assert.equal(f.index.stats().pending_representations, 0);
+});
+
+test('a personal material path outranks a bulk corpus repeating the query word', async t => {
+  const f = await fixture(t);
+  const dir = await mkdtemp(join(tmpdir(), 'artifact-rank-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const personal = join(dir, '简历', '曾晓峰简历.md');
+  const bulk = join(dir, 'presets', 'souls', 'soul-1.md');
+  await mkdir(join(dir, '简历'), { recursive: true });
+  await mkdir(join(dir, 'presets', 'souls'), { recursive: true });
+  await writeFile(personal, '曾晓峰 简历 讲师');
+  // A different byte stream: identical content would collapse as one answer.
+  await writeFile(bulk, '曾晓峰 简历 讲师 模板');
+  const index = new ArtifactIndex({
+    dbPath: join(dir, 'index.sqlite'), cacheDir: join(dir, 'cache'), sourceNode: 'test-node',
+    extractor: async file => ({ kind: 'text', mime: 'text/plain', title: file.split('/').pop(), parser_version: 'fixture-v1', units: [{ kind: 'block', locator: { block: 1 }, text: '曾晓峰 简历 讲师' }], warnings: [] }),
+  });
+  t.after(() => index.close());
+  await index.index([dir], { semantic: false });
+  const found = await index.search('简历', { mode: 'lexical' });
+  assert.equal(found.results.length, 2);
+  assert.ok(found.results[0].source_uri.includes('%E7%AE%80%E5%8E%86') || found.results[0].source_uri.includes('简历'), 'the personal material path must rank first');
+  assert.ok(found.results[0].score > found.results[1].score);
+});
+
+test('an image query searches the multimodal space without touching text profiles', async t => {
+  const f = await fixture(t);
+  f.setParsed({ ...f.getParsed(), units: [page(1, '地图页', true)] });
+  await f.index.index([f.paths[0]]);
+  f.calls.length = 0;
+  const image = join(f.dir, 'query.png');
+  await writeFile(image, 'not-a-real-png');
+  const result = await f.index.search('', { queryImage: image });
+  assert.equal(result.semantic_status, 'available');
+  assert.equal(result.query_image, image);
+  assert.equal(result.results.length, 1);
+  assert.deepEqual(result.results[0].matched_modality, ['image']);
+  assert.deepEqual(result.results[0].locator, { page: 1 });
+  const kinds = f.calls.map(([kind]) => kind);
+  assert.ok(kinds.includes('media'), 'the query image must be encoded by the multimodal provider');
+  assert.ok(!kinds.includes('query'), 'a text encoder must never run for an image query');
+  assert.ok(!kinds.includes('text'));
+});
+
+test('an image query rejects unusable input and semantic-free modes', async t => {
+  const f = await fixture(t);
+  await f.index.index([f.paths[0]]);
+  const image = join(f.dir, 'query.png');
+  await writeFile(image, 'x');
+  await assert.rejects(() => f.index.search('', { queryImage: 'relative.png' }), /absolute local path/);
+  await assert.rejects(() => f.index.search('', { queryImage: join(f.dir, 'missing.png') }), /existing local file/);
+  await assert.rejects(() => f.index.search('地图', { queryImage: image, mode: 'lexical' }), /hybrid or semantic/);
+  await assert.rejects(() => f.index.search('  '), /1 to 8192 characters/);
+});
+
+test('identical file content is one search answer with the other paths attached', async t => {
+  const f = await fixture(t);
+  f.setParsed({ ...f.getParsed(), units: [page(1, '同名文件'), page(2, '第二页')] });
+  // Two byte-identical copies: same revision, same locators, different paths.
+  await writeFile(f.paths[0], 'identical-bytes');
+  await writeFile(f.paths[1], 'identical-bytes');
+  await f.index.index([f.paths[0], f.paths[1]]);
+  assert.equal(f.index.stats().resources, 2);
+  const result = await f.index.search('同名文件', { mode: 'lexical' });
+  assert.equal(result.results.length, 1, 'one page, one answer');
+  assert.equal(result.results[0].locator.page, 1);
+  assert.equal(result.diagnostics.duplicates_collapsed, 1);
+  assert.equal(result.results[0].duplicates.length, 1);
+  assert.ok(result.results[0].duplicates[0].source_uri.includes('b.pdf'));
+  assert.notEqual(result.results[0].resource_id, result.results[0].duplicates[0].resource_id);
+  const kept = await f.index.search('同名文件', { mode: 'lexical', collapseDuplicates: false });
+  assert.equal(kept.results.length, 2, 'every copy is listed again when collapsing is disabled');
+  assert.equal(kept.diagnostics.duplicates_collapsed, 0);
+});
+
+test('a copy of already parsed bytes reuses its units without a second parse', async t => {
+  const f = await fixture(t);
+  let parses = 0;
+  const original = f.index.extractor;
+  f.index.extractor = async (...args) => { parses += 1; return original(...args); };
+  await writeFile(f.paths[0], 'same-bytes');
+  await writeFile(f.paths[1], 'same-bytes');
+  // One run, same group: the second copy must adopt the first parse.
+  // The fixture page carries an image: a PDF run that requests visuals only
+  // reuses a twin that already has page renders. The parser version must match
+  // the one the current code would produce, otherwise the twin is stale.
+  f.setParsed({ ...f.getParsed(), parser_version: PARSER_VERSION, units: [page(1, '眼镜店产品手册', true)] });
+  const first = await f.index.index([f.paths[0], f.paths[1]]);
+  assert.equal(first.diagnostics.reused, 1, 'the copy is reused, not parsed');
+  assert.equal(parses, 1);
+  const reused = first.resources.find(item => item.reused_from);
+  assert.match(reused.reused_from, /[ab]\.pdf$/, 'the origin names the copy that was parsed');
+  assert.equal(first.resources.filter(item => item.representations?.pending === 0).length, 2);
+
+  // A later run under another path finds the committed twin.
+  await writeFile(f.paths[2], 'same-bytes');
+  const second = await f.index.index([f.paths[2]]);
+  assert.equal(second.diagnostics.reused, 1);
+  assert.equal(parses, 1, 'the stored twin is reused without parsing again');
+  // All three copies are indexed; search still answers once per unique page.
+  const found = await f.index.search('眼镜', { mode: 'lexical' });
+  assert.equal(found.results.length, 1);
+  assert.equal(found.results[0].duplicates.length, 2);
+  const every = await f.index.search('眼镜', { mode: 'lexical', collapseDuplicates: false });
+  assert.equal(every.results.length, 3, 'every copy keeps its own units');
+});
+
+test('a twin indexed without visuals is not reused when visuals are requested', async t => {
+  const f = await fixture(t);
+  f.setParsed({ ...f.getParsed(), parser_version: PARSER_VERSION, units: [page(1, '有图的页面', true)] });
+  await writeFile(f.paths[0], 'visual-bytes');
+  // First pass: visuals disabled, so the stored twin has no usable page image.
+  await f.index.index([f.paths[0]], { visual: false });
+  assert.equal(f.index.store.hasVisualRepresentations(f.index.list({ limit: 1 }).resources[0].resource_id), false);
+  await writeFile(f.paths[1], 'visual-bytes');
+  const second = await f.index.index([f.paths[1]], { visual: true });
+  assert.equal(second.diagnostics.reused, 0, 'a visual-less twin cannot satisfy a visual run');
+  const units = f.index.store.unitsWithRepresentations(second.resources[0].resource_id);
+  assert.ok(units.some(unit => unit.representations.some(rep => rep.modality === 'image')));
 });

@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 
 export const SCHEMA_VERSION = 1;
-export const ARTIFACT_KINDS = ['pdf', 'presentation', 'spreadsheet', 'video'];
+export const ARTIFACT_KINDS = ['pdf', 'presentation', 'spreadsheet', 'video', 'document', 'text'];
 export const SHARING_VALUES = ['local', 'network'];
 
 export function stableJSON(value) {
@@ -62,5 +62,7 @@ export function validateLocator(kind, locator) {
   if (kind === 'presentation' && !positive(locator.slide)) throw new Error('Presentation unit requires a 1-based slide');
   if (kind === 'spreadsheet' && (typeof locator.sheet !== 'string' || !locator.sheet || typeof locator.range !== 'string' || !/^[A-Z]+[1-9]\d*(?::[A-Z]+[1-9]\d*)?$/.test(locator.range))) throw new Error('Spreadsheet unit requires sheet and A1 cell range');
   if (kind === 'video' && (!Number.isInteger(locator.start_ms) || !Number.isInteger(locator.end_ms) || locator.start_ms < 0 || locator.end_ms <= locator.start_ms)) throw new Error('Video unit requires a positive time interval');
+  // Documents and plain text are addressed by the first content block they own.
+  if ((kind === 'document' || kind === 'text') && !positive(locator.block)) throw new Error(`${kind === 'document' ? 'Word' : 'Text'} unit requires a 1-based block`);
   return JSON.parse(stableJSON(locator));
 }

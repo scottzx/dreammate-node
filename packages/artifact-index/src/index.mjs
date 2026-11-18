@@ -1,10 +1,12 @@
 import { createReadStream } from 'node:fs';
 import { mkdir, realpath, stat } from 'node:fs/promises';
 import { homedir, hostname } from 'node:os';
-import { join, resolve, basename, dirname } from 'node:path';
+import { join, resolve, basename, dirname, extname, isAbsolute } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
 import { ArtifactStore } from './store.mjs';
+import { collectArtifacts } from './scan.mjs';
+import { PARSER_VERSION } from './extract.mjs';
 import { SCHEMA_VERSION, ARTIFACT_KINDS, SHARING_VALUES, hash, stableJSON, normalizeProfile, profileFingerprint, vectorToBlob, blobToVector, validateLocator } from './schema.mjs';
 
 export { ArtifactStore } from './store.mjs';
@@ -47,14 +49,38 @@ async function timed(operation, milliseconds, signal) {
 }
 
 function normalized(text) { return String(text).normalize('NFKC').toLowerCase(); }
+/** Run workers concurrently while keeping the input order of their results. */
+async function mapConcurrent(items, limit, worker) {
+  const results = new Array(items.length);
+  let next = 0;
+  const runners = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+    while (true) {
+      const index = next++;
+      if (index >= items.length) return;
+      results[index] = await worker(items[index], index);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
 function queryTerms(query) {
   const words = normalized(query).match(/[\p{L}\p{N}]+/gu) ?? [];
   const terms = new Set();
   for (const word of words) {
+    if (word.length > 64) continue;
     terms.add(word);
+    // A Han run without spaces is one word; its character bigrams keep a
+    // multi-character phrase searchable inside longer body text.
     if (/\p{Script=Han}/u.test(word) && word.length > 2) for (let i = 0; i < word.length - 1; i++) terms.add(word.slice(i, i + 2));
   }
   return [...terms].slice(0, 128);
+}
+function occurrences(haystack, needle) {
+  if (!needle) return 0;
+  let count = 0, index = haystack.indexOf(needle);
+  // Saturation needs a rough count, not an exact one.
+  while (index !== -1 && count < 8) { count++; index = haystack.indexOf(needle, index + needle.length); }
+  return count;
 }
 function lexicalScore(text, title, query, terms) {
   const body = normalized(text), heading = normalized(title), phrase = normalized(query).trim();
@@ -62,13 +88,72 @@ function lexicalScore(text, title, query, terms) {
   if (heading.includes(phrase)) score += 2;
   let matched = 0;
   for (const term of terms) {
-    if (body.includes(term)) { score += 1; matched++; }
-    if (heading.includes(term)) score += 0.5;
+    const bodyHits = occurrences(body, term);
+    if (bodyHits) { score += 1 + Math.log2(bodyHits); matched++; }
+    const titleHits = occurrences(heading, term);
+    // A file name is a deliberate label, so it counts as much as the body.
+    if (titleHits) score += 1 + Math.log2(titleHits);
   }
   // A title is useful context, but cannot make every empty page in a video or
   // document a separate lexical hit.
   if (!matched && !body.includes(phrase)) return 0;
   return score / (1 + Math.log1p(body.length) / 20);
+}
+/**
+ * A path that names the subject of a search outranks a bulk corpus.
+ *
+ * A library can hold thousands of generated fixtures that happen to contain a
+ * common word. The directory holding the person's own material is a stronger
+ * signal than any single document title. A report about a search is weaker
+ * than the document the search is about.
+ *
+ * The hint only applies when the QUERY mentions that subject: searching for a
+ * project name must not drag in the resume just because its path says "简历".
+ */
+const PERSONAL_PATH_HINTS = [
+  ['简历', 3], ['讲师', 3], ['求职', 3], ['个人简历', 3], ['自我介绍', 3], ['作品集', 3],
+  ['培训', 2], ['白皮书', 2], ['报告', 2], ['个人', 2],
+];
+const WEAK_PATH_HINTS = [['检索', 1], ['findings', 1], ['summary', 1]];
+// The multimodal profile holds page renders, slide images and video clips;
+// the Qwen document profile holds text only. An image query can only enter
+// the former, so a text-only space is skipped instead of failing the search.
+// Formats whose parser renders pages, slides or video frames. A copy may adopt
+// a twin's units only when that twin already carries those renders, otherwise
+// an earlier `--no-visual` run would silently strip visuals from the copy.
+const RENDERED_EXTENSIONS = new Set(['.pdf', '.pptx', '.pptm', '.ppt', '.mp4', '.mov', '.webm', '.mkv', '.avi', '.m4v', '.mpeg', '.mpg']);
+
+/** Re-key another resource's parsed units under this copy's resource id. */
+function adoptUnits(source, resourceId) {
+  return source.units.map(unit => {
+    const id = `unit:${hash(`${resourceId}\0${stableJSON(unit.locator)}`)}`;
+    return { ...unit, id, representations: unit.representations.map(rep => ({
+      ...rep, id: `representation:${hash(`${id}\0${rep.modality}\0${rep.content_hash}`)}`,
+    })) };
+  });
+}
+
+function supportsMediaQuery(profile) {
+  if (!profile || typeof profile !== 'object') return false;
+  return profile.alias === 'embeddinggemma2' || profile.task === 'multimodal'
+    || (typeof profile.encoding === 'string' && profile.encoding.startsWith('dreammate.gemma2.v1'));
+}
+function pathWeight(canonicalPath, query = '') {
+  if (!canonicalPath) return 0;
+  // The boost is evidence that the user named the subject; an image query has
+  // no words to compare, so it must never invent a personal-material signal.
+  if (!String(query).trim()) return 0;
+  const path = normalized(canonicalPath), q = normalized(query);
+  let weight = 0;
+  for (const [hint, value] of PERSONAL_PATH_HINTS) {
+    const h = normalized(hint);
+    // The subject must actually be what the user searched for.
+    if (q && !q.includes(h) && !h.includes(q)) continue;
+    if (path.includes(h)) weight = Math.max(weight, value);
+  }
+  // Reports about a search describe the material rather than being it.
+  for (const [hint, value] of WEAK_PATH_HINTS) if (path.includes(normalized(hint))) weight = Math.min(weight, value);
+  return weight;
 }
 function snippet(text, query, max = 600) {
   if (text.length <= max) return text;
@@ -110,33 +195,158 @@ export class ArtifactIndex {
 
   ensureOpen() { if (this.closed) throw new Error('Artifact index is closed'); }
 
+  /**
+   * Index files and directories.
+   *
+   * A directory is walked for locally parseable formats; an explicit file is
+   * always attempted so an unsupported format reports a parse error instead of
+   * disappearing. A file whose size and modification time are unchanged keeps
+   * its existing units and vectors unless `reindex` is requested.
+   */
   async index(paths, options = {}) {
     this.ensureOpen();
     if (!Array.isArray(paths) || paths.some(path => typeof path !== 'string') || !paths.length) throw new Error('index() requires one or more file paths');
-    const operation = this.mutationTail.then(() => this.indexBatch(paths, options));
+    const discovery = options.scan === false
+      ? { files: paths, directories: [], skipped: [], truncated: false }
+      : await collectArtifacts(paths, options.scan ?? {});
+    if (!discovery.files.length) {
+      return {
+        schema_version: SCHEMA_VERSION, resources: [],
+        diagnostics: { parsed: 0, indexed: 0, reused: 0, failed: 0, skipped: 0, cached_representations: 0, vectorized_text: 0, vectorized_visual: 0, embedding_errors: [],
+          scanned_directories: discovery.directories.length, discovered_files: 0, skipped_files: discovery.skipped_total ?? discovery.skipped.length, skipped_reasons: discovery.skipped_counts ?? {}, truncated: discovery.truncated },
+      };
+    }
+    const operation = this.mutationTail.then(() => this.indexBatch(discovery.files, { ...options, discovery }));
     this.mutationTail = operation.catch(() => {});
     return operation;
+  }
+
+  /** True when a stored resource still matches the file on disk. */
+  unchanged(resourceId, info, options = {}) {
+    const previous = this.store.resource(resourceId);
+    if (!previous || previous.status !== 'ready') return false;
+    // A newer parser must re-read the source even when the bytes are the same.
+    if (previous.parser_version !== (options.parserVersion ?? PARSER_VERSION)) return false;
+    if (previous.size !== info.size || previous.mtime_ms !== info.mtimeMs) return false;
+    // A resource whose vectors never landed must be retried; otherwise a
+    // failed embedding batch would leave it permanently unsearchable.
+    return !this.store.hasPendingVectors(resourceId);
   }
 
   async indexBatch(paths, options) {
     this.ensureOpen();
     await mkdir(this.cacheDir, { recursive: true });
     const semantic = options.semantic !== false, visual = options.visual !== false;
+    // Semantic indexing needs a provider. Without one the run is lexical
+    // only, and the representations are not "pending" — nothing to retry.
+    const embeddable = semantic && typeof this.embeddings?.embedText === 'function';
     const sharing = options.sharing ?? this.sharing;
     if (!SHARING_VALUES.includes(sharing)) throw new Error('Invalid sharing value');
-    const prepared = [], outcomes = [], seen = new Set();
-    for (const suppliedPath of paths) {
-      let sourceId = `resource:${hash(`${this.sourceNode}\0${await potentialRealPath(suppliedPath)}`)}`, observedRevision;
+    const outcomes = [], seen = new Set();
+    let cached = 0;
+    const errors = [];
+    // Commit in groups so a long library scan keeps its progress and a
+    // restart resumes instead of repeating the whole collection.
+    const groupSize = boundedInt(options.chunkSize, 64, 1, 2000);
+    for (const [groupIndex, group] of chunks(paths, groupSize).entries()) {
+      options.onProgress?.({ phase: 'parse', group: groupIndex + 1, groups: Math.ceil(paths.length / groupSize), files: group.length });
+      const prepared = await this.parseGroup(group, options, outcomes, seen, semantic, embeddable, visual, sharing);
+      options.onProgress?.({ phase: 'embed', group: groupIndex + 1, groups: Math.ceil(paths.length / groupSize), files: prepared.length });
+      const encoded = await this.embedGroup(prepared, options);
+      cached += encoded.cached;
+      errors.push(...encoded.errors);
+      options.onProgress?.({ phase: 'commit', group: groupIndex + 1, groups: Math.ceil(paths.length / groupSize), files: prepared.length, cached: encoded.cached });
+      await this.commitGroup(prepared, options);
+    }
+    const discovery = options.discovery ?? { directories: [], skipped: [], truncated: false };
+    return {
+      schema_version: SCHEMA_VERSION, resources: outcomes,
+      diagnostics: { parsed: outcomes.filter(item => item.status !== 'failed' && item.status !== 'skipped').length, indexed: outcomes.filter(item => item.status === 'indexed').length, reused: outcomes.filter(item => item.reused_from).length, failed: outcomes.filter(item => item.status === 'failed').length, skipped: outcomes.filter(item => item.status === 'skipped').length, cached_representations: cached, vectorized_text: outcomes.reduce((n, item) => n + (item.representations?.vectorized_text ?? 0), 0), vectorized_visual: outcomes.reduce((n, item) => n + (item.representations?.vectorized_visual ?? 0), 0), embedding_errors: errors,
+        scanned_directories: discovery.directories.length, discovered_files: discovery.files?.length ?? paths.length, skipped_files: discovery.skipped_total ?? discovery.skipped.length, skipped_reasons: discovery.skipped_counts ?? {}, truncated: discovery.truncated === true },
+    };
+  }
+
+  /**
+   * A committed resource holding the same bytes, or null. Copies adopt its
+   * units instead of re-rendering pages or re-encoding media; vectors are
+   * shared by content hash, so adopting costs one insert.
+   */
+  storedTwin(revision, extension, canonical, visual, parserVersion) {
+    const twin = this.store.twin(revision, parserVersion, canonical);
+    // A twin indexed without visuals must not satisfy a run that asks for them.
+    const needsVisual = visual && RENDERED_EXTENSIONS.has(extension);
+    if (!twin || extname(twin.canonical_path).toLowerCase() !== extension) return null;
+    if (needsVisual && !this.store.hasVisualRepresentations(twin.id)) return null;
+    return {
+      from: twin.canonical_path, kind: twin.kind, mime: twin.mime, title: twin.title,
+      parser_version: twin.parser_version, warnings: JSON.parse(twin.warnings_json ?? '[]'),
+      units: this.store.unitsWithRepresentations(twin.id).map(row => ({
+        kind: row.kind, locator: JSON.parse(row.locator_json), text: row.text, metadata: JSON.parse(row.metadata_json),
+        representations: row.representations.map(rep => ({
+          modality: rep.modality, content_hash: rep.content_hash,
+          ...(rep.text !== null ? { text: rep.text } : { path: rep.path }),
+          ...(rep.vector_id ? { vector_id: rep.vector_id } : {}),
+        })),
+      })),
+    };
+  }
+
+  /** Builder that materialises a copy from an adopted parse, or null. */
+  adoption(source, revision, canonical, resourceId, sharing) {
+    if (!source) return null;
+    const units = adoptUnits(source, resourceId);
+    return after => {
+      const resource = {
+        id: resourceId, source_node: this.sourceNode, source_uri: pathToFileURL(canonical).href, canonical_path: canonical,
+        kind: source.kind, mime: source.mime, title: source.title, revision, size: after.size, mtime_ms: after.mtimeMs, sharing,
+        parser_version: source.parser_version, indexed_at: new Date().toISOString(),
+        warnings: [...source.warnings, `Identical bytes were already parsed at ${source.from}; parsing was skipped`],
+      };
+      const outcome = { path: canonical, resource_id: resourceId, status: 'parsed', units: units.length, reused_from: source.from, warnings: resource.warnings };
+      return { outcome, prepared: { resource, units, outcome } };
+    };
+  }
+
+  /** Parse one group of sources into resources, units and representations. */
+  async parseGroup(paths, options, outcomes, seen, semantic, embeddable, visual, sharing) {
+    const prepared = [];
+    // Copies inside one group race each other, so the first parse publishes its
+    // units and the rest adopt them. The map only spans this group, so memory
+    // stays as small as the group itself.
+    const flights = new Map();
+    // Each source needs its own parser process, so several sources are read
+    // at once; the parser startup dominates a single small file.
+    const concurrency = boundedInt(options.concurrency, 6, 1, 32);
+    const results = await mapConcurrent(paths, concurrency, async suppliedPath => {
+      let sourceId = `resource:${hash(`${this.sourceNode}\0${await potentialRealPath(suppliedPath)}`)}`, observedRevision, publish;
       try {
         const canonical = await realpath(resolve(suppliedPath));
-        if (seen.has(canonical)) { outcomes.push({ path: suppliedPath, status: 'skipped', reason: 'duplicate_path' }); continue; }
+        if (seen.has(canonical)) return { outcome: { path: suppliedPath, status: 'skipped', reason: 'duplicate_path' } };
         seen.add(canonical);
         const before = await stat(canonical);
         if (!before.isFile()) throw new Error('Artifact source must be a regular file');
-        const revision = await fileHash(canonical);
         const resourceId = `resource:${hash(`${this.sourceNode}\0${canonical}`)}`;
         sourceId = resourceId;
+        if (!options.reindex && this.unchanged(resourceId, before, options)) {
+          return { outcome: { path: canonical, resource_id: resourceId, status: 'skipped', reason: 'unchanged' } };
+        }
+        const revision = await fileHash(canonical);
         observedRevision = revision;
+        const extension = extname(canonical).toLowerCase();
+        const flightKey = `${revision}\u0000${extension}`;
+        // Copies of the same bytes share one parse. The first source to hash
+        // registers before any other await, so the copy that arrives second
+        // always sees the registration and never parses in parallel.
+        const flight = flights.get(flightKey);
+        let adoption = null;
+        if (flight) adoption = this.adoption(await flight, revision, canonical, resourceId, sharing);
+        if (!adoption) adoption = this.adoption(this.storedTwin(revision, extension, canonical, visual, options.parserVersion ?? PARSER_VERSION), revision, canonical, resourceId, sharing);
+        if (adoption) {
+          const settled = await stat(canonical);
+          if (settled.size !== before.size || settled.mtimeMs !== before.mtimeMs) throw new Error('Source file changed while being indexed; retry');
+          return adoption(settled);
+        }
+        if (!flights.has(flightKey)) flights.set(flightKey, new Promise(resolve => { publish = resolve; }));
         const extracted = await this.extractor(canonical, { ...options, cacheDir: this.cacheDir, resourceId, visual, sourceNode: this.sourceNode });
         const after = await stat(canonical);
         if (before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs || before.ino !== after.ino || revision !== await fileHash(canonical)) throw new Error('Source file changed while being indexed; retry');
@@ -153,7 +363,9 @@ export class ArtifactIndex {
           if (text.length > 10_000_000) throw new Error('An extracted unit exceeds the 10 MB text limit');
           const representations = [], repIds = new Set();
           let rawReps = [...(sourceUnit.representations ?? [])];
-          if (text.trim() && !rawReps.some(rep => rep.modality === 'text')) rawReps.unshift({ modality: 'text', text });
+          // Chunk the complete unit text so the shared document window is used
+          // as designed; the parser's own chunk boundaries are redundant here.
+          if (text.trim()) rawReps = [{ modality: 'text', text }, ...rawReps.filter(rep => rep.modality !== 'text')];
           rawReps = rawReps.flatMap(rep => rep.modality === 'text' ? textChunks(String(rep.text ?? text), options.textChunkChars).map(chunk => ({ ...rep, text: chunk })) : [rep]);
           for (const raw of rawReps) {
             if (!['text', 'image', 'video', 'audio'].includes(raw.modality)) throw new Error('Unsupported representation modality');
@@ -166,7 +378,7 @@ export class ArtifactIndex {
             if (repIds.has(repId)) continue;
             repIds.add(repId);
             const rep = { id: repId, modality: raw.modality, content_hash: contentHash, ...(repText !== undefined ? { text: repText } : { path: resolve(raw.path) }) };
-            if (!semantic || (raw.modality !== 'text' && !visual)) rep.error = 'embedding_disabled';
+            if (!semantic || !embeddable || (raw.modality !== 'text' && !visual)) rep.error = 'embedding_disabled';
             representations.push(rep);
           }
           const { kind: ignoredKind, locator: ignoredLocator, text: ignoredText, representations: ignoredRepresentations, ...metadata } = sourceUnit;
@@ -181,19 +393,34 @@ export class ArtifactIndex {
           parser_version: String(extracted.parser_version ?? 'unknown'), indexed_at: new Date().toISOString(), warnings: extracted.warnings ?? [],
         };
         const outcome = { path: canonical, resource_id: resourceId, status: 'parsed', units: units.length, warnings: resource.warnings };
-        outcomes.push(outcome);
-        prepared.push({ resource, units, outcome });
+        publish?.({ from: canonical, kind: resource.kind, mime: resource.mime, title: resource.title,
+          parser_version: resource.parser_version, warnings: resource.warnings, units });
+        return { outcome, prepared: { resource, units, outcome } };
       } catch (error) {
+        // Copies waiting on this parse must fall back to parsing themselves.
+        publish?.(null);
         const previous = this.store.resource(sourceId);
         if (previous) this.store.markFailure(sourceId, message(error), !observedRevision || previous.revision !== observedRevision || /changed while/.test(message(error)));
-        outcomes.push({ path: suppliedPath, resource_id: previous?.id, status: 'failed', error: message(error), ...(previous ? { snapshot_status: this.store.resource(sourceId).status } : {}) });
+        return { outcome: { path: suppliedPath, resource_id: previous?.id, status: 'failed', error: message(error), ...(previous ? { snapshot_status: this.store.resource(sourceId).status } : {}) } };
       }
+    });
+    for (const result of results) {
+      if (!result) continue;
+      outcomes.push(result.outcome);
+      if (result.prepared) prepared.push(result.prepared);
     }
+    return prepared;
+  }
 
+  /** Encode the pending representations of one group, reusing cached vectors. */
+  async embedGroup(prepared, options) {
     const allReps = prepared.flatMap(file => file.units.flatMap(unit => unit.representations));
     const groups = new Map();
     for (const rep of allReps) {
-      if (rep.error) continue;
+      // A representation that failed a previous attempt is retried now; only
+      // a deliberate opt-out stays excluded.
+      if (rep.error && rep.error !== 'embedding_disabled') continue;
+      if (rep.error === 'embedding_disabled') continue;
       const key = `${rep.modality}\0${rep.content_hash}`;
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(rep);
@@ -248,6 +475,11 @@ export class ArtifactIndex {
     // Qwen ↔ Gemma once per page on a memory-constrained local machine.
     await encodeGroups(pendingText, false);
     await encodeGroups(pendingMedia, true);
+    return { cached, errors };
+  }
+
+  /** Commit one group; a changed source keeps its previous snapshot. */
+  async commitGroup(prepared, options) {
     for (const file of prepared) {
       try {
         const current = await stat(file.resource.canonical_path);
@@ -268,18 +500,25 @@ export class ArtifactIndex {
         if (previous) this.store.markFailure(previous.id, message(error), error.code === 'ENOENT' || /changed while/.test(message(error)) || previous.revision !== file.resource.revision);
       }
     }
-    return {
-      schema_version: SCHEMA_VERSION, resources: outcomes,
-      diagnostics: { parsed: prepared.length, indexed: outcomes.filter(item => item.status === 'indexed').length, failed: outcomes.filter(item => item.status === 'failed').length, skipped: outcomes.filter(item => item.status === 'skipped').length, cached_representations: cached, vectorized_text: outcomes.reduce((n, item) => n + (item.representations?.vectorized_text ?? 0), 0), vectorized_visual: outcomes.reduce((n, item) => n + (item.representations?.vectorized_visual ?? 0), 0), embedding_errors: errors },
-    };
   }
 
   async search(query, options = {}) {
     this.ensureOpen();
-    if (typeof query !== 'string' || !query.trim() || query.length > 8192) throw new Error('Query must contain 1 to 8192 characters');
+    // An image query enters the same multimodal space as page renders, slide
+    // images and video clips, so no transcription step is needed.
+    const queryImage = options.queryImage;
+    if (queryImage !== undefined) {
+      if (typeof queryImage !== 'string' || !isAbsolute(queryImage)) throw new Error('queryImage must be an absolute local path');
+      const info = await stat(queryImage).catch(() => null);
+      if (!info?.isFile()) throw new Error('queryImage must point to an existing local file');
+    }
+    if (typeof query !== 'string') query = '';
+    if ((!queryImage && !query.trim()) || query.length > 8192) throw new Error('Query must contain 1 to 8192 characters');
     const started = performance.now();
     const mode = options.mode ?? 'hybrid';
     if (!['hybrid', 'lexical', 'semantic'].includes(mode)) throw new Error('Invalid search mode');
+    // An image carries no words, so it cannot rank the lexical channel.
+    if (queryImage && mode === 'lexical') throw new Error('Image queries require hybrid or semantic mode');
     const limit = boundedInt(options.limit, 15, 1, 200), offset = boundedInt(options.offset, 0, 0, 10000);
     const maxChars = boundedInt(options.maxChars, 12000, 256, 200000);
     const perResourceLimit = boundedInt(options.perResourceLimit, 3, 1, 200);
@@ -292,32 +531,51 @@ export class ArtifactIndex {
     if (!Array.isArray(modalities) || !modalities.length || modalities.some(value => !['text', 'image', 'video', 'audio'].includes(value))) throw new Error('Invalid modality filter');
     const statusFilter = options.includeStale ? '' : " AND r.status = 'ready'";
     const candidateLimit = boundedInt(options.candidateLimit, 20000, 1, 100000);
-    const rows = this.store.db.prepare(`SELECT u.*, r.title, r.source_node, r.source_uri, r.kind AS resource_kind, r.sharing, r.status, r.last_error FROM units u JOIN resources r ON r.id = u.resource_id WHERE r.sharing IN (${sharingValues.map(() => '?').join(',')}) AND r.kind IN (${types.map(() => '?').join(',')})${statusFilter} ORDER BY r.indexed_at DESC, u.ordinal LIMIT ?`).all(...sharingValues, ...types, candidateLimit + 1);
+    // Path filters keep bulk generated corpora out of a personal search. The
+    // pattern matches the canonical source path.
+    const pathFilters = (options.excludePaths ?? []).filter(value => typeof value === 'string' && value.trim());
+    const pathFilterClause = pathFilters.length ? ` AND ${pathFilters.map(() => "r.canonical_path NOT LIKE ?").join(' AND ')}` : '';
+    const pathFilterArgs = pathFilters.map(pattern => `%${pattern}%`);
+    const rows = this.store.db.prepare(`SELECT u.*, r.title, r.source_node, r.source_uri, r.canonical_path, r.kind AS resource_kind, r.sharing, r.status, r.last_error, r.revision FROM units u JOIN resources r ON r.id = u.resource_id WHERE r.sharing IN (${sharingValues.map(() => '?').join(',')}) AND r.kind IN (${types.map(() => '?').join(',')})${statusFilter}${pathFilterClause} ORDER BY r.indexed_at DESC, u.ordinal LIMIT ?`).all(...sharingValues, ...types, ...pathFilterArgs, candidateLimit + 1);
     const truncated = rows.length > candidateLimit;
     if (truncated) rows.pop();
     const candidates = new Map(rows.map(row => [row.id, row]));
+    // Rank ties fall back to the source path, not a hash-derived unit id, so
+    // identical copies always resolve to the same keeper across runs.
+    const pathOf = id => candidates.get(id)?.canonical_path ?? '';
     const rankedLists = [], semanticErrors = [];
     const terms = queryTerms(query);
-    const lexical = modalities.includes('text') ? rows.map(row => ({ id: row.id, score: lexicalScore(row.text, row.title, query, terms), modality: 'text' })).filter(row => row.score > 0).sort((a, b) => b.score - a.score || a.id.localeCompare(b.id)) : [];
-    if (mode !== 'semantic') rankedLists.push({ profile: null, rows: lexical });
+    const lexical = !queryImage && modalities.includes('text') ? rows.map(row => {
+      const base = lexicalScore(row.text, row.title, query, terms);
+      if (!base) return { id: row.id, score: 0, modality: 'text' };
+      // A personal-material path is a deliberate signal and outranks a bulk
+      // generated corpus that merely repeats the query word.
+      return { id: row.id, score: base * (1 + pathWeight(row.canonical_path, query)), modality: 'text' };
+    }).filter(row => row.score > 0).sort((a, b) => b.score - a.score || pathOf(a.id).localeCompare(pathOf(b.id)) || a.id.localeCompare(b.id)) : [];
+    if (mode !== 'semantic' && !queryImage) rankedLists.push({ profile: null, rows: lexical });
     let spaces = 0, spacesSucceeded = 0, visualCandidates = 0;
     if (mode !== 'lexical' && candidates.size) {
       const spacesMap = new Map();
       // Apply source/type/sharing filters in SQL before loading any vectors.
-      const vectorRows = this.store.db.prepare(`WITH filtered_units AS (SELECT u.id FROM units u JOIN resources r ON r.id = u.resource_id WHERE r.sharing IN (${sharingValues.map(() => '?').join(',')}) AND r.kind IN (${types.map(() => '?').join(',')})${statusFilter} ORDER BY r.indexed_at DESC, u.ordinal LIMIT ?) SELECT rp.unit_id, rp.modality, v.data, v.profile_id, p.metadata_json FROM representations rp JOIN vectors v ON v.id = rp.vector_id JOIN profiles p ON p.id = v.profile_id JOIN filtered_units u ON u.id = rp.unit_id WHERE rp.modality IN (${modalities.map(() => '?').join(',')})`).all(...sharingValues, ...types, candidateLimit, ...modalities);
+      const vectorRows = this.store.db.prepare(`WITH filtered_units AS (SELECT u.id FROM units u JOIN resources r ON r.id = u.resource_id WHERE r.sharing IN (${sharingValues.map(() => '?').join(',')}) AND r.kind IN (${types.map(() => '?').join(',')})${statusFilter}${pathFilterClause} ORDER BY r.indexed_at DESC, u.ordinal LIMIT ?) SELECT rp.unit_id, rp.modality, v.data, v.profile_id, p.metadata_json FROM representations rp JOIN vectors v ON v.id = rp.vector_id JOIN profiles p ON p.id = v.profile_id JOIN filtered_units u ON u.id = rp.unit_id WHERE rp.modality IN (${modalities.map(() => '?').join(',')})`).all(...sharingValues, ...types, ...pathFilterArgs, candidateLimit, ...modalities);
       for (const row of vectorRows) {
         if (!candidates.has(row.unit_id)) continue;
         if (row.modality !== 'text') visualCandidates++;
         if (!spacesMap.has(row.profile_id)) spacesMap.set(row.profile_id, { profile: JSON.parse(row.metadata_json), vectors: [] });
         spacesMap.get(row.profile_id).vectors.push(row);
       }
-      const selectedSpaces = [...spacesMap.values()].sort((a, b) => a.profile.alias.localeCompare(b.profile.alias)).slice(0, boundedInt(options.maxProfiles, 8, 1, 32));
-      spaces = spacesMap.size;
-      if (spacesMap.size > selectedSpaces.length) semanticErrors.push({ error: 'Embedding profile search budget exceeded' });
+      // A text index lives in the Qwen space and cannot hold an image query;
+      // only the multimodal (Gemma) space accepts page renders and clips.
+      const queryableSpaces = [...spacesMap.values()].filter(space => !queryImage || supportsMediaQuery(space.profile));
+      const selectedSpaces = queryableSpaces.sort((a, b) => a.profile.alias.localeCompare(b.profile.alias)).slice(0, boundedInt(options.maxProfiles, 8, 1, 32));
+      spaces = queryableSpaces.length;
+      if (queryableSpaces.length > selectedSpaces.length) semanticErrors.push({ error: 'Embedding profile search budget exceeded' });
       for (const space of selectedSpaces) {
         try {
-          if (typeof this.embeddings?.embedQuery !== 'function') throw new Error('No local embedding provider configured');
-          const result = await timed(signal => this.embeddings.embedQuery(query, space.profile, { signal }), boundedInt(options.embeddingTimeoutMs, 60000, 1, 600000), options.signal);
+          if (queryImage ? typeof this.embeddings?.embedMedia !== 'function' : typeof this.embeddings?.embedQuery !== 'function') throw new Error('No local embedding provider configured');
+          const result = await timed(signal => queryImage
+            ? this.embeddings.embedMedia([{ modality: 'image', path: queryImage }], { signal })
+            : this.embeddings.embedQuery(query, space.profile, { signal }), boundedInt(options.embeddingTimeoutMs, 60000, 1, 600000), options.signal);
           const actual = normalizeProfile(result.profile);
           if (actual.id !== space.profile.id || profileFingerprint(actual) !== profileFingerprint(space.profile)) throw new Error('Query embedding profile does not match the indexed vector space');
           if (!Array.isArray(result.vectors) || result.vectors.length !== 1) throw new Error('Query provider returned an invalid vector count');
@@ -330,7 +588,15 @@ export class ArtifactIndex {
             const prior = byUnit.get(vector.unit_id);
             if (!prior || cosine > prior.score) byUnit.set(vector.unit_id, { id: vector.unit_id, score: cosine, modality: vector.modality });
           }
-          rankedLists.push({ profile: actual.id, rows: [...byUnit.values()].sort((a, b) => b.score - a.score || a.id.localeCompare(b.id)) });
+          // A personal-material path breaks ties inside the vector space, so a
+          // generated fixture corpus cannot outrank the actual documents.
+          const semanticRows = [...byUnit.values()].map(row => {
+            const resource = candidates.get(row.id);
+            const weight = resource ? 1 + pathWeight(resource.canonical_path, query) : 1;
+            // Keep the raw cosine for reporting; only ordering uses the weight.
+            return { ...row, similarity: row.score, score: row.score * weight };
+          }).sort((a, b) => b.score - a.score || pathOf(a.id).localeCompare(pathOf(b.id)) || a.id.localeCompare(b.id));
+          rankedLists.push({ profile: actual.id, rows: semanticRows });
           spacesSucceeded++;
         } catch (error) { semanticErrors.push({ profile_id: space.profile.id, error: message(error) }); }
       }
@@ -352,15 +618,47 @@ export class ArtifactIndex {
           value.score = rankScore;
           value.best_list_order = listOrder;
         }
-        value.matches.push({ modality: item.modality, profile_id: list.profile, rank: index + 1, similarity: list.profile ? item.score : undefined });
+        value.matches.push({ modality: item.modality, profile_id: list.profile, rank: index + 1, similarity: list.profile ? (item.similarity ?? item.score) : undefined });
       }
+    }
+    // Rank fusion compares positions inside a channel, so a raw score cannot
+    // separate channels. A file that the searcher deliberately named — a
+    // resume, a registration form — is a stronger answer than a bulk corpus
+    // that merely occupies a better rank in one channel.
+    for (const value of fused.values()) {
+      const row = candidates.get(value.id);
+      if (!row) continue;
+      const weight = pathWeight(row.canonical_path, query);
+      if (weight) { value.score *= 1 + weight; value.personal = true; }
     }
     // Different channels' rank-one hits stay together, in stable channel/list
     // order, ahead of every rank-two hit. Hash-derived unit IDs do not decide
     // which modality wins an otherwise equal ranking.
-    const sorted = [...fused.values()].sort((a, b) => b.score - a.score || a.best_list_order - b.best_list_order || a.id.localeCompare(b.id));
-    const counts = new Map(), balanced = [];
+    const sorted = [...fused.values()].sort((a, b) => b.score - a.score || a.best_list_order - b.best_list_order
+      || pathOf(a.id).localeCompare(pathOf(b.id)) || a.id.localeCompare(b.id));
+    // The same bytes copied to another path are one answer, not two. Units are
+    // keyed by file revision plus locator, so page 65 of a copied PDF merges
+    // while page 66 stays its own hit. The winning rank keeps its locator and
+    // carries the other copies as `duplicates` instead of repeating itself.
+    const collapse = options.collapseDuplicates !== false;
+    const seenUnits = new Map(), collapsed = [];
+    let duplicatesCollapsed = 0;
     for (const item of sorted) {
+      const row = candidates.get(item.id);
+      if (!row) continue;
+      const key = `${row.revision}\u0000${row.locator_json}`;
+      const keeper = collapse ? seenUnits.get(key) : undefined;
+      if (keeper) {
+        keeper.duplicates.push({ resource_id: row.resource_id, title: row.title, source_uri: row.source_uri, source_node: row.source_node, sharing: row.sharing });
+        duplicatesCollapsed++;
+        continue;
+      }
+      const entry = { ...item, duplicates: [] };
+      if (collapse) seenUnits.set(key, entry);
+      collapsed.push(entry);
+    }
+    const counts = new Map(), balanced = [];
+    for (const item of collapsed) {
       const row = candidates.get(item.id), count = counts.get(row.resource_id) ?? 0;
       if (count >= perResourceLimit) continue;
       counts.set(row.resource_id, count + 1);
@@ -370,12 +668,15 @@ export class ArtifactIndex {
     for (const item of balanced.slice(offset, offset + limit)) {
       const row = candidates.get(item.id);
       const excerpt = snippet(row.text, query, Math.min(600, Math.max(0, maxChars - characters)));
-      const result = { unit_id: row.id, resource_id: row.resource_id, title: row.title, kind: row.resource_kind, unit_kind: row.kind, locator: JSON.parse(row.locator_json), snippet: excerpt, source_node: row.source_node, source_uri: row.source_uri, sharing: row.sharing, status: row.status, ...(row.last_error ? { last_error: row.last_error } : {}), score: item.score, matched_modality: [...new Set(item.matches.map(match => match.modality))], matches: item.matches };
+      // `score` is the fused rank score; `similarity` is the raw cosine of the
+      // best vector hit so callers can see how close the match really was.
+      const similarities = item.matches.map(match => match.similarity).filter(value => typeof value === 'number');
+      const result = { unit_id: row.id, resource_id: row.resource_id, title: row.title, kind: row.resource_kind, unit_kind: row.kind, locator: JSON.parse(row.locator_json), snippet: excerpt, source_node: row.source_node, source_uri: row.source_uri, sharing: row.sharing, status: row.status, ...(row.last_error ? { last_error: row.last_error } : {}), score: item.score, ...(similarities.length ? { similarity: Math.max(...similarities) } : {}), ...(item.duplicates?.length ? { duplicates: item.duplicates } : {}), matched_modality: [...new Set(item.matches.map(match => match.modality))], matches: item.matches };
       const length = JSON.stringify(result).length;
       if (characters + length > maxChars) break;
       results.push(result); characters += length;
     }
-    return { schema_version: SCHEMA_VERSION, query, mode, results, total: balanced.length, semantic_status: semanticStatus, fallback: fallback || (mode === 'hybrid' && semanticStatus === 'unavailable'), diagnostics: { elapsed_ms: Math.round((performance.now() - started) * 100) / 100, candidates: rows.length, candidate_limit: candidateLimit, candidates_truncated: truncated, vector_spaces: spaces, successful_vector_spaces: spacesSucceeded, visual_vectors: visualCandidates, errors: semanticErrors, visual_search_unavailable: mode !== 'lexical' && semanticStatus === 'unavailable' && (!modalities.includes('text') || rows.some(row => !row.text.trim())), chars: characters, per_resource_limit: perResourceLimit } };
+    return { schema_version: SCHEMA_VERSION, query, ...(queryImage ? { query_image: queryImage } : {}), mode, results, total: balanced.length, semantic_status: semanticStatus, fallback: fallback || (mode === 'hybrid' && semanticStatus === 'unavailable'), diagnostics: { elapsed_ms: Math.round((performance.now() - started) * 100) / 100, candidates: rows.length, candidate_limit: candidateLimit, candidates_truncated: truncated, vector_spaces: spaces, successful_vector_spaces: spacesSucceeded, visual_vectors: visualCandidates, errors: semanticErrors, visual_search_unavailable: mode !== 'lexical' && semanticStatus === 'unavailable' && (!modalities.includes('text') || rows.some(row => !row.text.trim())), chars: characters, per_resource_limit: perResourceLimit, duplicates_collapsed: duplicatesCollapsed } };
   }
 
   read(unitId) {

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline artifact extraction. All stdout is one JSON result; no model imports."""
 import base64
+import codecs
 import contextlib
 import datetime
 import hashlib
@@ -11,6 +12,7 @@ import mimetypes
 import os
 import posixpath
 from pathlib import Path
+import re
 import shutil
 import socket
 import struct
@@ -21,29 +23,50 @@ from urllib.parse import urlsplit
 import xml.etree.ElementTree as ET
 import zipfile
 
-PARSER_VERSION = "artifact-local-v1"
+PARSER_VERSION = "artifact-local-v2"
 MIMES = {"pdf": "application/pdf", "presentation": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-         "spreadsheet": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "video": "video/mp4"}
+         "spreadsheet": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "video": "video/mp4",
+         "document": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "text": "text/plain"}
+# The dispatch table is mirrored by the JavaScript scanner; doctor publishes it
+# so a drifting list is caught by a test instead of a silent indexing gap.
+EXTENSIONS = {"pdf": [".pdf"], "presentation": [".pptx", ".pptm", ".ppt"], "spreadsheet": [".xlsx", ".xlsm", ".xls"],
+              "video": [".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v", ".mpeg", ".mpg"],
+              "document": [".docx", ".docm", ".doc"], "text": [".txt", ".md", ".markdown"]}
+W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+MACRO_DISABLED_PROFILE = ('<?xml version="1.0" encoding="UTF-8"?><oor:items xmlns:oor="http://openoffice.org/2001/registry">'
+                           '<item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="MacroSecurityLevel" oor:op="fuse"><value>3</value></prop></item>'
+                           '<item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="DisableMacrosExecution" oor:op="fuse"><value>true</value></prop></item>'
+                           '</oor:items>')
 
 
 def deny_python_network(*args, **kwargs):
     raise RuntimeError("Network access is disabled in the local artifact extractor")
 
 
+# macOS sandbox profiles. The strict profile denies every socket operation.
+# LibreOffice binds a local socket while converting headlessly and exits
+# silently when bind/inbound are denied, so office conversions run under a
+# profile that still blocks every outbound connection.
+SANDBOX_STRICT = "(version 1)(allow default)(deny network*)"
+SANDBOX_OFFICE = "(version 1)(allow default)(deny network-outbound)"
+
+
 def network_isolation():
     sandbox = shutil.which("sandbox-exec") if sys.platform == "darwin" else None
     if sandbox:
-        return {"level": "os-sandbox", "command": [sandbox, "-p", "(version 1)(allow default)(deny network*)"]}
+        return {"level": "os-sandbox", "command": [sandbox, "-p", SANDBOX_STRICT],
+                "office_command": [sandbox, "-p", SANDBOX_OFFICE]}
     if sys.platform.startswith("linux"):
         unshare = shutil.which("unshare")
         if unshare:
             try:
                 checked = subprocess.run([unshare, "--user", "--map-root-user", "--net", "true"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
                 if checked.returncode == 0:
-                    return {"level": "os-network-namespace", "command": [unshare, "--user", "--map-root-user", "--net"]}
+                    return {"level": "os-network-namespace", "command": [unshare, "--user", "--map-root-user", "--net"],
+                            "office_command": [unshare, "--user", "--map-root-user", "--net"]}
             except (OSError, subprocess.TimeoutExpired):
                 pass
-    return {"level": "application-only", "command": []}
+    return {"level": "application-only", "command": [], "office_command": []}
 
 
 def sha(data):
@@ -96,6 +119,10 @@ def video_segments(duration_ms, segment_ms=6000, overlap_ms=1000):
 
 
 class Extractor:
+    MARKDOWN_HEADING = re.compile(r"^\s{0,3}#{1,6}\s+(.*\S)\s*$")
+    LIST_ITEM = re.compile(r"^\s*([-*+•]|\d{1,9}[.)])\s+")
+    HEADING_NAME = re.compile(r"^(heading|标题|題目|title|subtitle|副标题)\s*\d*$", re.IGNORECASE)
+
     def __init__(self, source, cache, options):
         self.source = Path(source).resolve(strict=True)
         self.cache = Path(cache).resolve()
@@ -128,8 +155,9 @@ class Extractor:
             raise ValueError("Refusing to overwrite the original artifact")
         return path
 
-    def command(self, args, timeout=120):
-        result = subprocess.run(self.isolation["command"] + [str(arg) for arg in args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    def command(self, args, timeout=120, office=False):
+        prefix = self.isolation["office_command"] if office else self.isolation["command"]
+        result = subprocess.run(prefix + [str(arg) for arg in args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 timeout=min(timeout, self.limit("commandTimeoutSeconds", 180)), check=False)
         if result.returncode:
             raise RuntimeError(f"{Path(args[0]).name} failed: {result.stderr.decode('utf-8', errors='replace')[-4000:]}")
@@ -236,6 +264,13 @@ class Extractor:
             self.warnings.append(f"Removed {removed} external Office relationships from a cached rendering copy; original file was preserved and external resources were not fetched")
         return cleaned
 
+    def office_profile(self, directory):
+        """Disposable profile: no user settings, no macro execution."""
+        profile = Path(directory)
+        (profile / "user").mkdir()
+        (profile / "user" / "registrymodifications.xcu").write_text(MACRO_DISABLED_PROFILE, encoding="utf-8")
+        return profile
+
     def convert_presentation(self):
         command = shutil.which("soffice") or shutil.which("libreoffice")
         if not command:
@@ -246,19 +281,31 @@ class Extractor:
         target = self.output_path(Path("office") / (local_source.stem + ".pdf"))
         # A failed/no-output conversion must never reuse an older cached PDF.
         target.unlink(missing_ok=True)
-        # Disposable profile prevents touching user settings and disables macros.
         with tempfile.TemporaryDirectory(prefix="artifact-office-") as directory:
-            profile = Path(directory)
-            (profile / "user").mkdir()
-            (profile / "user" / "registrymodifications.xcu").write_text(
-                '<?xml version="1.0" encoding="UTF-8"?><oor:items xmlns:oor="http://openoffice.org/2001/registry">'
-                '<item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="MacroSecurityLevel" oor:op="fuse"><value>3</value></prop></item>'
-                '<item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="DisableMacrosExecution" oor:op="fuse"><value>true</value></prop></item>'
-                '</oor:items>', encoding="utf-8")
+            profile = self.office_profile(directory)
             self.command([command, "-env:UserInstallation=" + profile.as_uri(), "--headless", "--nologo", "--nodefault",
-                          "--norestore", "--convert-to", "pdf:impress_pdf_Export", "--outdir", str(out), str(local_source)], timeout=180)
+                          "--norestore", "--convert-to", "pdf:impress_pdf_Export", "--outdir", str(out), str(local_source)],
+                         timeout=180, office=True)
         if not target.is_file():
             raise RuntimeError("LibreOffice did not produce a PDF")
+        return target
+
+    def convert_word(self):
+        """Legacy binary DOC has no local parser; convert a disposable copy."""
+        command = shutil.which("soffice") or shutil.which("libreoffice")
+        if not command:
+            raise RuntimeError("Legacy DOC requires local LibreOffice (soffice); no file content was indexed")
+        out = self.output_path("office")
+        out.mkdir(exist_ok=True)
+        target = self.output_path(Path("office") / (self.source.stem + ".docx"))
+        target.unlink(missing_ok=True)
+        with tempfile.TemporaryDirectory(prefix="artifact-office-") as directory:
+            profile = self.office_profile(directory)
+            self.command([command, "-env:UserInstallation=" + profile.as_uri(), "--headless", "--nologo", "--nodefault",
+                          "--norestore", "--convert-to", "docx:MS Word 2007 XML", "--outdir", str(out), str(self.source)],
+                         timeout=180, office=True)
+        if not target.is_file():
+            raise RuntimeError("LibreOffice did not produce a DOCX copy")
         return target
 
     def presentation(self):
@@ -486,6 +533,258 @@ class Extractor:
         result["sampling"] = {"segment_ms": self.options.get("segmentMs", 6000), "overlap_ms": self.options.get("overlapMs", 1000), "fps": fps, "max_dimension": dimension}
         return result
 
+    # --- plain text, markdown and Word documents -------------------------------
+
+    def decode_bytes(self, data):
+        """Decode a local text file without silently mangling Chinese content."""
+        if data.startswith(codecs.BOM_UTF8):
+            return data.decode("utf-8-sig"), "utf-8-sig"
+        if data.startswith(codecs.BOM_UTF32_LE) or data.startswith(codecs.BOM_UTF32_BE):
+            return data.decode("utf-32"), "utf-32"
+        if data.startswith(codecs.BOM_UTF16_LE) or data.startswith(codecs.BOM_UTF16_BE):
+            return data.decode("utf-16"), "utf-16"
+        try:
+            return data.decode("utf-8"), "utf-8"
+        except UnicodeDecodeError:
+            pass
+        sample = data[:4096]
+        if sample.count(b"\x00") > len(sample) // 4:
+            for codec in ("utf-16-le", "utf-16-be"):
+                try:
+                    return data.decode(codec), codec
+                except UnicodeDecodeError:
+                    continue
+        # gb18030 covers GBK/GB2312, the usual legacy Chinese encoding.
+        for codec in ("gb18030", "big5"):
+            try:
+                return data.decode(codec), codec
+            except UnicodeDecodeError:
+                continue
+        return data.decode("utf-8", errors="replace"), "utf-8-replace"
+
+    def text_blocks(self, text):
+        """Split plain text or markdown into ordered content blocks."""
+        blocks = []
+        buffer = []
+        buffer_code = False
+        code = False
+        counter = 0
+
+        def flush():
+            nonlocal buffer
+            if not buffer:
+                return
+            body = "\n".join(buffer).strip()
+            buffer = []
+            if not body:
+                return
+            lines = [line for line in body.splitlines() if line.strip()]
+            kind = "code" if buffer_code else ("list" if lines and all(self.LIST_ITEM.match(line) for line in lines) else "paragraph")
+            blocks.append({"index": len(blocks) + 1, "text": body, "kind": kind})
+
+        for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            stripped = line.strip()
+            if stripped.startswith("```") or stripped.startswith("~~~"):
+                # A fence opens its own block and never merges with prose.
+                if buffer and not code:
+                    flush()
+                if not buffer:
+                    buffer_code = True
+                code = not code
+                buffer.append(line)
+                continue
+            if not stripped:
+                flush()
+                continue
+            heading = None if code else self.MARKDOWN_HEADING.match(line)
+            if heading:
+                flush()
+                blocks.append({"index": len(blocks) + 1, "text": heading.group(1).strip(), "kind": "heading"})
+                continue
+            if not buffer:
+                buffer_code = code
+            buffer.append(line)
+        flush()
+        return blocks
+
+    def block_units(self, blocks):
+        """Group blocks into addressable units.
+
+        A heading becomes its own unit so an exact heading query hits it, and
+        the body unit that follows repeats the heading as retrieval context.
+        """
+        limit = int(self.limit("unitChars", 1000, 64))
+        if limit > 20000:
+            raise ValueError("unitChars must be <=20000")
+        groups = []
+        pending = []
+        pending_length = 0
+        section = ""
+
+        def flush():
+            nonlocal pending, pending_length
+            if pending:
+                groups.append({"kind": "block", "blocks": pending, "section": section})
+                pending = []
+                pending_length = 0
+
+        for block in blocks:
+            text = block["text"].strip()
+            if not text:
+                continue
+            if block["kind"] == "heading":
+                flush()
+                groups.append({"kind": "heading", "blocks": [block], "section": text})
+                section = text
+                continue
+            if block["kind"] == "table":
+                flush()
+                groups.append({"kind": "table", "blocks": [block], "section": section})
+                continue
+            if pending_length and pending_length + len(text) > limit:
+                flush()
+            pending.append(block)
+            pending_length += len(text) + 1
+        flush()
+
+        units = []
+        for group in groups:
+            body = "\n".join(block["text"] for block in group["blocks"])
+            if group["kind"] == "heading":
+                text = body
+            elif group["section"] and not body.startswith(group["section"]):
+                text = group["section"] + "\n" + body
+            else:
+                text = body
+            locator = {"block": group["blocks"][0]["index"]}
+            units.append({"kind": group["kind"], "locator": locator, "text": text,
+                          "section": group["section"],
+                          "block_start": group["blocks"][0]["index"],
+                          "block_end": group["blocks"][-1]["index"],
+                          "block_kinds": [block["kind"] for block in group["blocks"]],
+                          "representations": self.text_representations(text, locator)})
+        return units
+
+    def plain_text(self):
+        data = self.source.read_bytes()
+        self.budget(len(data), "maxFileBytes", 512 * 1024 * 1024)
+        text, encoding = self.decode_bytes(data)
+        units = self.block_units(self.text_blocks(text))
+        if not units:
+            self.warnings.append("Text file has no readable content")
+        result = self.finish("text", units)
+        result["encoding"] = encoding
+        return result
+
+    def docx_text(self, node):
+        """Read visible runs of a paragraph, skipping field codes and deletions."""
+        parts = []
+
+        def walk(element):
+            for child in element:
+                tag = child.tag
+                if tag == f"{W_NS}del":
+                    continue
+                if tag == f"{W_NS}t":
+                    parts.append(child.text or "")
+                elif tag == f"{W_NS}tab":
+                    parts.append("\t")
+                elif tag in (f"{W_NS}br", f"{W_NS}cr"):
+                    parts.append("\n")
+                elif tag == f"{W_NS}noBreakHyphen":
+                    parts.append("-")
+                else:
+                    walk(child)
+
+        walk(node)
+        return "".join(parts)
+
+    def docx_style_names(self, archive):
+        names = {}
+        try:
+            root = ET.fromstring(archive.read("word/styles.xml"))
+        except KeyError:
+            return names
+        for style in root.iter(f"{W_NS}style"):
+            identifier = style.get(f"{W_NS}styleId")
+            name = style.find(f"{W_NS}name")
+            if identifier and name is not None and name.get(f"{W_NS}val"):
+                names[identifier.lower()] = name.get(f"{W_NS}val")
+        return names
+
+    def docx_paragraph_kind(self, paragraph, styles):
+        properties = paragraph.find(f"{W_NS}pPr")
+        style_id = ""
+        outline = None
+        if properties is not None:
+            style = properties.find(f"{W_NS}pStyle")
+            if style is not None:
+                style_id = style.get(f"{W_NS}val") or ""
+            level = properties.find(f"{W_NS}outlineLvl")
+            if level is not None:
+                outline = level.get(f"{W_NS}val")
+        name = styles.get(style_id.lower(), "").strip()
+        if self.HEADING_NAME.match(name) or (outline is not None and outline.isdigit() and int(outline) <= 8):
+            return "heading"
+        if properties is not None and properties.find(f"{W_NS}numPr") is not None:
+            return "list"
+        return "paragraph"
+
+    def docx_table_text(self, table):
+        rows = []
+        for row in table.findall(f"{W_NS}tr"):
+            cells = []
+            for cell in row.findall(f"{W_NS}tc"):
+                paragraphs = [self.docx_text(item) for item in cell.findall(f"{W_NS}p")]
+                cells.append(" ".join(text.strip() for text in paragraphs if text.strip()))
+            rows.append(" | ".join(cells))
+        return "\n".join(rows)
+
+    def docx_blocks(self, path):
+        with zipfile.ZipFile(path) as archive:
+            self.budget(sum(info.file_size for info in archive.infolist()), "maxArchiveBytes", 512 * 1024 * 1024)
+            try:
+                document = archive.read("word/document.xml")
+            except KeyError:
+                raise ValueError("Word document has no word/document.xml part")
+            styles = self.docx_style_names(archive)
+        try:
+            root = ET.fromstring(document)
+        except ET.ParseError as error:
+            raise ValueError(f"Word document is not valid XML: {error}")
+        body = root.find(f"{W_NS}body")
+        if body is None:
+            raise ValueError("Word document has no body part")
+        blocks = []
+
+        def walk(node):
+            for child in node:
+                if child.tag == f"{W_NS}p":
+                    text = self.docx_text(child)
+                    if text.strip():
+                        blocks.append({"index": len(blocks) + 1, "text": text, "kind": self.docx_paragraph_kind(child, styles)})
+                elif child.tag == f"{W_NS}tbl":
+                    text = self.docx_table_text(child)
+                    if text.strip():
+                        blocks.append({"index": len(blocks) + 1, "text": text, "kind": "table"})
+                elif child.tag == f"{W_NS}sdt":
+                    content = child.find(f"{W_NS}sdtContent")
+                    if content is not None:
+                        walk(content)
+
+        walk(body)
+        return blocks
+
+    def document(self):
+        source = self.convert_word() if self.source.suffix.lower() == ".doc" else self.source
+        units = self.block_units(self.docx_blocks(source))
+        if not units:
+            self.warnings.append("Word document has no extractable text; text boxes and images are not read")
+        result = self.finish("document", units)
+        if source != self.source:
+            result["converted_from"] = self.source.suffix.lower().lstrip(".")
+        return result
+
     def finish(self, kind, units):
         self.budget(len(units), "maxUnits", 20_000)
         self.budget(sum(len(unit.get("text", "")) for unit in units), "maxTextChars", 32_000_000)
@@ -494,7 +793,7 @@ class Extractor:
 
     def extract(self):
         extension = self.source.suffix.lower()
-        if extension in (".pptx", ".pptm", ".xlsx", ".xlsm"):
+        if extension in (".pptx", ".pptm", ".xlsx", ".xlsm", ".docx", ".docm"):
             with zipfile.ZipFile(self.source) as archive:
                 self.budget(sum(info.file_size for info in archive.infolist()), "maxArchiveBytes", 512 * 1024 * 1024)
         if extension == ".pdf":
@@ -505,6 +804,10 @@ class Extractor:
             return self.spreadsheet()
         if extension in (".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v", ".mpeg", ".mpg"):
             return self.video()
+        if extension in (".docx", ".docm", ".doc"):
+            return self.document()
+        if extension in (".txt", ".md", ".markdown"):
+            return self.plain_text()
         raise ValueError(f"Unsupported artifact extension: {extension or '(none)'}")
 
 
@@ -512,10 +815,11 @@ def doctor():
     modules = {name: importlib.util.find_spec(name) is not None for name in ("pypdf", "pptx", "openpyxl", "xlrd", "PIL")}
     commands = {name: shutil.which(name) for name in ("pdftoppm", "pdftotext", "soffice", "libreoffice", "ffmpeg", "ffprobe")}
     return {"python": sys.executable, "parser_version": PARSER_VERSION, "modules": modules, "commands": commands,
-            "offline_isolation": network_isolation()["level"],
+            "offline_isolation": network_isolation()["level"], "extensions": EXTENSIONS,
             "capabilities": {"pdf_text": modules["pypdf"], "pdf_visual": modules["pypdf"] and bool(commands["pdftoppm"]),
                              "pptx_text": modules["pptx"], "presentation_visual": bool(commands["soffice"] or commands["libreoffice"]) and bool(commands["pdftoppm"]),
-                             "xlsx": modules["openpyxl"], "xls": modules["xlrd"] and modules["openpyxl"], "video": bool(commands["ffmpeg"] and commands["ffprobe"])}}
+                             "xlsx": modules["openpyxl"], "xls": modules["xlrd"] and modules["openpyxl"], "video": bool(commands["ffmpeg"] and commands["ffprobe"]),
+                             "docx": True, "doc_legacy": bool(commands["soffice"] or commands["libreoffice"]), "text": True}}
 
 
 def main():

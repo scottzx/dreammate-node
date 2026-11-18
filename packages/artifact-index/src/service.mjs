@@ -1,11 +1,13 @@
 import {createServer} from 'node:http';
 import {randomUUID} from 'node:crypto';
+import {readFileSync} from 'node:fs';
 import {readPage} from './read.mjs';
 
 const protocol='dreammate.artifacts.v1';
+const version=JSON.parse(readFileSync(new URL('../package.json',import.meta.url),'utf8')).version;
 const object=(properties,required=[])=>({type:'object',properties,required,additionalProperties:false});
 export const ARTIFACT_METHODS={
-  'artifacts.search':{description:'Search indexed local PDF pages, presentation slides, spreadsheet cell ranges and video time segments; return summaries and original locations.',parameters:object({query:{type:'string',minLength:1,maxLength:2000},types:{type:'array',minItems:1,items:{type:'string',enum:['pdf','presentation','spreadsheet','video']}},modalities:{type:'array',minItems:1,items:{type:'string',enum:['text','image','video']}},mode:{type:'string',enum:['hybrid','lexical','semantic']},limit:{type:'integer',minimum:1,maximum:20},offset:{type:'integer',minimum:0,maximum:10000},max_chars:{type:'integer',minimum:1000,maximum:12000}},['query'])},
+  'artifacts.search':{description:'Search indexed local PDF pages, presentation slides, spreadsheet cell ranges, Word paragraphs, plain text and markdown blocks and video time segments; return summaries and original locations.',parameters:object({query:{type:'string',minLength:1,maxLength:2000},types:{type:'array',minItems:1,items:{type:'string',enum:['pdf','presentation','spreadsheet','video','document','text']}},modalities:{type:'array',minItems:1,items:{type:'string',enum:['text','image','video']}},mode:{type:'string',enum:['hybrid','lexical','semantic']},limit:{type:'integer',minimum:1,maximum:20},offset:{type:'integer',minimum:0,maximum:10000},max_chars:{type:'integer',minimum:1000,maximum:12000}},['query'])},
   'artifacts.read':{description:'Read a bounded page of an indexed unit: text, structured metadata JSON (cells/formulas), or representations JSON. Continue using next_offset.',parameters:object({unit_id:{type:'string',minLength:1,maxLength:256},section:{type:'string',enum:['text','metadata','representations']},offset:{type:'integer',minimum:0,maximum:100000000},max_chars:{type:'integer',minimum:1000,maximum:12000}},['unit_id'])},
   'artifacts.list':{description:'List artifact resources and indexing status without loading an embedding model.',parameters:object({limit:{type:'integer',minimum:1,maximum:100},offset:{type:'integer',minimum:0,maximum:1000000}})},
   'artifacts.status':{description:'Read artifact-index statistics without loading an embedding model.',parameters:object({})},
@@ -35,7 +37,7 @@ export async function serveArtifactIndex({index,agent='http://127.0.0.1:36908',p
     if(!response.ok){await response.body?.cancel();throw new Error(`Node HTTP ${response.status}`);}
     return {body:response.status===204?null:await response.json(),etag:response.headers.get('etag')};
   };
-  const descriptor=()=>({id:serviceId,name:'Local artifact index',kind:'generic',port:server.address()?.port??port,sharing,reachability:'localhost',execution:'http',health:'/health',methods:ARTIFACT_METHODS,resources:[{scheme:'artifact',description:'Versioned artifact units with original page, slide, cell range and time locators'}],metadata:{artifact_index_provider:{protocol,version:'0.1.0',instance_id:instanceId,read_only:true},invoke_timeout_ms:120000}});
+  const descriptor=()=>({id:serviceId,name:'Local artifact index',kind:'generic',port:server.address()?.port??port,sharing,reachability:'localhost',execution:'http',health:'/health',methods:ARTIFACT_METHODS,resources:[{scheme:'artifact',description:'Versioned artifact units with original page, slide, cell range, block and time locators'}],metadata:{artifact_index_provider:{protocol,version,instance_id:instanceId,read_only:true},invoke_timeout_ms:120000}});
   const health=()=>({status:'ok',service:'artifact-index',protocol,pid:process.pid,sharing,read_only:true,registration:{registered,local_confirmed:confirmed,...(lastError?{last_error:lastError}:{})}});
   const send=(res,status,body)=>{
     if(res.destroyed||res.writableEnded)return;
@@ -78,7 +80,7 @@ export async function serveArtifactIndex({index,agent='http://127.0.0.1:36908',p
       }
       if(typeof params.query!=='string'||!params.query.trim()||params.query.length>2000)throw problem('query must have 1..2000 characters');
       if(params.mode!==undefined&&!['hybrid','lexical','semantic'].includes(params.mode))throw problem('Invalid search mode');
-      if(params.types!==undefined&&(!Array.isArray(params.types)||!params.types.length||params.types.some(type=>!['pdf','presentation','spreadsheet','video'].includes(type))))throw problem('Invalid artifact types');
+      if(params.types!==undefined&&(!Array.isArray(params.types)||!params.types.length||params.types.some(type=>!['pdf','presentation','spreadsheet','video','document','text'].includes(type))))throw problem('Invalid artifact types');
       if(params.modalities!==undefined&&(!Array.isArray(params.modalities)||!params.modalities.length||params.modalities.some(type=>!['text','image','video'].includes(type))))throw problem('Invalid modalities');
       return send(res,200,await index.search(params.query,{mode:params.mode??'hybrid',types:params.types,modalities:params.modalities,limit:boundedInteger(params.limit,15,1,20,'limit'),offset:boundedInteger(params.offset,0,0,10000,'offset'),maxChars:boundedInteger(params.max_chars,12000,1000,12000,'max_chars'),sharing:visibility,signal:controller.signal}));
     }catch(error){send(res,error.status??500,{error:error.status?error.message:'Artifact request failed'});}

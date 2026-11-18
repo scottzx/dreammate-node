@@ -6,7 +6,7 @@ import { isAbsolute, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const SCRIPT = fileURLToPath(new URL('../python/extract.py', import.meta.url));
-export const PARSER_VERSION = 'artifact-local-v1';
+export const PARSER_VERSION = 'artifact-local-v2';
 
 async function fileHash(file) {
   const hash = createHash('sha256');

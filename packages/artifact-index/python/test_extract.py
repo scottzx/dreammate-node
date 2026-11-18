@@ -10,6 +10,46 @@ import zipfile
 
 from extract import Extractor, chunks, video_segments, file_sha
 
+W_NS = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+CONTENT_TYPES = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"""
+PACKAGE_RELS = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"""
+STYLES = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles {W_NS}>
+<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/></w:style>
+</w:styles>"""
+STYLES_EXTRA = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles {W_NS}>
+<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/></w:style>
+<w:style w:type="paragraph" w:styleId="2"><w:name w:val="标题 2"/></w:style>
+</w:styles>"""
+
+
+def paragraph(text, style=None):
+    properties = f'<w:pPr><w:pStyle w:val="{style}"/></w:pPr>' if style else ""
+    return f'<w:p>{properties}<w:r><w:t xml:space="preserve">{text}</w:t></w:r></w:p>'
+
+
+def docx_table(rows):
+    cells = "".join("<w:tr>" + "".join(f"<w:tc>{paragraph(cell)}</w:tc>" for cell in row) + "</w:tr>" for row in rows)
+    return f"<w:tbl>{cells}</w:tbl>"
+
+
+def write_docx(path, body, styles_extra=None):
+    document = f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document {W_NS}><w:body>{body}</w:body></w:document>'
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("[Content_Types].xml", CONTENT_TYPES)
+        archive.writestr("_rels/.rels", PACKAGE_RELS)
+        archive.writestr("word/styles.xml", styles_extra or STYLES)
+        archive.writestr("word/document.xml", document)
+
 
 class ExtractionTests(unittest.TestCase):
     def setUp(self):
@@ -183,7 +223,7 @@ class ExtractionTests(unittest.TestCase):
         out = self.root / "xls-fixture"
         out.mkdir()
         extractor = self.extractor(source)
-        extractor.command([shutil.which("soffice") or shutil.which("libreoffice"), "-env:UserInstallation=" + profile.as_uri(), "--headless", "--convert-to", "xls:MS Excel 97", "--outdir", str(out), str(source)])
+        extractor.command([shutil.which("soffice") or shutil.which("libreoffice"), "-env:UserInstallation=" + profile.as_uri(), "--headless", "--convert-to", "xls:MS Excel 97", "--outdir", str(out), str(source)], office=True)
         output = self.extractor(out / "legacy-source.xls").extract()
         formula = next(cell for cell in output["units"][0]["cells"] if cell["coordinate"] == "C2")
         self.assertTrue(formula["formula_biff_base64"])
@@ -207,6 +247,68 @@ class ExtractionTests(unittest.TestCase):
             self.assertGreater(Path(rep["path"]).stat().st_size, 100)
         with self.assertRaisesRegex(ValueError, "maxVideoSeconds"):
             self.extractor(path, maxVideoSeconds=1).extract()
+
+    def test_docx_keeps_headings_paragraphs_and_tables(self):
+        path = self.root / "resume.docx"
+        write_docx(path, paragraph("个人简历", "Heading1")
+                   + paragraph("姓名：张三")
+                   + paragraph("工作经历", "Heading1")
+                   + paragraph("2021-2025 某某科技公司 产品经理")
+                   + docx_table([["技能", "年限"], ["产品设计", "5 年"]]))
+        output = self.extractor(path).extract()
+        self.assertEqual(output["kind"], "document")
+        self.assertEqual(output["mime"], "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        self.assertEqual([unit["locator"] for unit in output["units"]],
+                         [{"block": 1}, {"block": 2}, {"block": 3}, {"block": 4}, {"block": 5}])
+        self.assertEqual(output["units"][0]["kind"], "heading")
+        self.assertEqual(output["units"][0]["text"], "个人简历")
+        self.assertEqual(output["units"][1]["kind"], "block")
+        self.assertIn("姓名：张三", output["units"][1]["text"])
+        self.assertEqual(output["units"][4]["kind"], "table")
+        self.assertIn("产品设计 | 5 年", output["units"][4]["text"])
+        # The heading that owns a body unit is repeated as retrieval context.
+        self.assertTrue(output["units"][3]["text"].startswith("工作经历"))
+        self.assertTrue(all(unit["representations"][0]["modality"] == "text" for unit in output["units"]))
+
+    def test_docx_reads_localized_style_names_and_content_controls(self):
+        path = self.root / "localized.docx"
+        body = (f'<w:sdt><w:sdtContent>{paragraph("技能")}</w:sdtContent></w:sdt>' + paragraph("数据分析", "2"))
+        write_docx(path, body, styles_extra=STYLES_EXTRA)
+        output = self.extractor(path).extract()
+        # A paragraph inside a content control is still read.
+        self.assertEqual(output["units"][0]["kind"], "block")
+        self.assertIn("技能", output["units"][0]["text"])
+        # A localized style name still marks a heading.
+        self.assertEqual(output["units"][1]["kind"], "heading")
+        self.assertEqual(output["units"][1]["text"], "数据分析")
+
+    def test_markdown_blocks_headings_and_lists(self):
+        path = self.root / "notes.md"
+        path.write_text("# 标题\n\n正文段落一\n\n正文段落二\n\n## 小节\n\n- 第一项\n- 第二项\n", encoding="utf-8")
+        output = self.extractor(path).extract()
+        self.assertEqual(output["kind"], "text")
+        self.assertEqual(output["encoding"], "utf-8")
+        self.assertEqual(output["units"][0]["kind"], "heading")
+        self.assertEqual(output["units"][0]["text"], "标题")
+        body = output["units"][1]
+        self.assertIn("正文段落一", body["text"])
+        self.assertIn("正文段落二", body["text"])
+        self.assertTrue(body["text"].startswith("标题"))
+        self.assertEqual(body["block_start"], 2)
+        self.assertEqual(body["block_end"], 3)
+
+    def test_plain_text_reads_legacy_chinese_encoding(self):
+        path = self.root / "legacy.txt"
+        path.write_bytes("个人简历\n姓名：张三\n".encode("gb18030"))
+        output = self.extractor(path).extract()
+        self.assertEqual(output["encoding"], "gb18030")
+        self.assertIn("姓名：张三", output["units"][0]["text"])
+
+    def test_unsupported_extension_is_reported(self):
+        path = self.root / "data.bin"
+        path.write_bytes(b"\x00\x01")
+        with self.assertRaisesRegex(ValueError, "Unsupported artifact extension"):
+            self.extractor(path).extract()
 
 
 if __name__ == "__main__":
