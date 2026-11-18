@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.19.0 — 2026-11-14
+
+- Embed the DeepSeek Harness plugin into `@1agents/dreammate-node`. Install or upgrade that one package; `@1agents/dsh-dreammate-node` is no longer published.
+- Keep the plugin id `dreammate-node`. Remove the old bundle before adding `@1agents/dreammate-node`, and point custom rows at the package root.
+- Ship `yima-tailnet-trust.mjs` inside the embedded DSH plugin as the disabled `yima-tailnet-trust` row. A profile enables it with one exact Tailscale `host:port` authority to trust the Yima tailnet entry.
+
 ## 0.18.0 — 2026-11-13
 
 - Add optional `cloudflared` and `dreammate-node tunnel` to open a temporary Quick Tunnel to a loopback origin. The default target is the HTTP MCP listener at `127.0.0.1:8787`. The command does not start MCP or enable gateway public access, and the hostname dies with the process.

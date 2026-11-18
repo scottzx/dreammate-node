@@ -76,3 +76,4 @@ export {
   listSkillArchive,
   type SkillDescriptorWithSource,
 } from './skills.js';
+export { name, inject, apply } from './dsh.js';

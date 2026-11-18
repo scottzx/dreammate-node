@@ -1,31 +1,35 @@
-# @1agents/dsh-dreammate-node
+# DreamMate DSH plugin
 
-DreamMate Network tools for DeepSeek Harness. Activating the plugin reuses a healthy
-local `dreammate-node`, or starts the installed dependency when no node is running.
-No separate global install, MCP configuration or daemon command is required.
+Source module for the DeepSeek Harness integration. It is embedded into
+`@1agents/dreammate-node` at pack time and is not published on its own.
+Activating the plugin reuses a healthy local `dreammate-node`, or starts one
+from the same installed package when no node is running. No separate global
+install, MCP configuration or daemon command is required.
 
 ## Install
 
-From a DSH checkout (tested with DSH 0.1.7-rc.2, Node.js >=22.19):
+From a DSH checkout (Node.js >=22.19):
 
 ```sh
-pnpm dsh plugin --profile web add @1agents/dsh-dreammate-node
+pnpm dsh plugin --profile web remove @1agents/dsh-dreammate-node
+pnpm dsh plugin --profile web add @1agents/dreammate-node
 pnpm dsh web
 ```
 
 Restart an already running DSH after installation. Use `desktop` instead of `web`
 for that profile; omit `pnpm` when using an installed `dsh` executable.
-The package's `dsh.bundle.patch` registers the Host plugin automatically.
-The plugin defines no install-time scripts, and installing it starts no services.
-Its `dreammate-node` dependency can install bundled skill guides through npm
-`postinstall`; see [automatic skill installation](../../README.md#npm-安装时自动安装对应-skill).
+Remove the old `@1agents/dsh-dreammate-node` bundle first. Do not enable both.
+The plugin id stays `dreammate-node`. Custom rows must name `@1agents/dreammate-node`,
+the package root, not a subpath.
+`@1agents/dreammate-node` declares `dsh.bundle.patch` and registers the Host plugin.
+Installing it does not start a service by itself. The package `postinstall` can
+install bundled skill guides; see [automatic skill installation](../../README.md#npm-安装时自动安装对应-skill).
 
 Ask the DSH Agent to find devices/services, inspect a method, then call it:
 
 > 查看 DreamMate 网络中有哪些设备，查找转写服务，读取它的方法契约。
 
-The current source package depends on `@1agents/dreammate-node ^0.18.0` and registers
-the dependency's exported tools, except `dreammate_access`. Tool search, skill search and
+The embedded plugin registers the package's exported tools, except `dreammate_access`. Tool search, skill search and
 versioned skill reads sit alongside discovery, inspection, invocation and lifecycle
 tools. Their original JSON schemas and descriptions are used. Public-access tokens stay
 on the loopback control port and the `dreammate-node access` command; a DSH tool cannot
@@ -91,6 +95,30 @@ to start a replacement. Calls are never automatically replayed. Cancellation is
 checked before dispatch and after settlement; already dispatched gateway work
 uses its own timeouts and may still complete remotely.
 
+## Tailnet trust adapter (`yima-tailnet-trust`)
+
+The bundle also ships `yima-tailnet-trust.mjs`, a loader adapter beside
+`cordis.patch.yml`. It keeps the contract of the standalone dsh-config profile
+extension of the same name: it trusts exactly one Tailscale DNS `host:port`
+authority in the DSH Connection carrier, so the Yima phone/browser entry can
+reach DSH through Tailscale Serve, which preserves the Host header.
+
+The `yima-tailnet-trust` row ships `disabled: true` with an empty authority. A
+profile enables it and replaces the config wholesale with its real authority:
+
+```yaml
+- id: yima-tailnet-trust
+  disabled: false
+  config:
+    authority: "scott-mac.tailfb4720.ts.net:3080"
+```
+
+The adapter refuses anything but an exact lowercase `*.ts.net` authority —
+normally `host:port`, as the preserved Host header arrives; a bare host is also
+accepted and matches the port-443 entry. No scheme, userinfo, path, query or
+fragment passes. It withdraws the trust again when the row is disposed, and
+never removes an authority that was already trusted before the row activated.
+
 ## Development
 
 ```sh
@@ -98,16 +126,18 @@ cd packages/dsh-plugin
 pnpm install --frozen-lockfile
 pnpm test
 DSH_CHECKOUT=/absolute/path/DSH pnpm test
-pnpm pack
 ```
 
 The optional checkout runs integration tests against real built DSH Cordis and
 tool services. Lifecycle tests use ephemeral ports; the node's test mode disables
 registry persistence.
-The package ships plain JavaScript and needs no consumer build scripts or DSH
-runtime dependencies beyond the Host-provided `tools` service.
+This directory is private source. Packing it does not produce the DSH install
+target. From the repository root, `npm run build` copies these files into
+`vendor/dsh` and the published package is `@1agents/dreammate-node`.
+The plugin ships plain JavaScript and needs no DSH runtime dependencies beyond
+the Host-provided `tools` service.
 
-Remove with `pnpm dsh plugin --profile web remove @1agents/dsh-dreammate-node`
+Remove with `pnpm dsh plugin --profile web remove @1agents/dreammate-node`
 and restart DSH. Existing identity and service registrations are retained.
 
 
@@ -124,11 +154,9 @@ a DSH tool. Existing running local nodes remain externally owned.
 
 ## Releases
 
-This package keeps its own version numbers. What tracks DreamMate Node is the
-dependency's major and minor: `^0.18.0` accepts `0.18.x` and not `0.19.0`.
-Pushing `v0.18.0` publishes Node and, in the same workflow, this package when its
-version is not on npm yet. A Node patch such as `0.18.1` does not publish the plugin.
-The plugin version does not jump to `0.18.0` just to match Node.
+`@1agents/dsh-dreammate-node` stopped receiving releases at 0.4.0. Later DSH
+installs use `@1agents/dreammate-node`. One npm publish carries the gateway,
+MCP tools and this adapter. Plugin-only changes ship with the node version.
 
 ## 0.2.0 dependency transition
 

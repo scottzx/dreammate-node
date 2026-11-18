@@ -14,7 +14,8 @@ export const inject = ['tools'];
 // 不能从工具列表里开关公网访问或读出明文 token。
 export const DSH_TOOLS = MCP_TOOLS.filter(tool => tool.name !== 'dreammate_access');
 const render = (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }];
-const legacyInvoke = createRequire(import.meta.url)('@1agents/dreammate-node/package.json').version === '0.7.1';
+const nodePackage = createRequire(import.meta.url)('@1agents/dreammate-node/package.json');
+const legacyInvoke = nodePackage.version === '0.7.1';
 
 function normalizeResult(name, result) {
   // 0.7.1 wraps successful HTTP JSON in a text block, even when that JSON is an
@@ -35,7 +36,7 @@ export async function apply(ctx, input = {}) {
   await ctx.effect(() => acquireService(options));
   // Use the published gateway API rather than duplicating its routing or relying
   // on an unpublished callDreammateTool export. No extra MCP process is needed.
-  const client = new Client({ name: '@1agents/dsh-dreammate-node', version: '0.1.0' });
+  const client = new Client({ name: nodePackage.name, version: nodePackage.version });
   await ctx.effect(async () => {
     const server = createMcpServer({ agentUrl: options.serviceUrl, exposeAccessControl: false });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();

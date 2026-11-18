@@ -1,6 +1,20 @@
 - insert:
     - id: dreammate-node
-      name: '@1agents/dsh-dreammate-node'
+      name: '@1agents/dreammate-node'
       config:
         serviceMode: auto
         serviceUrl: http://127.0.0.1:36908
+
+# Yima phone/browser entry over Tailscale Serve: trust exactly one private
+# `host:port` authority in the Connection carrier. Shipped disabled; a profile
+# patch enables it and replaces the config wholesale with its real authority:
+#   - id: yima-tailnet-trust
+#     disabled: false
+#     config:
+#       authority: "scott-mac.tailfb4720.ts.net:3080"
+- insert:
+    - id: yima-tailnet-trust
+      name: './yima-tailnet-trust.mjs'
+      disabled: true
+      config:
+        authority: ''

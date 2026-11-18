@@ -1,7 +1,8 @@
 {
   "name": "@1agents/dsh-dreammate-node",
   "version": "0.4.0",
-  "description": "DreamMate Network discovery and invocation tools for DeepSeek Harness, with automatic local node startup",
+  "private": true,
+  "description": "Private source of the DreamMate DSH plugin. It is embedded into @1agents/dreammate-node and is not published.",
   "type": "module",
   "exports": {
     ".": "./src/index.js",
@@ -11,17 +12,13 @@
   "files": [
     "src",
     "cordis.patch.yml",
+    "yima-tailnet-trust.mjs",
     "README.md",
     "LICENSE"
   ],
-  "dsh": {
-    "bundle": {
-      "patch": "./cordis.patch.yml"
-    }
-  },
   "scripts": {
     "test": "node --test test/*.test.mjs",
-    "prepack": "node --check src/index.js && node --check src/service-process.js && node --check src/service-worker.js"
+    "prepack": "node --check src/index.js && node --check src/service-process.js && node --check src/service-worker.js && node --check yima-tailnet-trust.mjs"
   },
   "engines": {
     "node": ">=22.19.0"
@@ -42,9 +39,5 @@
     "tools",
     "service-discovery"
   ],
-  "license": "MIT",
-  "publishConfig": {
-    "access": "public",
-    "registry": "https://registry.npmjs.org"
-  }
+  "license": "MIT"
 }

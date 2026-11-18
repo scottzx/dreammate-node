@@ -55,6 +55,12 @@ try {
     '--workspace=@1agents/artifact-index', '--pack-destination', artifacts]));
   assert.ok(!gateway.files.some(file => /^(?:dist\/)?packages\//.test(file.path)),
     'Node must not embed independent workspace implementations');
+  for (const embedded of ['vendor/dsh/index.js', 'vendor/dsh/service-worker.js', 'vendor/dsh/cordis.patch.yml', 'vendor/dsh/yima-tailnet-trust.mjs']) {
+    assert.ok(gateway.files.some(file => file.path === embedded), `Node tarball must include ${embedded}`);
+  }
+  assert.equal(gatewayManifest.dsh?.bundle?.patch, './vendor/dsh/cordis.patch.yml');
+  assert.equal(gatewayManifest.dependencies?.['@1agents/dsh-dreammate-node'], undefined,
+    'Node must embed the DSH plugin instead of depending on it');
   assert.ok(artifact.files.some(file => file.path === 'python/requirements.txt'),
     'Artifact Index must include its parser dependency manifest');
   const artifactAllow = /^(?:src\/[^/]+\.(?:mjs|d\.ts)|bin\/artifact-index\.mjs|python\/(?:extract\.py|requirements\.txt)|(?:package\.json|README\.md|CHANGELOG\.md|LICENSE))$/;
@@ -82,6 +88,16 @@ const pkg = JSON.parse(fs.readFileSync('node_modules/@1agents/dreammate-node/pac
 assert.equal(pkg.version, ${JSON.stringify(gatewayManifest.version)});
 assert.equal(pkg.dependencies?.['@1agents/skill-manager'], undefined);
 assert.equal(pkg.dependencies?.['@1agents/artifact-index'], undefined);
+assert.equal(pkg.dependencies?.['@1agents/dsh-dreammate-node'], undefined);
+assert.equal(pkg.dsh.bundle.patch, './vendor/dsh/cordis.patch.yml');
+const patch = fs.readFileSync('node_modules/@1agents/dreammate-node/vendor/dsh/cordis.patch.yml', 'utf8');
+assert.equal(patch.includes("name: '@1agents/dreammate-node'"), true);
+assert.equal(patch.includes('dsh-dreammate-node'), false);
+assert.equal(patch.includes("name: './yima-tailnet-trust.mjs'"), true);
+assert.equal(fs.existsSync('node_modules/@1agents/dreammate-node/vendor/dsh/yima-tailnet-trust.mjs'), true);
+assert.equal(gateway.name, 'dreammate-node');
+assert.deepEqual(gateway.inject, ['tools']);
+assert.equal(typeof gateway.apply, 'function');
 assert.equal(fs.existsSync('node_modules/@1agents/skill-manager'), false);
 assert.equal(fs.existsSync('node_modules/@1agents/dreammate-node/node_modules/@1agents/skill-manager'), false);
 assert.throws(() => import.meta.resolve('@1agents/skill-manager'), { code: 'ERR_MODULE_NOT_FOUND' });

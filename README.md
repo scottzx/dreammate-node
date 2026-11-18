@@ -66,7 +66,7 @@ flowchart LR
     family -.-> phone["1agents_phone<br/>原生设备能力 · 网络接入推进中"]
     node --> skills["skill-manager<br/>技能来源与版本化读取"]
     node --> artifacts["artifact-index<br/>本地产物检索与定位"]
-    node --> plugin["dsh-dreammate-node<br/>DSH 接入插件"]
+    node --> plugin["DSH 接入<br/>嵌在同一个包里"]
 ```
 
 ### 核心项目
@@ -76,15 +76,15 @@ flowchart LR
 | [DreamMate Network](https://github.com/scottzx/dreammate-network) · `@1agents/dreammate-network` | Node、Service、Execution 等公共协议、Schema 与类型 | 供各项目使用的公共语言；不运行服务或业务流程 |
 | [DreamMate Node](#dreammate-node-设备入口) · `@1agents/dreammate-node` | 每台设备的登记、发现、探活与调用入口；提供 CLI/MCP | 使用协议包，代理本机 HTTP/CLI 服务，连接其他设备的网关 |
 | [Skill Manager](packages/skill-manager/README.md) · `@1agents/skill-manager` | 技能来源发现、整包版本、指南及资源读取 | 本仓库独立包，通过 HTTP 向 Node 报备；原件保留在项目或共享目录 |
-| [Artifact Index](packages/artifact-index/README.md) · `@1agents/artifact-index` | PDF、PPT、Excel、视频的检索与原始定位 | 本仓库独立包；可向 Node 发布只读服务，复用已登记的本地模型 |
+| [Artifact Index](packages/artifact-index/README.md) · `@1agents/artifact-index` | PDF、PPT、Excel、Word、纯文本/Markdown、视频的检索与原始定位 | 本仓库独立包；可向 Node 发布只读服务，复用已登记的本地模型 |
 | [Session Reader / 1session](https://github.com/scottzx/session-reader) · `@1agents/session-reader` | 读取与检索多个宿主的原始落盘会话 | 可独立使用、提供 DSH 历史入口，也可作为网络中的会话读取服务，为常驻角色提供历史查询与工作追溯 |
 | [1ACP](https://github.com/scottzx/1acp) · `@1agents/acp-service` | 原生 Agent 持久会话、ACP 接入与可选 A2A 委托 | 一个公开包包含运行时、服务、CLI 与 DSH 集成；为常驻角色提供执行与派单基础，A2A 网关可向 Node 报备 |
-| [DSH 接入插件](packages/dsh-plugin/README.md) · `@1agents/dsh-dreammate-node` | 在 DeepSeek Harness 中提供能力网络工具 | 本仓库的独立适配包，依赖 Node；复用或按需拉起本机网关 |
+| [DSH 接入](packages/dsh-plugin/README.md) | 在 DeepSeek Harness 中提供能力网络工具 | 源码在 `packages/dsh-plugin`，发布时嵌进 `@1agents/dreammate-node`；不再单独发 npm |
 | [1agents_phone](https://github.com/scottzx/1agents_phone) | 原生移动端与设备能力项目 | 独立项目；原生能力存在与通过能力网络可调用是不同阶段，具体入网进度以该项目为准 |
 
-Skill Manager、Artifact Index 与 Node 分别安装、维护版本，通过协议协作；它们之间没有彼此的 npm 运行时依赖。DSH 插件则直接依赖 Node。Session Reader 与 ACP 服务是其他独立仓库，安装条件以各项目说明为准。
+Skill Manager、Artifact Index 与 Node 分别安装、维护版本，通过协议协作；它们之间没有彼此的 npm 运行时依赖。DSH 接入跟 Node 是同一个 npm 包。Session Reader 与 ACP 服务是其他独立仓库，安装条件以各项目说明为准。
 
-[DeepSeek Harness（DSH）](https://github.com/deepseek-ai/deepseek-harness) 是外部 Agent 宿主。Node 插件为其提供网络工具，Session Reader 提供历史浏览，ACP 服务提供原生 Agent 会话；三个入口分别安装，职责独立。
+[DeepSeek Harness（DSH）](https://github.com/deepseek-ai/deepseek-harness) 是外部 Agent 宿主。安装 `@1agents/dreammate-node` 即可提供网络工具，Session Reader 提供历史浏览，ACP 服务提供原生 Agent 会话；三个入口分别安装，职责独立。
 
 ### 可复用的能力服务
 
@@ -218,15 +218,17 @@ CRM、ERP、项目管理及其他业务系统，可以将已有接口封装为�
 
 基础设备信息附在 `/manifest` 的 `metadata.device` 和 `/nodes` 的本机条目中；新版 MCP/CLI 可读取设备型号、系统、主机名及本地网卡信息。仅采集本机已有信息，不进行节点间探测或局域网分组。见 [基础设备信息](docs/device-info.md)。
 
-DeepSeek Harness 可以直接安装配套插件，复用本机已运行的 node，未启动时自动拉起：
+DeepSeek Harness 安装同一个包。插件复用本机已运行的 node，未启动时自动拉起：
 
 ```bash
-pnpm dsh plugin --profile web add @1agents/dsh-dreammate-node
+pnpm dsh plugin --profile web remove @1agents/dsh-dreammate-node
+pnpm dsh plugin --profile web add @1agents/dreammate-node
 # 重启 DSH 后生效；desktop 使用 --profile desktop
 ```
 
-当前仓库中的 DSH 插件依赖 `@1agents/dreammate-node ^0.15.0`，直接注册该依赖导出的 MCP 元工具，覆盖工具与技能搜索、契约读取及调用等入口，默认使用本机 `36908`。
-DSH 插件需要 Node.js >=22.19；旧 profile 应按插件说明同步更新依赖与锁文件，已有运行中的网关需单独核对版本。
+先卸掉旧的 `@1agents/dsh-dreammate-node`，再装这个包。两个 bundle 不要同时启用。插件 id 仍是 `dreammate-node`；自定义补丁行的包名改成 `@1agents/dreammate-node`。
+它注册本包导出的 MCP 元工具，覆盖工具与技能搜索、契约读取及调用等入口，默认使用本机 `36908`。`dreammate_access` 不进入 DSH 工具列表。
+DSH 需要 Node.js >=22.19。安装这个包会运行它自己的 `postinstall` 来放置技能指南。已有运行中的网关需单独核对版本。
 配置与进程生命周期见 [DSH 插件说明](packages/dsh-plugin/README.md)。
 
 ```bash
@@ -415,7 +417,7 @@ MCP 对应 `dreammate_search_skills` → `dreammate_read_skill`。HTTP 为分页
 
 ### 本地文件和视频的统一产物索引
 
-[`@1agents/artifact-index`](packages/artifact-index/README.md) 是另一独立 npm 包，提供 CLI、ESM 库和可选的只读服务。
+[`@1agents/artifact-index`](packages/artifact-index/README.md) 是另一独立 npm 包，提供 CLI、ESM 库和可选的只读服务；它索引 PDF、PPT、Excel、Word、纯文本/Markdown 与视频，支持目录遍历与增量索引。
 它索引显式传入的 PDF、PPT/PPTX、Excel 与视频，保留页码、幻灯片编号、工作表/单元格范围和时间片段，
 支持先搜索摘要、再读取原始定位对应的内容。Node 和产物索引互无 npm 运行时依赖，安装 Node 不会附带索引数据库或用户文件。
 

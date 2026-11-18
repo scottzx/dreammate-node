@@ -1,6 +1,6 @@
 {
   "name": "@1agents/dreammate-node",
-  "version": "0.18.0",
+  "version": "0.19.0",
   "description": "DreamMate Network 的设备网关与一次性 CLI：服务发现、调用与可导入的设备地址簿。",
   "keywords": [
     "dreammate",
@@ -26,7 +26,8 @@
       "types": "./dist/src/client.d.ts",
       "import": "./dist/src/client.js"
     },
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./vendor/dsh/cordis.patch.yml"
   },
   "bin": {
     "dreammate-node": "dist/bin/dreammate-node.js"
@@ -52,12 +53,18 @@
     "skills/terminal/dreammate-node/SKILL.md",
     "README.md",
     "scripts/audit-dependencies.mjs",
-    "ecosystem"
+    "ecosystem",
+    "vendor/dsh"
   ],
+  "dsh": {
+    "bundle": {
+      "patch": "./vendor/dsh/cordis.patch.yml"
+    }
+  },
   "sideEffects": false,
   "scripts": {
     "build": "npm run build:node",
-    "build:node": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.build.json",
+    "build:node": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.build.json && node scripts/embed-dsh.mjs",
     "build:all": "npm run build && npm run skill-manager:build",
     "skill-manager:build": "npm run build --workspace=@1agents/skill-manager",
     "skill-manager:check": "npm run check --workspace=@1agents/skill-manager",
