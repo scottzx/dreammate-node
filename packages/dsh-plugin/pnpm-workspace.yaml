@@ -2,8 +2,7 @@ packages:
   - .
 
 minimumReleaseAgeExclude:
-  - "@1agents/dreammate-node@0.17.0"
-  - "@1agents/dreammate-node@0.18.0"
+  - '@1agents/dreammate-node@0.17.0 || 0.18.0 || 0.19.0'
   - "@1agents/dreammate-network@0.5.0"
 
 allowBuilds:

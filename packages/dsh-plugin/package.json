@@ -24,7 +24,7 @@
     "node": ">=22.19.0"
   },
   "dependencies": {
-    "@1agents/dreammate-node": "^0.18.0",
+    "@1agents/dreammate-node": "^0.19.0",
     "@modelcontextprotocol/sdk": "^1.30.0"
   },
   "repository": {
