@@ -12,31 +12,63 @@
 // tool outputs, `meta` dumps, redundant `assistant/message.data.stream` replay
 // buffers, and `request/header.header.tools` schemas. The local Electron desktop
 // UI does not traverse this loopback listener and stays 100% untouched.
+//
+// The list endpoints a remote browser pulls on its first frame join the same
+// treatment: `POST /api/session/list` drops the projection keys the remote list
+// view never renders, and `POST /api/commands/list` drops the prose of every
+// descriptor and is cached for a short window so a reconnect storm (the client
+// re-pulls the whole table for every session key on every reconnect) costs no
+// upstream work.
+//
+// The DSH web server only knows gzip. This entry re-encodes its own responses
+// with brotli when the client accepts it and keeps the immutable client
+// bundles (`/assets/`, `/plugins/`) compressed in memory, so the cold start of
+// a phone browser drops by roughly a quarter of its bytes.
 
 import { createServer, request as httpRequest } from 'node:http';
+import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { gunzipSync, gzipSync } from 'node:zlib';
+import { brotliCompressSync, constants as zlibConstants, gunzipSync, gzipSync } from 'node:zlib';
 
 export const name = 'yima-shared-loopback';
 export const inject = ['connection', 'webServer', 'typertGateway'];
 
 const REMOTE_STREAM_MUX_PATH = '/api/remote.mux';
-const SLIM_HTTP_PATHS = new Set(['/api/session/page', '/api/session/events']);
+// Every proxied HTTP route: the two history paging endpoints plus the list
+// endpoints a remote browser pulls on its first frame.
+const SLIM_HTTP_ROUTES = new Map([
+  ['/api/session/page', { methods: ['POST'], transform: 'rpcRecords' }],
+  ['/api/session/events', { methods: ['POST'], transform: 'rpcRecords' }],
+  ['/api/session/list', { methods: ['POST'], transform: 'sessionList' }],
+  ['/api/commands/list', { methods: ['POST'], transform: 'commandList', cacheTtlMs: 'commandListCacheTtlMs' }],
+]);
+// Static client payloads the remote browser pulls once per cold start. They
+// are immutable and text-shaped, so a cached brotli re-encode pays off.
+const COMPRESSIBLE_ASSET_PREFIXES = ['/assets/', '/plugins/'];
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 const DEFAULT_MAX_MISSED_HEARTBEATS = 2;
 const DEFAULT_STREAM_INBOX_BYTES = 262_144;
 const DEFAULT_COMPRESSION_LEVEL = 6;
+const DEFAULT_BROTLI_QUALITY = 4;
 const COMPRESS_THRESHOLD_BYTES = 512;
+const MAX_CACHED_REQUEST_BYTES = 65_536;
+const MAX_ASSET_CACHE_BYTES = 64 * 1024 * 1024;
 
 export const DEFAULT_SLIM_CONFIG = Object.freeze({
   enabled: true,
   // Initial history budget for session/follow (DSH default: maxMessages=500, minMessages=50, minTurns=2).
-  maxMessages: 24,
-  minMessages: 12,
-  minTurns: 1,
+  // 200 keeps a long conversation readable on a phone while the tool-output
+  // trimming below does the heavy lifting; the window stays bounded so one
+  // session can never ship its whole history in one frame.
+  maxMessages: 200,
+  // The turn window is what actually decides how much history the phone gets:
+  // the host stops at the first Turn boundary after both minima, so the
+  // message cap above only ever acts as a safety net.
+  minMessages: 50,
+  minTurns: 2,
   // Strip tool call arguments so the UI displays only the tool name.
   stripToolArguments: true,
   // Omit tool/result output body & meta (keep error indicator when isError=true).
@@ -56,10 +88,42 @@ export const DEFAULT_SLIM_CONFIG = Object.freeze({
   dropCompactionRawOutput: true,
   // Slim live assistant-stream tool-call argument deltas (keeps text/reasoning deltas intact).
   slimLiveToolDeltas: true,
+  // Trim the session list payload: every row carries a full projection dump
+  // (~1 KB), and the remote list view only renders a few of its keys. The
+  // dropped keys are accounting or duplicate state; the live control stream
+  // re-supplies them when a session is opened.
+  slimSessionList: true,
+  dropSessionListValues: ['tokenUsage', 'workingDirectory', 'modelSelection'],
+  // Trim the command table: keep the identity fields, cut the prose.
+  slimCommandList: true,
+  maxCommandDescriptionChars: 200,
+  maxCommandHintChars: 120,
+  // Serve a repeated identical command-table pull from memory for this long.
+  // A reconnect storm (the client re-pulls the whole table per session key on
+  // every reconnect) then costs zero upstream work.
+  commandListCacheTtlMs: 30_000,
+  // HTTP response encoding for proxied payloads: 'auto' prefers brotli, which
+  // the DSH web server never emits (it only knows gzip).
+  httpCompression: 'auto',
+  brotliQuality: DEFAULT_BROTLI_QUALITY,
+  // Re-encode static client payloads (JS/CSS bundles) with brotli and keep
+  // them in memory; they are immutable, so the cache is safe.
+  compressAssets: true,
+  assetCacheTtlMs: 3_600_000,
 });
 
 function positiveInt(value, fallback) {
   return Number.isSafeInteger(value) && value > 0 ? value : fallback;
+}
+
+function nonNegativeInt(value, fallback) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : fallback;
+}
+
+function stringList(value, fallback) {
+  if (!Array.isArray(value)) return [...fallback];
+  const out = value.filter((item) => typeof item === 'string' && item.length > 0);
+  return out.length > 0 ? out : [...fallback];
 }
 
 function isPlainObject(value) {
@@ -99,6 +163,29 @@ export function resolveSlimConfig(raw) {
     maxJobLabelChars: positiveInt(input.maxJobLabelChars, DEFAULT_SLIM_CONFIG.maxJobLabelChars),
     dropCompactionRawOutput: input.dropCompactionRawOutput !== false,
     slimLiveToolDeltas: input.slimLiveToolDeltas !== false,
+    slimSessionList: input.slimSessionList !== false,
+    dropSessionListValues: Object.freeze(stringList(
+      input.dropSessionListValues,
+      DEFAULT_SLIM_CONFIG.dropSessionListValues,
+    )),
+    slimCommandList: input.slimCommandList !== false,
+    maxCommandDescriptionChars: positiveInt(
+      input.maxCommandDescriptionChars,
+      DEFAULT_SLIM_CONFIG.maxCommandDescriptionChars,
+    ),
+    maxCommandHintChars: positiveInt(input.maxCommandHintChars, DEFAULT_SLIM_CONFIG.maxCommandHintChars),
+    commandListCacheTtlMs: nonNegativeInt(
+      input.commandListCacheTtlMs,
+      DEFAULT_SLIM_CONFIG.commandListCacheTtlMs,
+    ),
+    httpCompression: input.httpCompression === 'gzip' || input.httpCompression === 'brotli' || input.httpCompression === 'none'
+      ? input.httpCompression
+      : DEFAULT_SLIM_CONFIG.httpCompression,
+    brotliQuality: Number.isSafeInteger(input.brotliQuality) && input.brotliQuality >= 1 && input.brotliQuality <= 11
+      ? input.brotliQuality
+      : DEFAULT_SLIM_CONFIG.brotliQuality,
+    compressAssets: input.compressAssets !== false,
+    assetCacheTtlMs: nonNegativeInt(input.assetCacheTtlMs, DEFAULT_SLIM_CONFIG.assetCacheTtlMs),
   });
 }
 
@@ -457,6 +544,94 @@ export function slimRpcResponseBody(body, config = DEFAULT_SLIM_CONFIG) {
     body: { ...body, result: { ...result, value: { ...page, records: nextRecords } } },
   };
 }
+
+function readRpcValue(body) {
+  if (!body || typeof body !== 'object') return undefined;
+  const result = body.result;
+  if (!result || typeof result !== 'object' || result.ok !== true) return undefined;
+  return result.value;
+}
+
+function slimSessionListItem(item, config) {
+  if (!isPlainObject(item)) return item;
+  const projections = item.projections;
+  if (!isPlainObject(projections) || !isPlainObject(projections.values)) return item;
+  const values = projections.values;
+  let nextValues = values;
+  let changed = false;
+  for (const key of config.dropSessionListValues) {
+    if (!Object.hasOwn(nextValues, key)) continue;
+    if (nextValues === values) nextValues = { ...values };
+    delete nextValues[key];
+    changed = true;
+  }
+  if (!changed) return item;
+  return { ...item, projections: { ...projections, values: nextValues } };
+}
+
+/**
+ * Trim one session list response: every row carries a full projection dump,
+ * and the remote list view renders only a few of its keys. The dropped keys
+ * are accounting or duplicate state; the live control stream re-supplies them
+ * once the session is opened.
+ */
+export function slimSessionListResponse(body, config = DEFAULT_SLIM_CONFIG) {
+  if (!config.slimSessionList) return { body, changed: false };
+  const page = readRpcValue(body);
+  if (!isPlainObject(page) || !Array.isArray(page.items)) return { body, changed: false };
+  let changed = false;
+  const items = page.items.map((item) => {
+    const next = slimSessionListItem(item, config);
+    if (next !== item) changed = true;
+    return next;
+  });
+  if (!changed) return { body, changed: false };
+  return {
+    changed: true,
+    body: { ...body, result: { ...body.result, value: { ...page, items } } },
+  };
+}
+
+function trimCommandDescriptor(entry, config) {
+  if (!isPlainObject(entry)) return entry;
+  let next = entry;
+  if (typeof entry.description === 'string' && entry.description.length > config.maxCommandDescriptionChars) {
+    next = { ...next, description: truncateText(entry.description, config.maxCommandDescriptionChars) };
+  }
+  const input = entry.input;
+  if (isPlainObject(input) && typeof input.hint === 'string' && input.hint.length > config.maxCommandHintChars) {
+    next = { ...next, input: { ...input, hint: truncateText(input.hint, config.maxCommandHintChars) } };
+  }
+  return next;
+}
+
+/**
+ * Trim the command descriptor table: the identity fields stay, the prose is
+ * cut. A reconnect storm re-pulls this table per session key, so every byte
+ * here is paid again on every reconnect.
+ */
+export function slimCommandsListResponse(body, config = DEFAULT_SLIM_CONFIG) {
+  if (!config.slimCommandList) return { body, changed: false };
+  const list = readRpcValue(body);
+  if (!Array.isArray(list)) return { body, changed: false };
+  let changed = false;
+  const next = list.map((entry) => {
+    const trimmed = trimCommandDescriptor(entry, config);
+    if (trimmed !== entry) changed = true;
+    return trimmed;
+  });
+  if (!changed) return { body, changed: false };
+  return {
+    changed: true,
+    body: { ...body, result: { ...body.result, value: next } },
+  };
+}
+
+const SLIM_TRANSFORMS = Object.freeze({
+  rpcRecords: slimRpcResponseBody,
+  sessionList: slimSessionListResponse,
+  commandList: slimCommandsListResponse,
+});
 
 export async function loadWsModule() {
   try {
@@ -956,11 +1131,152 @@ function readUpstreamPort(carrier) {
   return undefined;
 }
 
-function proxySlimSessionPage(req, res, { upstreamPort, slimConfig, compressionLevel, logger, logStats }) {
+function readAcceptEncoding(req) {
+  return String(req.headers['accept-encoding'] ?? '').toLowerCase();
+}
+
+function acceptsEncoding(req, encoding) {
+  return new RegExp(`\\b${encoding}\\b`).test(readAcceptEncoding(req));
+}
+
+/**
+ * Encode one payload for the wire. The DSH web server only knows gzip, so a
+ * brotli-capable client is served a brotli body from here; gzip stays the
+ * fallback and identity is the last resort.
+ */
+function encodePayload(payload, req, slimConfig, compressionLevel) {
+  const mode = slimConfig.httpCompression;
+  if (mode !== 'none' && payload.length >= COMPRESS_THRESHOLD_BYTES) {
+    if (mode !== 'gzip' && acceptsEncoding(req, 'br')) {
+      return {
+        buffer: brotliCompressSync(payload, {
+          params: {
+            [zlibConstants.BROTLI_PARAM_QUALITY]: slimConfig.brotliQuality,
+          },
+        }),
+        encoding: 'br',
+      };
+    }
+    if (acceptsEncoding(req, 'gzip')) {
+      return { buffer: gzipSync(payload, { level: compressionLevel }), encoding: 'gzip' };
+    }
+  }
+  return { buffer: payload, encoding: undefined };
+}
+
+/**
+ * Bounded in-memory cache for encoded responses. It absorbs the reconnect
+ * storm (the client re-pulls the command table for every session key on every
+ * reconnect) and keeps the immutable client bundles off the wire twice.
+ */
+class SlimResponseCache {
+  constructor({ maxBytes = MAX_ASSET_CACHE_BYTES, maxEntries = 256 } = {}) {
+    this.maxBytes = maxBytes;
+    this.maxEntries = maxEntries;
+    this.bytes = 0;
+    this.entries = new Map();
+  }
+
+  get(key) {
+    const entry = this.entries.get(key);
+    if (entry === undefined) return undefined;
+    if (entry.expiresAt <= Date.now()) {
+      this.delete(key);
+      return undefined;
+    }
+    // Refresh recency so the hot key survives the eviction sweep.
+    this.entries.delete(key);
+    this.entries.set(key, entry);
+    return entry;
+  }
+
+  set(key, value, ttlMs) {
+    if (ttlMs <= 0) return;
+    const previous = this.entries.get(key);
+    if (previous !== undefined) this.bytes -= previous.buffer.length;
+    this.entries.set(key, { ...value, expiresAt: Date.now() + ttlMs });
+    this.bytes += value.buffer.length;
+    while (this.entries.size > this.maxEntries || this.bytes > this.maxBytes) {
+      const oldest = this.entries.keys().next();
+      if (oldest.done) break;
+      this.delete(oldest.value);
+    }
+  }
+
+  delete(key) {
+    const entry = this.entries.get(key);
+    if (entry === undefined) return;
+    this.bytes -= entry.buffer.length;
+    this.entries.delete(key);
+  }
+}
+
+function requestCacheKey(req, body) {
+  const hash = createHash('sha1');
+  hash.update(String(req.method ?? 'GET'));
+  hash.update('\n');
+  hash.update(String(req.url ?? '/'));
+  if (body !== undefined) {
+    hash.update('\n');
+    hash.update(body);
+  }
+  return hash.digest('hex');
+}
+
+function readRequestBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > MAX_CACHED_REQUEST_BYTES) {
+        reject(new Error('yima-shared-loopback: request body exceeds the cacheable size'));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => { resolve(Buffer.concat(chunks)); });
+    req.on('error', reject);
+  });
+}
+
+/**
+ * Proxy one JSON route: fetch it from the upstream, apply the route's
+ * transform, then encode the result for the client.
+ */
+async function proxySlimHttp(req, res, {
+  upstreamPort, slimConfig, compressionLevel, logger, logStats, route, cache,
+}) {
+  const transform = SLIM_TRANSFORMS[route.transform];
+  const cacheTtlMs = route.cacheTtlMs ? slimConfig[route.cacheTtlMs] : 0;
+  let requestBody;
+  if (cacheTtlMs > 0) {
+    try {
+      requestBody = await readRequestBody(req);
+    } catch (error) {
+      logger?.warn?.('[yima-shared-loopback] request body read failed:', error);
+      res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('bad gateway');
+      return;
+    }
+  }
+
+  const cacheKey = cacheTtlMs > 0 ? requestCacheKey(req, requestBody.toString('utf8')) : undefined;
+  const cached = cacheKey === undefined ? undefined : cache.get(cacheKey);
+  if (cached !== undefined) {
+    const headers = { ...cached.headers, 'content-length': String(cached.buffer.length) };
+    res.writeHead(cached.status, headers);
+    res.end(cached.buffer);
+    return;
+  }
+
   const headers = { ...req.headers };
   headers['accept-encoding'] = 'identity';
   delete headers['connection'];
-  const clientAcceptsGzip = /\bgzip\b/i.test(String(req.headers['accept-encoding'] ?? ''));
+  if (requestBody !== undefined) {
+    headers['content-length'] = String(requestBody.length);
+  }
 
   const upstreamReq = httpRequest({
     hostname: '127.0.0.1',
@@ -989,7 +1305,7 @@ function proxySlimSessionPage(req, res, { upstreamPort, slimConfig, compressionL
         const encoding = String(outHeaders['content-encoding'] ?? '').toLowerCase();
         const plainBuf = encoding === 'gzip' ? gunzipSync(rawBuf) : rawBuf;
         const parsed = JSON.parse(plainBuf.toString('utf8'));
-        const { body, changed } = slimRpcResponseBody(parsed, slimConfig);
+        const { body, changed } = transform(parsed, slimConfig);
         const outJsonBuf = changed ? Buffer.from(JSON.stringify(body), 'utf8') : plainBuf;
 
         if (changed && logStats) {
@@ -1001,18 +1317,18 @@ function proxySlimSessionPage(req, res, { upstreamPort, slimConfig, compressionL
           else console.log(msg);
         }
 
-        let wireBuf = outJsonBuf;
-        if (clientAcceptsGzip && outJsonBuf.length >= COMPRESS_THRESHOLD_BYTES) {
-          wireBuf = gzipSync(outJsonBuf, { level: compressionLevel });
-          outHeaders['content-encoding'] = 'gzip';
-        } else {
-          delete outHeaders['content-encoding'];
-        }
+        const { buffer: wireBuf, encoding: wireEncoding } = encodePayload(outJsonBuf, req, slimConfig, compressionLevel);
+        if (wireEncoding === undefined) delete outHeaders['content-encoding'];
+        else outHeaders['content-encoding'] = wireEncoding;
         outHeaders['content-length'] = String(wireBuf.length);
         res.writeHead(statusCode, outHeaders);
         res.end(wireBuf);
+
+        if (cacheKey !== undefined && statusCode === 200) {
+          cache.set(cacheKey, { buffer: wireBuf, headers: outHeaders, status: statusCode }, cacheTtlMs);
+        }
       } catch (error) {
-        logger?.warn?.('[yima-shared-loopback] failed to slim session page response, passing through:', error);
+        logger?.warn?.('[yima-shared-loopback] failed to slim proxied response, passing through:', error);
         outHeaders['content-length'] = String(rawBuf.length);
         res.writeHead(statusCode, outHeaders);
         res.end(rawBuf);
@@ -1021,7 +1337,7 @@ function proxySlimSessionPage(req, res, { upstreamPort, slimConfig, compressionL
   });
 
   upstreamReq.on('error', (error) => {
-    logger?.warn?.('[yima-shared-loopback] upstream session page proxy error:', error);
+    logger?.warn?.('[yima-shared-loopback] upstream proxy error:', error);
     if (!res.headersSent) {
       res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
       res.end('bad gateway');
@@ -1030,7 +1346,93 @@ function proxySlimSessionPage(req, res, { upstreamPort, slimConfig, compressionL
     }
   });
 
-  req.pipe(upstreamReq);
+  if (requestBody !== undefined) upstreamReq.end(requestBody);
+  else req.pipe(upstreamReq);
+}
+
+/**
+ * Proxy one static client payload (JS/CSS bundle). These are immutable and
+ * text-shaped, so the proxy re-encodes them with brotli once and keeps the
+ * encoded body in memory.
+ */
+async function proxyCompressedAsset(req, res, {
+  upstreamPort, slimConfig, logger, logStats, cache,
+}) {
+  const cacheKey = `asset:${req.url}`;
+  const cached = cache.get(cacheKey);
+  if (cached !== undefined) {
+    const headers = { ...cached.headers, 'content-length': String(cached.buffer.length) };
+    res.writeHead(cached.status, headers);
+    res.end(cached.buffer);
+    return;
+  }
+
+  const headers = { ...req.headers };
+  headers['accept-encoding'] = 'identity';
+  delete headers['connection'];
+
+  const upstreamReq = httpRequest({
+    hostname: '127.0.0.1',
+    port: upstreamPort,
+    path: req.url,
+    method: 'GET',
+    headers,
+  }, (upstreamRes) => {
+    const chunks = [];
+    upstreamRes.on('data', (chunk) => chunks.push(chunk));
+    upstreamRes.on('end', () => {
+      const rawBuf = Buffer.concat(chunks);
+      const statusCode = upstreamRes.statusCode ?? 200;
+      const outHeaders = { ...upstreamRes.headers };
+      delete outHeaders['transfer-encoding'];
+
+      if (statusCode !== 200) {
+        outHeaders['content-length'] = String(rawBuf.length);
+        res.writeHead(statusCode, outHeaders);
+        res.end(rawBuf);
+        return;
+      }
+
+      try {
+        const encoding = String(outHeaders['content-encoding'] ?? '').toLowerCase();
+        const plainBuf = encoding === 'gzip' ? gunzipSync(rawBuf) : rawBuf;
+        const { buffer: wireBuf, encoding: wireEncoding } = encodePayload(plainBuf, req, slimConfig, 6);
+        if (wireEncoding === undefined) delete outHeaders['content-encoding'];
+        else outHeaders['content-encoding'] = wireEncoding;
+        outHeaders['content-length'] = String(wireBuf.length);
+        res.writeHead(statusCode, outHeaders);
+        res.end(wireBuf);
+
+        if (logStats && wireEncoding !== undefined) {
+          const pct = plainBuf.length > 0
+            ? (((plainBuf.length - wireBuf.length) / plainBuf.length) * 100).toFixed(1)
+            : '0.0';
+          const msg = `[yima-shared-loopback] ${req.url}: ${(plainBuf.length / 1024).toFixed(1)} KB -> ${(wireBuf.length / 1024).toFixed(1)} KB (${pct}% saved)`;
+          if (logger?.info) logger.info(msg);
+          else console.log(msg);
+        }
+
+        cache.set(cacheKey, { buffer: wireBuf, headers: outHeaders, status: statusCode }, slimConfig.assetCacheTtlMs);
+      } catch (error) {
+        logger?.warn?.('[yima-shared-loopback] failed to compress asset, passing through:', error);
+        outHeaders['content-length'] = String(rawBuf.length);
+        res.writeHead(statusCode, outHeaders);
+        res.end(rawBuf);
+      }
+    });
+  });
+
+  upstreamReq.on('error', (error) => {
+    logger?.warn?.('[yima-shared-loopback] upstream asset proxy error:', error);
+    if (!res.headersSent) {
+      res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('bad gateway');
+    } else {
+      res.destroy();
+    }
+  });
+
+  upstreamReq.end();
 }
 
 export function apply(ctx, config = {}) {
@@ -1092,19 +1494,42 @@ export function apply(ctx, config = {}) {
     const authority = `${host}:${port}`;
     const sockets = new Set();
     const peerReleases = new Set();
+    const responseCache = new SlimResponseCache();
 
     const server = createServer((req, res) => {
-      if (slimConfig.enabled && req.method === 'POST' && SLIM_HTTP_PATHS.has(readPathname(req.url))) {
-        const upstreamPort = readUpstreamPort(carrier);
-        if (upstreamPort !== undefined) {
-          proxySlimSessionPage(req, res, {
-            upstreamPort,
-            slimConfig,
-            compressionLevel,
-            logger: ctx.logger,
-            logStats,
-          });
-          return;
+      const pathname = readPathname(req.url);
+      if (slimConfig.enabled) {
+        const route = SLIM_HTTP_ROUTES.get(pathname);
+        if (route !== undefined && route.methods.includes(req.method)) {
+          const upstreamPort = readUpstreamPort(carrier);
+          if (upstreamPort !== undefined) {
+            void proxySlimHttp(req, res, {
+              upstreamPort,
+              slimConfig,
+              compressionLevel,
+              logger: ctx.logger,
+              logStats,
+              route,
+              cache: responseCache,
+            });
+            return;
+          }
+        }
+        if (slimConfig.compressAssets
+            && req.method === 'GET'
+            && acceptsEncoding(req, 'br')
+            && COMPRESSIBLE_ASSET_PREFIXES.some((prefix) => pathname.startsWith(prefix))) {
+          const upstreamPort = readUpstreamPort(carrier);
+          if (upstreamPort !== undefined) {
+            void proxyCompressedAsset(req, res, {
+              upstreamPort,
+              slimConfig,
+              logger: ctx.logger,
+              logStats,
+              cache: responseCache,
+            });
+            return;
+          }
         }
       }
       upstream.emit('request', req, res);

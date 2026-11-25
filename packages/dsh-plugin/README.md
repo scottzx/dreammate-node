@@ -142,9 +142,32 @@ slimming on `/api/remote.mux` (`session/follow`, `session/observeEvent`) and
 `POST /api/session/page` / `/api/session/events`: user and assistant message
 blocks stay intact, tool calls keep only their tool name, tool outputs/meta and
 redundant replay streams are omitted, WebSocket deflate level is raised to 6,
-and the heartbeat interval is widened to 15s. Set `slim: false` in `config` to
-disable slimming and fall back to transparent passthrough. The local Electron
-desktop UI never traverses this listener and stays 100% untouched.
+and the heartbeat interval is widened to 15s. The initial history window is
+clamped to 200 messages and asks for at least 50 messages across two turns, so
+a phone keeps a readable slice of a long conversation without letting one
+session ship its whole history in a single frame. Measured on the six longest
+sessions of a real profile, the first frame stays between 30 KB and 187 KB on
+the wire. Set `slim: false` in `config` to disable slimming and fall back to
+transparent passthrough. The local Electron desktop UI never traverses this
+listener and stays 100% untouched.
+
+The first-frame list endpoints are slimmed on the same entry:
+`POST /api/session/list` drops the per-row projection keys the remote list view
+never renders (the live control stream re-supplies them when a session is
+opened), and `POST /api/commands/list` drops the prose of every descriptor and
+is cached for 30s, so a reconnect storm — the client re-pulls the whole command
+table for every session key on every reconnect — costs no upstream work.
+
+Because the DSH web server only emits gzip, this entry re-encodes its own
+responses with brotli when the client accepts it, and keeps the immutable
+client bundles (`/assets/`, `/plugins/`) brotli-compressed in memory. Measured
+against the live desktop server, the plugin client bundle drops from 1600.5 KB
+(gzip) to 1164.0 KB and the session list from 117.5 KB to 72.4 KB.
+
+New knobs (all inside `config.slim`): `slimSessionList`, `slimCommandList`,
+`dropSessionListValues`, `maxCommandDescriptionChars`, `maxCommandHintChars`,
+`commandListCacheTtlMs`, `httpCompression` (`auto` | `gzip` | `brotli` |
+`none`), `brotliQuality`, `compressAssets`, `assetCacheTtlMs`.
 
 ## Development
 

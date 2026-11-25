@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.22.0 — 2026-11-25
+
+- Widen the remote history window: the initial follow frame now asks for at least 50 messages across two turns, with a 200-message cap, so a phone keeps a readable slice of a long conversation. Measured on the six longest sessions of a real profile, the first frame lands between 30 KB and 187 KB on the wire. Tool outputs stay dropped — the widening only buys message text, never the payloads that made the old frames large.
+- Slim the remote first-frame list endpoints on the shared loopback entry: `POST /api/session/list` drops the per-row projection keys the remote list view never renders (measured 117.5 KB → 80.8 KB gzip, titles and session ids unchanged across all 1050 rows), and `POST /api/commands/list` drops descriptor prose and is cached for 30s so a reconnect storm costs no upstream work.
+- Re-encode proxied responses with brotli when the client accepts it (the DSH web server only emits gzip) and keep the immutable client bundles (`/assets/`, `/plugins/`) brotli-compressed in memory. Measured against the live desktop server: plugin client bundle 1600.5 KB → 1164.0 KB, session list 117.5 KB → 72.4 KB.
+- Keep the new behaviour off the desktop path: the local Electron UI never traverses this listener, and `slim: false` still falls back to transparent passthrough.
+
 ## 0.21.0 — 2026-11-25
 
 - Export `@1agents/dreammate-node/yima-tailnet-trust` and `@1agents/dreammate-node/yima-shared-loopback` as clean package subpaths and reference them in `vendor/dsh/cordis.patch.yml` so DSH displays clean module specifiers instead of local `file://` URLs.

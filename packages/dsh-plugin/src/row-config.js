@@ -132,8 +132,30 @@ export function validateRowConfig(rowId, raw) {
       'stripRequestHeaderTools',
       'dropCompactionRawOutput',
       'slimLiveToolDeltas',
+      'slimSessionList',
+      'slimCommandList',
+      'compressAssets',
     ]) {
       if (typeof raw.slim[key] === 'boolean') slim[key] = raw.slim[key];
+    }
+    for (const key of ['maxCommandDescriptionChars', 'maxCommandHintChars', 'commandListCacheTtlMs', 'brotliQuality', 'assetCacheTtlMs']) {
+      if (raw.slim[key] === undefined || raw.slim[key] === '') continue;
+      const v = Number(raw.slim[key]);
+      if (!Number.isSafeInteger(v) || v < 0) {
+        throw new Error(`slim.${key} 必须是 0 以上的整数`);
+      }
+      slim[key] = v;
+    }
+    if (raw.slim.httpCompression !== undefined && raw.slim.httpCompression !== '') {
+      const mode = String(raw.slim.httpCompression);
+      if (!['auto', 'gzip', 'brotli', 'none'].includes(mode)) {
+        throw new Error('slim.httpCompression 必须是 auto、gzip、brotli 或 none');
+      }
+      slim.httpCompression = mode;
+    }
+    if (Array.isArray(raw.slim.dropSessionListValues)) {
+      const keys = raw.slim.dropSessionListValues.filter((item) => typeof item === 'string' && item.length > 0);
+      slim.dropSessionListValues = keys;
     }
     if (Object.keys(slim).length > 0) next.slim = slim;
   }

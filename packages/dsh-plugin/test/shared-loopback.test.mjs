@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createServer } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
+import { brotliDecompressSync, gunzipSync } from 'node:zlib';
 import {
   DEFAULT_SLIM_CONFIG,
   apply,
@@ -8,8 +9,10 @@ import {
   loadWsModule,
   name,
   rewriteFollowOpenPayload,
+  slimCommandsListResponse,
   slimFollowFrame,
   slimSessionEvent,
+  slimSessionListResponse,
 } from '../yima-shared-loopback.mjs';
 
 function assertDshWireEventValid(event) {
@@ -58,8 +61,8 @@ test('rewriteFollowOpenPayload clamps session/follow window without mutating inp
   };
   const next = rewriteFollowOpenPayload(original, DEFAULT_SLIM_CONFIG);
   assert.deepEqual(Object.keys(next), ['args']);
-  assert.equal(next.args.request.maxMessages, 24);
-  assert.deepEqual(next.args.request.turnWindow, { minMessages: 12, minTurns: 1 });
+  assert.equal(next.args.request.maxMessages, 200);
+  assert.deepEqual(next.args.request.turnWindow, { minMessages: 50, minTurns: 2 });
   assert.equal(original.args.request.maxMessages, 500);
 });
 
@@ -239,6 +242,212 @@ test('slimFollowFrame keeps live text deltas and trims tool argument deltas', ()
   assert.equal(slimmed.frame.chunk.argumentsDelta, '');
 });
 
+test('slimSessionListResponse drops the configured projection values and keeps the rest', () => {
+  const body = {
+    type: 'server-response',
+    rpcId: 'rpc-1',
+    result: {
+      ok: true,
+      value: {
+        items: [
+          {
+            sessionId: 'session-1',
+            updatedAt: 1,
+            cwd: '/tmp/one',
+            projections: {
+              kind: 'cached',
+              asOfSeq: 3,
+              values: {
+                title: 'kept title',
+                tokenUsage: { uncachedInputTokens: 123456 },
+                workingDirectory: '/tmp/one',
+                modelSelection: { lastUsed: { provider: 'magpie', model: 'group/daily-choice' } },
+                permissions: { currentValue: 'workspace-write' },
+              },
+            },
+          },
+        ],
+      },
+    },
+  };
+
+  const { body: slimmed, changed } = slimSessionListResponse(body);
+  assert.equal(changed, true);
+  const values = slimmed.result.value.items[0].projections.values;
+  assert.equal(values.title, 'kept title');
+  assert.equal(values.permissions.currentValue, 'workspace-write');
+  assert.equal(Object.hasOwn(values, 'tokenUsage'), false);
+  assert.equal(Object.hasOwn(values, 'workingDirectory'), false);
+  assert.equal(Object.hasOwn(values, 'modelSelection'), false);
+  assert.equal(slimmed.result.value.items[0].sessionId, 'session-1');
+  // The original payload stays untouched.
+  assert.equal(body.result.value.items[0].projections.values.tokenUsage.uncachedInputTokens, 123456);
+
+  const untouched = slimSessionListResponse({ result: { ok: true, value: { items: [] } } });
+  assert.equal(untouched.changed, false);
+});
+
+test('slimCommandsListResponse trims prose but keeps command identity', () => {
+  const body = {
+    type: 'server-response',
+    rpcId: 'rpc-1',
+    result: {
+      ok: true,
+      value: [
+        {
+          definitionId: '@deepseek-ai/dsh-command-compact',
+          name: 'compact',
+          description: 'x'.repeat(500),
+          input: { hint: 'y'.repeat(500), attachments: false },
+        },
+      ],
+    },
+  };
+
+  const { body: slimmed, changed } = slimCommandsListResponse(body);
+  assert.equal(changed, true);
+  const entry = slimmed.result.value[0];
+  assert.equal(entry.name, 'compact');
+  assert.equal(entry.definitionId, '@deepseek-ai/dsh-command-compact');
+  assert.equal(entry.description.length, DEFAULT_SLIM_CONFIG.maxCommandDescriptionChars + 1);
+  assert.equal(entry.input.hint.length, DEFAULT_SLIM_CONFIG.maxCommandHintChars + 1);
+  assert.equal(entry.input.attachments, false);
+});
+
+function requestRaw(port, pathname, { method = 'GET', headers = {}, body } = {}) {
+  return new Promise((resolve, reject) => {
+    const req = httpRequest({
+      hostname: '127.0.0.1',
+      port,
+      path: pathname,
+      method,
+      headers,
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => resolve({
+        status: res.statusCode,
+        headers: res.headers,
+        body: Buffer.concat(chunks),
+      }));
+    });
+    req.on('error', reject);
+    if (body !== undefined) req.end(body);
+    else req.end();
+  });
+}
+
+test('apply slims the list routes, serves brotli and caches the command table', async (t) => {
+  const upstreamServer = createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => {
+      if (req.url === '/api/session/list') {
+        const body = Buffer.from(JSON.stringify({
+          type: 'server-response',
+          rpcId: 'rpc-1',
+          result: {
+            ok: true,
+            value: {
+              items: [
+                {
+                  sessionId: 'session-1',
+                  cwd: '/tmp/one',
+                  projections: {
+                    kind: 'cached',
+                    asOfSeq: 1,
+                    values: {
+                      title: 'kept title',
+                      tokenUsage: { uncachedInputTokens: 123456 },
+                      workingDirectory: '/tmp/one',
+                      permissions: { currentValue: 'workspace-write', note: 'n'.repeat(600) },
+                    },
+                  },
+                },
+              ],
+            },
+          },
+        }), 'utf8');
+        res.writeHead(200, { 'content-type': 'application/json', 'content-length': String(body.length) });
+        res.end(body);
+        return;
+      }
+      if (req.url === '/api/commands/list') {
+        upstreamHits.commands += 1;
+        const body = Buffer.from(JSON.stringify({
+          type: 'server-response',
+          rpcId: 'rpc-1',
+          result: {
+            ok: true,
+            value: Array.from({ length: 5 }, (_, index) => ({
+              definitionId: `d${index}`,
+              name: `command-${index}`,
+              description: 'z'.repeat(400),
+            })),
+          },
+        }), 'utf8');
+        res.writeHead(200, { 'content-type': 'application/json', 'content-length': String(body.length) });
+        res.end(body);
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('ok');
+    });
+  });
+  const upstreamHits = { commands: 0 };
+  await new Promise((resolve) => upstreamServer.listen(0, '127.0.0.1', resolve));
+
+  const ctx = {
+    logger: { info() {}, warn() {} },
+    connection: {
+      trustedHosts: [],
+      admitConnection(req) {
+        return { peer: { id: 'p1', ctx: { effect: () => () => {} } }, release: async () => {} };
+      },
+    },
+    webServer: { protocol: 'http:', server: upstreamServer },
+    typertGateway: {},
+    effect: (fn) => fn(),
+  };
+
+  const probe = createServer();
+  await new Promise((resolve) => probe.listen(0, '127.0.0.1', resolve));
+  const port = probe.address().port;
+  await new Promise((resolve) => probe.close(resolve));
+
+  const dispose = await apply(ctx, { host: '127.0.0.1', port, logStats: false });
+  try {
+    const listRes = await requestRaw(port, '/api/session/list', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'accept-encoding': 'br' },
+      body: '{"type":"client-request","rpcId":"1","method":"session/list","payload":{"args":{"_request":{}}}}',
+    });
+    assert.equal(listRes.headers['content-encoding'], 'br');
+    const listJson = JSON.parse(brotliDecompressSync(listRes.body).toString('utf8'));
+    const values = listJson.result.value.items[0].projections.values;
+    assert.equal(values.title, 'kept title');
+    assert.equal(Object.hasOwn(values, 'tokenUsage'), false);
+    assert.equal(Object.hasOwn(values, 'workingDirectory'), false);
+
+    const commandBody = '{"type":"client-request","rpcId":"1","method":"commands/list","payload":{"args":{"agentId":"session-1"}}}';
+    const commandHeaders = { 'content-type': 'application/json', 'accept-encoding': 'gzip' };
+    const first = await requestRaw(port, '/api/commands/list', { method: 'POST', headers: commandHeaders, body: commandBody });
+    const firstBody = gunzipSync(first.body).toString('utf8');
+    assert.equal(first.headers['content-encoding'], 'gzip');
+    assert.equal(JSON.parse(firstBody).result.value[0].description.length, 201);
+    assert.equal(upstreamHits.commands, 1);
+
+    // A repeated identical pull inside the cache window costs no upstream work.
+    const second = await requestRaw(port, '/api/commands/list', { method: 'POST', headers: commandHeaders, body: commandBody });
+    const secondBody = gunzipSync(second.body).toString('utf8');
+    assert.equal(secondBody, firstBody);
+    assert.equal(upstreamHits.commands, 1);
+  } finally {
+    await dispose();
+    await new Promise((resolve) => upstreamServer.close(resolve));
+  }
+});
+
 test('apply slims /api/remote.mux WS and /api/session/page HTTP, and respects slim: false', async (t) => {
   const wsMod = await loadWsModule();
   if (!wsMod) {
@@ -360,8 +569,8 @@ test('apply slims /api/remote.mux WS and /api/session/page HTTP, and respects sl
     await done;
     ws.close();
 
-    assert.equal(capturedOpen.payload.args.request.maxMessages, 24);
-    assert.deepEqual(capturedOpen.payload.args.request.turnWindow, { minMessages: 12, minTurns: 1 });
+    assert.equal(capturedOpen.payload.args.request.maxMessages, 200);
+    assert.deepEqual(capturedOpen.payload.args.request.turnWindow, { minMessages: 50, minTurns: 2 });
     const snap = frames[0].value;
     assert.equal(snap.records[0].event.data.content[0].text, 'hello');
     assert.equal(snap.records[1].event.data.name, 'read_file');
