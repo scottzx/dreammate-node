@@ -62,7 +62,7 @@ test('rewriteFollowOpenPayload clamps session/follow window without mutating inp
   const next = rewriteFollowOpenPayload(original, DEFAULT_SLIM_CONFIG);
   assert.deepEqual(Object.keys(next), ['args']);
   assert.equal(next.args.request.maxMessages, 200);
-  assert.deepEqual(next.args.request.turnWindow, { minMessages: 50, minTurns: 2 });
+  assert.deepEqual(next.args.request.turnWindow, { minMessages: 50, minTurns: 1 });
   assert.equal(original.args.request.maxMessages, 500);
 });
 
@@ -570,7 +570,7 @@ test('apply slims /api/remote.mux WS and /api/session/page HTTP, and respects sl
     ws.close();
 
     assert.equal(capturedOpen.payload.args.request.maxMessages, 200);
-    assert.deepEqual(capturedOpen.payload.args.request.turnWindow, { minMessages: 50, minTurns: 2 });
+    assert.deepEqual(capturedOpen.payload.args.request.turnWindow, { minMessages: 50, minTurns: 1 });
     const snap = frames[0].value;
     assert.equal(snap.records[0].event.data.content[0].text, 'hello');
     assert.equal(snap.records[1].event.data.name, 'read_file');
@@ -595,6 +595,180 @@ test('apply slims /api/remote.mux WS and /api/session/page HTTP, and respects sl
     assert.equal(rawJson.result.value.records[1].event.data.message.content[0].text.length, 10_000);
   } finally {
     await disposePlain();
+    await new Promise((resolve) => upstreamServer.close(resolve));
+  }
+});
+
+test('loopback cache isolates encodings, enforces admit auth, bumps upstream keepAliveTimeout, and handles asset ETag/no-store', async () => {
+  const hits = { commands: 0, immutableAsset: 0, noStoreAsset: 0 };
+  const upstreamServer = createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => {
+      if (req.url === '/api/commands/list') {
+        hits.commands += 1;
+        const body = Buffer.from(JSON.stringify({
+          type: 'server-response',
+          rpcId: 'rpc-1',
+          result: {
+            ok: true,
+            value: Array.from({ length: 4 }, (_, i) => ({
+              definitionId: `d${i}`,
+              name: `cmd-${i}`,
+              description: 'a'.repeat(400),
+            })),
+          },
+        }), 'utf8');
+        res.writeHead(200, { 'content-type': 'application/json', 'content-length': String(body.length) });
+        res.end(body);
+        return;
+      }
+      if (req.url === '/assets/app-123.js') {
+        hits.immutableAsset += 1;
+        const body = Buffer.from(`console.log(${JSON.stringify('x'.repeat(2000))});`, 'utf8');
+        res.writeHead(200, {
+          'content-type': 'application/javascript',
+          'cache-control': 'no-cache',
+          etag: 'W/"abc123"',
+          'content-length': String(body.length),
+        });
+        res.end(body);
+        return;
+      }
+      if (req.url === '/plugins/live/client.js') {
+        hits.noStoreAsset += 1;
+        const body = Buffer.from(`window.__v=${hits.noStoreAsset};${'y'.repeat(1000)}`, 'utf8');
+        res.writeHead(200, {
+          'content-type': 'application/javascript',
+          'cache-control': 'no-store',
+          'content-length': String(body.length),
+        });
+        res.end(body);
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+  });
+  await new Promise((resolve) => upstreamServer.listen(0, '127.0.0.1', resolve));
+  const initialKeepAlive = upstreamServer.keepAliveTimeout;
+
+  const ctx = {
+    logger: { info() {}, warn() {} },
+    connection: {
+      trustedHosts: [],
+      admit(req) {
+        if (req.headers.cookie !== 'dsh-auth=ok') return { rejection: 401 };
+        return { peer: { id: 'p1' } };
+      },
+      admitConnection() {
+        return { peer: { id: 'p1', ctx: { effect: () => () => {} } }, release: async () => {} };
+      },
+    },
+    webServer: { protocol: 'http:', server: upstreamServer },
+    typertGateway: {},
+    effect: (fn) => fn(),
+  };
+
+  const probe = createServer();
+  await new Promise((resolve) => probe.listen(0, '127.0.0.1', resolve));
+  const port = probe.address().port;
+  await new Promise((resolve) => probe.close(resolve));
+
+  const dispose = await apply(ctx, { host: '127.0.0.1', port, logStats: false });
+  try {
+    // Shared upstream keepAliveTimeout is raised above Node's 5s default.
+    assert.ok(upstreamServer.keepAliveTimeout >= 65_000);
+
+    const cmdBody = '{"type":"client-request","rpcId":"1","method":"commands/list","payload":{"args":{}}}';
+    // Prime cache with gzip (authenticated).
+    const gzRes = await requestRaw(port, '/api/commands/list', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'accept-encoding': 'gzip', cookie: 'dsh-auth=ok' },
+      body: cmdBody,
+    });
+    assert.equal(gzRes.status, 200);
+    assert.equal(gzRes.headers['content-encoding'], 'gzip');
+    assert.match(String(gzRes.headers.vary ?? ''), /Accept-Encoding/i);
+    assert.equal(hits.commands, 1);
+
+    // Unauthenticated caller must NOT receive the cached response.
+    const unauthRes = await requestRaw(port, '/api/commands/list', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'accept-encoding': 'gzip' },
+      body: cmdBody,
+    });
+    assert.equal(unauthRes.status, 401);
+    assert.equal(hits.commands, 1);
+
+    // A brotli client must not receive the cached gzip entry.
+    const brRes = await requestRaw(port, '/api/commands/list', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'accept-encoding': 'br', cookie: 'dsh-auth=ok' },
+      body: cmdBody,
+    });
+    assert.equal(brRes.status, 200);
+    assert.equal(brRes.headers['content-encoding'], 'br');
+    const brJson = JSON.parse(brotliDecompressSync(brRes.body).toString('utf8'));
+    assert.equal(brJson.result.value[0].description.length, 201);
+    assert.equal(hits.commands, 2);
+
+    // Asset brotli caching + ETag 304 fast-path.
+    const asset1 = await requestRaw(port, '/assets/app-123.js', { headers: { 'accept-encoding': 'br' } });
+    assert.equal(asset1.status, 200);
+    assert.equal(asset1.headers['content-encoding'], 'br');
+    assert.equal(hits.immutableAsset, 1);
+    const asset304 = await requestRaw(port, '/assets/app-123.js', {
+      headers: { 'accept-encoding': 'br', 'if-none-match': 'W/"abc123"' },
+    });
+    assert.equal(asset304.status, 304);
+    assert.equal(hits.immutableAsset, 1);
+
+    // Cache-Control: no-store assets must never be served stale from memory.
+    const live1 = await requestRaw(port, '/plugins/live/client.js', { headers: { 'accept-encoding': 'br' } });
+    const live2 = await requestRaw(port, '/plugins/live/client.js', { headers: { 'accept-encoding': 'br' } });
+    assert.equal(hits.noStoreAsset, 2);
+    assert.notEqual(
+      brotliDecompressSync(live1.body).toString('utf8'),
+      brotliDecompressSync(live2.body).toString('utf8'),
+    );
+  } finally {
+    await dispose();
+    assert.equal(upstreamServer.keepAliveTimeout, initialKeepAlive);
+    await new Promise((resolve) => upstreamServer.close(resolve));
+  }
+});
+
+test('formats IPv6 loopback authority with brackets in trustedHosts', async (t) => {
+  const upstreamServer = createServer((_req, res) => { res.end('ok'); });
+  try {
+    await new Promise((resolve, reject) => {
+      upstreamServer.once('error', reject);
+      upstreamServer.listen(0, '::1', resolve);
+    });
+  } catch {
+    t.skip('IPv6 loopback unavailable in this environment');
+    return;
+  }
+  const probe = createServer();
+  await new Promise((resolve) => probe.listen(0, '::1', resolve));
+  const port = probe.address().port;
+  await new Promise((resolve) => probe.close(resolve));
+
+  const ctx = {
+    logger: { info() {}, warn() {} },
+    connection: { trustedHosts: [] },
+    webServer: { protocol: 'http:', server: upstreamServer },
+    typertGateway: {},
+    effect: (fn) => fn(),
+  };
+
+  const dispose = await apply(ctx, { host: '::1', port, logStats: false });
+  try {
+    assert.ok(ctx.connection.trustedHosts.includes(`[::1]:${port}`));
+  } finally {
+    await dispose();
+    assert.equal(ctx.connection.trustedHosts.includes(`[::1]:${port}`), false);
     await new Promise((resolve) => upstreamServer.close(resolve));
   }
 });

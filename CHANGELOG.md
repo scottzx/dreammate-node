@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.22.1 — 2026-11-26
+
+- Harden the shared loopback adapter (`yima-shared-loopback.mjs`) so remote traffic cannot stall the shared desktop host event loop: move brotli/gzip/gunzip compression off the main thread onto libuv worker threads and remove the redundant raw-snapshot `JSON.stringify` in `session/follow` stats logging.
+- Eliminate 5-second HTTP keep-alive half-close races (`ECONNRESET` / 502) by raising `keepAliveTimeout` / `headersTimeout` to `65s / 66s` on both the loopback listener and the shared upstream DSH HTTP server (restoring upstream values on dispose), using non-pooled loopback requests with 30s timeout and client-abort cleanup for internal proxy hops.
+- Tighten loopback cache and protocol boundaries: enforce `connection.admit(req)` before serving cached `/api/commands/list` entries, include negotiated encoding in cache keys with `Vary: Accept-Encoding`, honor `If-None-Match` 304 and `Cache-Control: no-store` on static assets, format IPv6 loopback authorities with brackets (`[::1]:port`), and guard WebSocket peer release against double invocation.
+- Tighten default `slim.minTurns` from `2` to `1` in both `yima-shared-loopback.mjs` and the DSH row-config panel (`client.js`) to keep ultra-long multi-step turns lean on remote links.
+
 ## 0.22.0 — 2026-11-25
 
 - Widen the remote history window: the initial follow frame now asks for at least 50 messages across two turns, with a 200-message cap, so a phone keeps a readable slice of a long conversation. Measured on the six longest sessions of a real profile, the first frame lands between 30 KB and 187 KB on the wire. Tool outputs stay dropped — the widening only buys message text, never the payloads that made the old frames large.

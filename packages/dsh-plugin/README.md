@@ -143,7 +143,7 @@ slimming on `/api/remote.mux` (`session/follow`, `session/observeEvent`) and
 blocks stay intact, tool calls keep only their tool name, tool outputs/meta and
 redundant replay streams are omitted, WebSocket deflate level is raised to 6,
 and the heartbeat interval is widened to 15s. The initial history window is
-clamped to 200 messages and asks for at least 50 messages across two turns, so
+clamped to 200 messages and asks for at least 50 messages across one turn, so
 a phone keeps a readable slice of a long conversation without letting one
 session ship its whole history in a single frame. Measured on the six longest
 sessions of a real profile, the first frame stays between 30 KB and 187 KB on

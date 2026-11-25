@@ -31,7 +31,12 @@ import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { brotliCompressSync, constants as zlibConstants, gunzipSync, gzipSync } from 'node:zlib';
+import { promisify } from 'node:util';
+import { brotliCompress, constants as zlibConstants, gunzip, gzip } from 'node:zlib';
+
+const brotliCompressAsync = promisify(brotliCompress);
+const gzipAsync = promisify(gzip);
+const gunzipAsync = promisify(gunzip);
 
 export const name = 'yima-shared-loopback';
 export const inject = ['connection', 'webServer', 'typertGateway'];
@@ -56,6 +61,11 @@ const DEFAULT_BROTLI_QUALITY = 4;
 const COMPRESS_THRESHOLD_BYTES = 512;
 const MAX_CACHED_REQUEST_BYTES = 65_536;
 const MAX_ASSET_CACHE_BYTES = 64 * 1024 * 1024;
+// Keep HTTP keep-alive comfortably above reverse-proxy (Tailscale Serve / Electron fetch)
+// idle windows so Node's 5s default never races a pooled connection reuse with ECONNRESET.
+const DEFAULT_SERVER_KEEP_ALIVE_TIMEOUT_MS = 65_000;
+const DEFAULT_SERVER_HEADERS_TIMEOUT_MS = 66_000;
+const DEFAULT_UPSTREAM_TIMEOUT_MS = 30_000;
 
 export const DEFAULT_SLIM_CONFIG = Object.freeze({
   enabled: true,
@@ -68,7 +78,7 @@ export const DEFAULT_SLIM_CONFIG = Object.freeze({
   // the host stops at the first Turn boundary after both minima, so the
   // message cap above only ever acts as a safety net.
   minMessages: 50,
-  minTurns: 2,
+  minTurns: 1,
   // Strip tool call arguments so the UI displays only the tool name.
   stripToolArguments: true,
   // Omit tool/result output body & meta (keep error indicator when isError=true).
@@ -1028,7 +1038,13 @@ class SlimMuxConnection {
       );
       for await (const rawValue of source) {
         const value = this.transformFrame(endpoint, rawValue);
-        await this.send({ type: 'item', streamId, value });
+        const sentBytes = await this.send({ type: 'item', streamId, value });
+        if (this.logStats && endpoint === 'session/follow' && value && typeof value === 'object' && value.type === 'snapshot') {
+          const count = Array.isArray(value.records) ? value.records.length : 0;
+          const msg = `[yima-shared-loopback] session/follow snapshot (${count} records): ${(sentBytes / 1024).toFixed(1)} KB on wire`;
+          if (this.logger?.info) this.logger.info(msg);
+          else console.log(msg);
+        }
       }
       outcome = { failed: false };
     } catch (error) {
@@ -1056,17 +1072,7 @@ class SlimMuxConnection {
 
   transformFrame(endpoint, value) {
     if (endpoint === 'session/follow') {
-      const slimmed = slimFollowFrame(value, this.slimConfig);
-      if (this.logStats && value && typeof value === 'object' && value.type === 'snapshot') {
-        const rawBytes = Buffer.byteLength(JSON.stringify(value), 'utf8');
-        const slimBytes = Buffer.byteLength(JSON.stringify(slimmed), 'utf8');
-        const pct = rawBytes > 0 ? (((rawBytes - slimBytes) / rawBytes) * 100).toFixed(1) : '0.0';
-        const count = Array.isArray(value.records) ? value.records.length : 0;
-        const msg = `[yima-shared-loopback] session/follow snapshot (${count} records): ${(rawBytes / 1024).toFixed(1)} KB -> ${(slimBytes / 1024).toFixed(1)} KB (${pct}% saved)`;
-        if (this.logger?.info) this.logger.info(msg);
-        else console.log(msg);
-      }
-      return slimmed;
+      return slimFollowFrame(value, this.slimConfig);
     }
     if (endpoint === 'session/observeEvent' && value && typeof value === 'object' && value.type === 'event') {
       const nextEvent = slimSessionEvent(value.event, this.slimConfig);
@@ -1091,6 +1097,7 @@ class SlimMuxConnection {
     } catch (cause) {
       return Promise.reject(new Error('yima-shared-loopback: stream item is not JSON serializable', { cause }));
     }
+    const byteLength = Buffer.byteLength(text, 'utf8');
     const delivery = this.writes.then(() => new Promise((resolve, reject) => {
       if (this.socket.readyState !== this.WebSocket.OPEN) {
         reject(new Error('yima-shared-loopback: Remote stream socket is closed'));
@@ -1105,13 +1112,17 @@ class SlimMuxConnection {
           return;
         }
         if (queued) this.alive();
-        resolve();
+        resolve(byteLength);
       });
       queued = this.socket.bufferedAmount > 0;
     }));
     this.writes = delivery.catch(() => undefined);
     return delivery;
   }
+}
+
+function formatAuthority(host, port) {
+  return host.includes(':') ? `[${host}]:${port}` : `${host}:${port}`;
 }
 
 function readPathname(url) {
@@ -1122,12 +1133,19 @@ function readPathname(url) {
   }
 }
 
-function readUpstreamPort(carrier) {
+function readUpstreamTarget(carrier) {
   const addr = carrier?.server?.address?.();
   if (addr && typeof addr === 'object' && Number.isInteger(addr.port) && addr.port > 0) {
-    return addr.port;
+    let host = typeof addr.address === 'string' && addr.address.length > 0
+      ? addr.address
+      : (carrier?.host ?? '127.0.0.1');
+    if (host === '0.0.0.0') host = '127.0.0.1';
+    else if (host === '::') host = '::1';
+    return { host, port: addr.port };
   }
-  if (Number.isInteger(carrier?.port) && carrier.port > 0) return carrier.port;
+  if (Number.isInteger(carrier?.port) && carrier.port > 0) {
+    return { host: carrier?.host ?? '127.0.0.1', port: carrier.port };
+  }
   return undefined;
 }
 
@@ -1139,17 +1157,38 @@ function acceptsEncoding(req, encoding) {
   return new RegExp(`\\b${encoding}\\b`).test(readAcceptEncoding(req));
 }
 
-/**
- * Encode one payload for the wire. The DSH web server only knows gzip, so a
- * brotli-capable client is served a brotli body from here; gzip stays the
- * fallback and identity is the last resort.
- */
-function encodePayload(payload, req, slimConfig, compressionLevel) {
+function negotiateEncoding(req, slimConfig) {
   const mode = slimConfig.httpCompression;
-  if (mode !== 'none' && payload.length >= COMPRESS_THRESHOLD_BYTES) {
-    if (mode !== 'gzip' && acceptsEncoding(req, 'br')) {
+  if (mode === 'none') return 'identity';
+  if (mode !== 'gzip' && acceptsEncoding(req, 'br')) return 'br';
+  if (mode !== 'brotli' && acceptsEncoding(req, 'gzip')) return 'gzip';
+  return 'identity';
+}
+
+function appendVary(headers, token) {
+  const existing = headers['vary'];
+  if (!existing) {
+    headers['vary'] = token;
+    return;
+  }
+  const parts = String(existing).split(',').map((s) => s.trim()).filter(Boolean);
+  if (!parts.some((p) => p.toLowerCase() === token.toLowerCase())) {
+    parts.push(token);
+    headers['vary'] = parts.join(', ');
+  }
+}
+
+/**
+ * Encode one payload off the event loop (libuv thread pool). The DSH web server
+ * only knows gzip, so a brotli-capable client is served a brotli body from here;
+ * gzip stays the fallback and identity is the last resort.
+ */
+async function encodePayload(payload, req, slimConfig, compressionLevel) {
+  const target = negotiateEncoding(req, slimConfig);
+  if (target !== 'identity' && payload.length >= COMPRESS_THRESHOLD_BYTES) {
+    if (target === 'br') {
       return {
-        buffer: brotliCompressSync(payload, {
+        buffer: await brotliCompressAsync(payload, {
           params: {
             [zlibConstants.BROTLI_PARAM_QUALITY]: slimConfig.brotliQuality,
           },
@@ -1157,8 +1196,11 @@ function encodePayload(payload, req, slimConfig, compressionLevel) {
         encoding: 'br',
       };
     }
-    if (acceptsEncoding(req, 'gzip')) {
-      return { buffer: gzipSync(payload, { level: compressionLevel }), encoding: 'gzip' };
+    if (target === 'gzip') {
+      return {
+        buffer: await gzipAsync(payload, { level: compressionLevel }),
+        encoding: 'gzip',
+      };
     }
   }
   return { buffer: payload, encoding: undefined };
@@ -1211,11 +1253,13 @@ class SlimResponseCache {
   }
 }
 
-function requestCacheKey(req, body) {
+function requestCacheKey(req, body, encoding) {
   const hash = createHash('sha1');
   hash.update(String(req.method ?? 'GET'));
   hash.update('\n');
   hash.update(String(req.url ?? '/'));
+  hash.update('\n');
+  hash.update(encoding);
   if (body !== undefined) {
     hash.update('\n');
     hash.update(body);
@@ -1241,28 +1285,48 @@ function readRequestBody(req) {
   });
 }
 
+function writeProxyError(res, status, message) {
+  if (res.writableEnded || res.destroyed) return;
+  if (!res.headersSent) {
+    res.writeHead(status, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end(message);
+  } else {
+    res.destroy();
+  }
+}
+
 /**
  * Proxy one JSON route: fetch it from the upstream, apply the route's
- * transform, then encode the result for the client.
+ * transform, then encode the result off the event loop for the client.
  */
 async function proxySlimHttp(req, res, {
-  upstreamPort, slimConfig, compressionLevel, logger, logStats, route, cache,
+  upstreamTarget, connection, slimConfig, compressionLevel, logger, logStats, route, cache,
 }) {
   const transform = SLIM_TRANSFORMS[route.transform];
   const cacheTtlMs = route.cacheTtlMs ? slimConfig[route.cacheTtlMs] : 0;
+  const targetEncoding = negotiateEncoding(req, slimConfig);
   let requestBody;
   if (cacheTtlMs > 0) {
+    // Never serve cached RPC data to an unauthenticated or untrusted-Host caller.
+    if (typeof connection?.admit === 'function') {
+      const admission = connection.admit(req);
+      if ('rejection' in admission) {
+        writeProxyError(res, admission.rejection, admission.rejection === 401 ? 'unauthorized' : 'forbidden');
+        return;
+      }
+    }
     try {
       requestBody = await readRequestBody(req);
     } catch (error) {
       logger?.warn?.('[yima-shared-loopback] request body read failed:', error);
-      res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
-      res.end('bad gateway');
+      writeProxyError(res, 502, 'bad gateway');
       return;
     }
   }
 
-  const cacheKey = cacheTtlMs > 0 ? requestCacheKey(req, requestBody.toString('utf8')) : undefined;
+  const cacheKey = cacheTtlMs > 0
+    ? requestCacheKey(req, requestBody.toString('utf8'), targetEncoding)
+    : undefined;
   const cached = cacheKey === undefined ? undefined : cache.get(cacheKey);
   if (cached !== undefined) {
     const headers = { ...cached.headers, 'content-length': String(cached.buffer.length) };
@@ -1279,71 +1343,91 @@ async function proxySlimHttp(req, res, {
   }
 
   const upstreamReq = httpRequest({
-    hostname: '127.0.0.1',
-    port: upstreamPort,
+    hostname: upstreamTarget.host,
+    port: upstreamTarget.port,
     path: req.url,
     method: req.method,
     headers,
+    // Dedicated loopback socket avoids 5s keep-alive half-close ECONNRESET races
+    // against DSH's own http.Server and leaves zero lingering self-loopback FDs.
+    agent: false,
+    timeout: DEFAULT_UPSTREAM_TIMEOUT_MS,
   }, (upstreamRes) => {
     const chunks = [];
     upstreamRes.on('data', (chunk) => chunks.push(chunk));
+    upstreamRes.on('error', (error) => {
+      logger?.warn?.('[yima-shared-loopback] upstream response error:', error);
+      writeProxyError(res, 502, 'bad gateway');
+    });
     upstreamRes.on('end', () => {
-      const rawBuf = Buffer.concat(chunks);
-      const statusCode = upstreamRes.statusCode ?? 200;
-      const outHeaders = { ...upstreamRes.headers };
-      delete outHeaders['transfer-encoding'];
+      void (async () => {
+        if (res.destroyed || res.writableEnded) return;
+        const rawBuf = Buffer.concat(chunks);
+        const statusCode = upstreamRes.statusCode ?? 200;
+        const outHeaders = { ...upstreamRes.headers };
+        delete outHeaders['transfer-encoding'];
 
-      const contentType = String(outHeaders['content-type'] ?? '');
-      if (statusCode !== 200 || !contentType.includes('application/json')) {
-        outHeaders['content-length'] = String(rawBuf.length);
-        res.writeHead(statusCode, outHeaders);
-        res.end(rawBuf);
-        return;
-      }
-
-      try {
-        const encoding = String(outHeaders['content-encoding'] ?? '').toLowerCase();
-        const plainBuf = encoding === 'gzip' ? gunzipSync(rawBuf) : rawBuf;
-        const parsed = JSON.parse(plainBuf.toString('utf8'));
-        const { body, changed } = transform(parsed, slimConfig);
-        const outJsonBuf = changed ? Buffer.from(JSON.stringify(body), 'utf8') : plainBuf;
-
-        if (changed && logStats) {
-          const pct = plainBuf.length > 0
-            ? (((plainBuf.length - outJsonBuf.length) / plainBuf.length) * 100).toFixed(1)
-            : '0.0';
-          const msg = `[yima-shared-loopback] ${req.url}: ${(plainBuf.length / 1024).toFixed(1)} KB -> ${(outJsonBuf.length / 1024).toFixed(1)} KB (${pct}% saved)`;
-          if (logger?.info) logger.info(msg);
-          else console.log(msg);
+        const contentType = String(outHeaders['content-type'] ?? '');
+        if (statusCode !== 200 || !contentType.includes('application/json')) {
+          outHeaders['content-length'] = String(rawBuf.length);
+          res.writeHead(statusCode, outHeaders);
+          res.end(rawBuf);
+          return;
         }
 
-        const { buffer: wireBuf, encoding: wireEncoding } = encodePayload(outJsonBuf, req, slimConfig, compressionLevel);
-        if (wireEncoding === undefined) delete outHeaders['content-encoding'];
-        else outHeaders['content-encoding'] = wireEncoding;
-        outHeaders['content-length'] = String(wireBuf.length);
-        res.writeHead(statusCode, outHeaders);
-        res.end(wireBuf);
+        try {
+          const encoding = String(outHeaders['content-encoding'] ?? '').toLowerCase();
+          const plainBuf = encoding === 'gzip' ? await gunzipAsync(rawBuf) : rawBuf;
+          const parsed = JSON.parse(plainBuf.toString('utf8'));
+          const { body, changed } = transform(parsed, slimConfig);
+          const outJsonBuf = changed ? Buffer.from(JSON.stringify(body), 'utf8') : plainBuf;
 
-        if (cacheKey !== undefined && statusCode === 200) {
-          cache.set(cacheKey, { buffer: wireBuf, headers: outHeaders, status: statusCode }, cacheTtlMs);
+          if (changed && logStats) {
+            const pct = plainBuf.length > 0
+              ? (((plainBuf.length - outJsonBuf.length) / plainBuf.length) * 100).toFixed(1)
+              : '0.0';
+            const msg = `[yima-shared-loopback] ${req.url}: ${(plainBuf.length / 1024).toFixed(1)} KB -> ${(outJsonBuf.length / 1024).toFixed(1)} KB (${pct}% saved)`;
+            if (logger?.info) logger.info(msg);
+            else console.log(msg);
+          }
+
+          const { buffer: wireBuf, encoding: wireEncoding } = await encodePayload(outJsonBuf, req, slimConfig, compressionLevel);
+          if (res.destroyed || res.writableEnded) return;
+          if (wireEncoding === undefined) delete outHeaders['content-encoding'];
+          else outHeaders['content-encoding'] = wireEncoding;
+          appendVary(outHeaders, 'Accept-Encoding');
+          outHeaders['content-length'] = String(wireBuf.length);
+          res.writeHead(statusCode, outHeaders);
+          res.end(wireBuf);
+
+          if (cacheKey !== undefined && statusCode === 200) {
+            cache.set(cacheKey, { buffer: wireBuf, headers: outHeaders, status: statusCode }, cacheTtlMs);
+          }
+        } catch (error) {
+          logger?.warn?.('[yima-shared-loopback] failed to slim proxied response, passing through:', error);
+          if (res.destroyed || res.writableEnded) return;
+          outHeaders['content-length'] = String(rawBuf.length);
+          res.writeHead(statusCode, outHeaders);
+          res.end(rawBuf);
         }
-      } catch (error) {
-        logger?.warn?.('[yima-shared-loopback] failed to slim proxied response, passing through:', error);
-        outHeaders['content-length'] = String(rawBuf.length);
-        res.writeHead(statusCode, outHeaders);
-        res.end(rawBuf);
-      }
+      })();
     });
   });
 
+  const onClientClose = () => {
+    if (!res.writableEnded) upstreamReq.destroy();
+  };
+  res.once('close', onClientClose);
+  upstreamReq.once('close', () => { res.off('close', onClientClose); });
+
+  upstreamReq.on('timeout', () => {
+    upstreamReq.destroy(new Error('upstream request timed out'));
+  });
   upstreamReq.on('error', (error) => {
+    if (res.destroyed || res.writableEnded) return;
     logger?.warn?.('[yima-shared-loopback] upstream proxy error:', error);
-    if (!res.headersSent) {
-      res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
-      res.end('bad gateway');
-    } else {
-      res.destroy();
-    }
+    const status = error?.message === 'upstream request timed out' ? 504 : 502;
+    writeProxyError(res, status, status === 504 ? 'gateway timeout' : 'bad gateway');
   });
 
   if (requestBody !== undefined) upstreamReq.end(requestBody);
@@ -1351,16 +1435,25 @@ async function proxySlimHttp(req, res, {
 }
 
 /**
- * Proxy one static client payload (JS/CSS bundle). These are immutable and
- * text-shaped, so the proxy re-encodes them with brotli once and keeps the
- * encoded body in memory.
+ * Proxy one static client payload (JS/CSS bundle). These are revisioned or
+ * ETag-stamped, so the proxy re-encodes them with brotli off the event loop and
+ * keeps the encoded body in memory while honoring ETag 304 and `no-store`.
  */
 async function proxyCompressedAsset(req, res, {
-  upstreamPort, slimConfig, logger, logStats, cache,
+  upstreamTarget, slimConfig, logger, logStats, cache,
 }) {
-  const cacheKey = `asset:${req.url}`;
+  const targetEncoding = negotiateEncoding(req, slimConfig);
+  const cacheKey = `asset:${targetEncoding}:${req.url}`;
   const cached = cache.get(cacheKey);
   if (cached !== undefined) {
+    const ifNoneMatch = req.headers['if-none-match'];
+    if (ifNoneMatch && cached.headers.etag && ifNoneMatch === cached.headers.etag) {
+      const headers = { etag: cached.headers.etag, vary: cached.headers.vary ?? 'Accept-Encoding' };
+      if (cached.headers['cache-control']) headers['cache-control'] = cached.headers['cache-control'];
+      res.writeHead(304, headers);
+      res.end();
+      return;
+    }
     const headers = { ...cached.headers, 'content-length': String(cached.buffer.length) };
     res.writeHead(cached.status, headers);
     res.end(cached.buffer);
@@ -1372,64 +1465,85 @@ async function proxyCompressedAsset(req, res, {
   delete headers['connection'];
 
   const upstreamReq = httpRequest({
-    hostname: '127.0.0.1',
-    port: upstreamPort,
+    hostname: upstreamTarget.host,
+    port: upstreamTarget.port,
     path: req.url,
     method: 'GET',
     headers,
+    agent: false,
+    timeout: DEFAULT_UPSTREAM_TIMEOUT_MS,
   }, (upstreamRes) => {
     const chunks = [];
     upstreamRes.on('data', (chunk) => chunks.push(chunk));
+    upstreamRes.on('error', (error) => {
+      logger?.warn?.('[yima-shared-loopback] upstream asset response error:', error);
+      writeProxyError(res, 502, 'bad gateway');
+    });
     upstreamRes.on('end', () => {
-      const rawBuf = Buffer.concat(chunks);
-      const statusCode = upstreamRes.statusCode ?? 200;
-      const outHeaders = { ...upstreamRes.headers };
-      delete outHeaders['transfer-encoding'];
+      void (async () => {
+        if (res.destroyed || res.writableEnded) return;
+        const rawBuf = Buffer.concat(chunks);
+        const statusCode = upstreamRes.statusCode ?? 200;
+        const outHeaders = { ...upstreamRes.headers };
+        delete outHeaders['transfer-encoding'];
 
-      if (statusCode !== 200) {
-        outHeaders['content-length'] = String(rawBuf.length);
-        res.writeHead(statusCode, outHeaders);
-        res.end(rawBuf);
-        return;
-      }
-
-      try {
-        const encoding = String(outHeaders['content-encoding'] ?? '').toLowerCase();
-        const plainBuf = encoding === 'gzip' ? gunzipSync(rawBuf) : rawBuf;
-        const { buffer: wireBuf, encoding: wireEncoding } = encodePayload(plainBuf, req, slimConfig, 6);
-        if (wireEncoding === undefined) delete outHeaders['content-encoding'];
-        else outHeaders['content-encoding'] = wireEncoding;
-        outHeaders['content-length'] = String(wireBuf.length);
-        res.writeHead(statusCode, outHeaders);
-        res.end(wireBuf);
-
-        if (logStats && wireEncoding !== undefined) {
-          const pct = plainBuf.length > 0
-            ? (((plainBuf.length - wireBuf.length) / plainBuf.length) * 100).toFixed(1)
-            : '0.0';
-          const msg = `[yima-shared-loopback] ${req.url}: ${(plainBuf.length / 1024).toFixed(1)} KB -> ${(wireBuf.length / 1024).toFixed(1)} KB (${pct}% saved)`;
-          if (logger?.info) logger.info(msg);
-          else console.log(msg);
+        if (statusCode !== 200) {
+          outHeaders['content-length'] = String(rawBuf.length);
+          res.writeHead(statusCode, outHeaders);
+          res.end(rawBuf);
+          return;
         }
 
-        cache.set(cacheKey, { buffer: wireBuf, headers: outHeaders, status: statusCode }, slimConfig.assetCacheTtlMs);
-      } catch (error) {
-        logger?.warn?.('[yima-shared-loopback] failed to compress asset, passing through:', error);
-        outHeaders['content-length'] = String(rawBuf.length);
-        res.writeHead(statusCode, outHeaders);
-        res.end(rawBuf);
-      }
+        try {
+          const encoding = String(outHeaders['content-encoding'] ?? '').toLowerCase();
+          const plainBuf = encoding === 'gzip' ? await gunzipAsync(rawBuf) : rawBuf;
+          const { buffer: wireBuf, encoding: wireEncoding } = await encodePayload(plainBuf, req, slimConfig, 6);
+          if (res.destroyed || res.writableEnded) return;
+          if (wireEncoding === undefined) delete outHeaders['content-encoding'];
+          else outHeaders['content-encoding'] = wireEncoding;
+          appendVary(outHeaders, 'Accept-Encoding');
+          outHeaders['content-length'] = String(wireBuf.length);
+          res.writeHead(statusCode, outHeaders);
+          res.end(wireBuf);
+
+          if (logStats && wireEncoding !== undefined) {
+            const pct = plainBuf.length > 0
+              ? (((plainBuf.length - wireBuf.length) / plainBuf.length) * 100).toFixed(1)
+              : '0.0';
+            const msg = `[yima-shared-loopback] ${req.url}: ${(plainBuf.length / 1024).toFixed(1)} KB -> ${(wireBuf.length / 1024).toFixed(1)} KB (${pct}% saved)`;
+            if (logger?.info) logger.info(msg);
+            else console.log(msg);
+          }
+
+          const cacheControl = String(outHeaders['cache-control'] ?? '').toLowerCase();
+          if (!cacheControl.includes('no-store') && !cacheControl.includes('private')) {
+            cache.set(cacheKey, { buffer: wireBuf, headers: outHeaders, status: statusCode }, slimConfig.assetCacheTtlMs);
+          }
+        } catch (error) {
+          logger?.warn?.('[yima-shared-loopback] failed to compress asset, passing through:', error);
+          if (res.destroyed || res.writableEnded) return;
+          outHeaders['content-length'] = String(rawBuf.length);
+          res.writeHead(statusCode, outHeaders);
+          res.end(rawBuf);
+        }
+      })();
     });
   });
 
+  const onClientClose = () => {
+    if (!res.writableEnded) upstreamReq.destroy();
+  };
+  res.once('close', onClientClose);
+  upstreamReq.once('close', () => { res.off('close', onClientClose); });
+
+  upstreamReq.on('timeout', () => {
+    upstreamReq.destroy(new Error('upstream asset request timed out'));
+  });
   upstreamReq.on('error', (error) => {
+    if (res.destroyed || res.writableEnded) return;
     logger?.warn?.('[yima-shared-loopback] upstream asset proxy error:', error);
-    if (!res.headersSent) {
-      res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
-      res.end('bad gateway');
-    } else {
-      res.destroy();
-    }
+    const status = error?.message === 'upstream asset request timed out' ? 504 : 502;
+    writeProxyError(res, status, status === 504 ? 'gateway timeout' : 'bad gateway');
   });
 
   upstreamReq.end();
@@ -1491,20 +1605,35 @@ export function apply(ctx, config = {}) {
       }
     }
 
-    const authority = `${host}:${port}`;
+    const authority = formatAuthority(host, port);
     const sockets = new Set();
     const peerReleases = new Set();
     const responseCache = new SlimResponseCache();
+
+    // Raise Node's default 5s keepAliveTimeout on the shared upstream DSH HTTP server
+    // too so Electron desktop fetch() and loopback callers do not hit 5s EOF races.
+    const bumpedUpstreamKeepAlive = typeof upstream.keepAliveTimeout === 'number'
+      && upstream.keepAliveTimeout > 0
+      && upstream.keepAliveTimeout < DEFAULT_SERVER_KEEP_ALIVE_TIMEOUT_MS;
+    const prevUpstreamKeepAlive = upstream.keepAliveTimeout;
+    const prevUpstreamHeadersTimeout = upstream.headersTimeout;
+    if (bumpedUpstreamKeepAlive) {
+      upstream.keepAliveTimeout = DEFAULT_SERVER_KEEP_ALIVE_TIMEOUT_MS;
+      if (typeof upstream.headersTimeout === 'number' && upstream.headersTimeout < DEFAULT_SERVER_HEADERS_TIMEOUT_MS) {
+        upstream.headersTimeout = DEFAULT_SERVER_HEADERS_TIMEOUT_MS;
+      }
+    }
 
     const server = createServer((req, res) => {
       const pathname = readPathname(req.url);
       if (slimConfig.enabled) {
         const route = SLIM_HTTP_ROUTES.get(pathname);
         if (route !== undefined && route.methods.includes(req.method)) {
-          const upstreamPort = readUpstreamPort(carrier);
-          if (upstreamPort !== undefined) {
+          const upstreamTarget = readUpstreamTarget(carrier);
+          if (upstreamTarget !== undefined) {
             void proxySlimHttp(req, res, {
-              upstreamPort,
+              upstreamTarget,
+              connection,
               slimConfig,
               compressionLevel,
               logger: ctx.logger,
@@ -1517,12 +1646,12 @@ export function apply(ctx, config = {}) {
         }
         if (slimConfig.compressAssets
             && req.method === 'GET'
-            && acceptsEncoding(req, 'br')
+            && negotiateEncoding(req, slimConfig) === 'br'
             && COMPRESSIBLE_ASSET_PREFIXES.some((prefix) => pathname.startsWith(prefix))) {
-          const upstreamPort = readUpstreamPort(carrier);
-          if (upstreamPort !== undefined) {
+          const upstreamTarget = readUpstreamTarget(carrier);
+          if (upstreamTarget !== undefined) {
             void proxyCompressedAsset(req, res, {
-              upstreamPort,
+              upstreamTarget,
               slimConfig,
               logger: ctx.logger,
               logStats,
@@ -1534,6 +1663,9 @@ export function apply(ctx, config = {}) {
       }
       upstream.emit('request', req, res);
     });
+    server.keepAliveTimeout = DEFAULT_SERVER_KEEP_ALIVE_TIMEOUT_MS;
+    server.headersTimeout = DEFAULT_SERVER_HEADERS_TIMEOUT_MS;
+    server.requestTimeout = 0;
 
     server.on('connection', (socket) => {
       sockets.add(socket);
@@ -1552,7 +1684,10 @@ export function apply(ctx, config = {}) {
         return;
       }
 
+      let released = false;
       const release = () => {
+        if (released) return;
+        released = true;
         const done = admission.release().catch((error) => {
           ctx.logger?.warn?.('[yima-shared-loopback] peer release failed:', error);
         });
@@ -1579,14 +1714,23 @@ export function apply(ctx, config = {}) {
       }
     });
 
-    await new Promise((resolve, reject) => {
-      const onError = (error) => reject(error);
-      server.once('error', onError);
-      server.listen(port, host, () => {
-        server.off('error', onError);
-        resolve();
+    try {
+      await new Promise((resolve, reject) => {
+        const onError = (error) => reject(error);
+        server.once('error', onError);
+        server.listen(port, host, () => {
+          server.off('error', onError);
+          resolve();
+        });
       });
-    });
+    } catch (error) {
+      if (bumpedUpstreamKeepAlive) {
+        upstream.keepAliveTimeout = prevUpstreamKeepAlive;
+        upstream.headersTimeout = prevUpstreamHeadersTimeout;
+      }
+      if (mux) await mux.close().catch(() => undefined);
+      throw error;
+    }
     server.on('error', (error) => ctx.logger?.warn?.(error));
     const added = !connection.trustedHosts.includes(authority);
     if (added) connection.trustedHosts.push(authority);
@@ -1596,6 +1740,10 @@ export function apply(ctx, config = {}) {
     console.log(`dsh web shared: http://${authority}/ (${modeLabel})`);
 
     return async () => {
+      if (bumpedUpstreamKeepAlive) {
+        upstream.keepAliveTimeout = prevUpstreamKeepAlive;
+        upstream.headersTimeout = prevUpstreamHeadersTimeout;
+      }
       if (added) {
         const index = connection.trustedHosts.indexOf(authority);
         if (index !== -1) connection.trustedHosts.splice(index, 1);

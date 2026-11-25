@@ -318,7 +318,7 @@ window.__ModuleLoader__.load({
         slimEnabled,
         maxMessages: String(slimObj.maxMessages ?? 200),
         minMessages: String(slimObj.minMessages ?? 50),
-        minTurns: String(slimObj.minTurns ?? 2),
+        minTurns: String(slimObj.minTurns ?? 1),
         stripToolArguments: slimObj.stripToolArguments !== false,
         omitToolResults: slimObj.omitToolResults !== false,
         heartbeat: String(cfg.websocketHeartbeatIntervalMs ?? 15000),
