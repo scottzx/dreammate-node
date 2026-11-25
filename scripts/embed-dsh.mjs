@@ -4,10 +4,15 @@ import { cpSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-const PLUGIN_FILES = ['index.js', 'service-process.js', 'service-worker.js'];
-// Loader modules whose patch rows use relative names; they must stay anchored
-// beside cordis.patch.yml in both the source package and the embedded copy.
-const PATCH_MODULES = ['yima-tailnet-trust.mjs', 'yima-shared-loopback.mjs'];
+const PLUGIN_FILES = ['index.js', 'service-process.js', 'service-worker.js', 'row-config.js'];
+// Subpath adapters exported by @1agents/dreammate-node and referenced by
+// package subpath in cordis.patch.yml so DSH displays clean module names
+// instead of absolute file:// URLs.
+const SUBPATH_ADAPTERS = [
+  { subpath: './yima-tailnet-trust', file: 'yima-tailnet-trust.mjs' },
+  { subpath: './yima-shared-loopback', file: 'yima-shared-loopback.mjs' },
+];
+const PATCH_MODULES = [...SUBPATH_ADAPTERS.map(item => item.file), 'client.js'];
 const DOC_FILES = ['cordis.patch.yml', 'README.md', 'LICENSE'];
 
 export function embedDsh(root = dirname(fileURLToPath(new URL('../package.json', import.meta.url)))) {
@@ -19,11 +24,16 @@ export function embedDsh(root = dirname(fileURLToPath(new URL('../package.json',
   assert.equal(target.name, '@1agents/dreammate-node');
   assert.equal(target.dependencies?.['@1agents/dsh-dreammate-node'], undefined, 'DSH plugin must be embedded, not depended on');
   assert.equal(target.dsh?.bundle?.patch, './vendor/dsh/cordis.patch.yml');
+  assert.equal(target.exports?.['./client']?.default, './vendor/dsh/client.js',
+    'package exports["./client"].default must point to the embedded DSH browser client');
   const patch = readFileSync(join(pluginRoot, 'cordis.patch.yml'), 'utf8');
   assert.match(patch, /name: '@1agents\/dreammate-node'/, 'DSH patch must load the package root');
-  for (const name of PATCH_MODULES) {
-    assert.match(patch, new RegExp(`name: '\\./${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}'`),
-      `DSH patch must load ${name} beside its patch file`);
+  for (const { subpath, file } of SUBPATH_ADAPTERS) {
+    const spec = `${target.name}${subpath.slice(1)}`;
+    assert.equal(target.exports?.[subpath], `./vendor/dsh/${file}`,
+      `package exports["${subpath}"] must map to ./vendor/dsh/${file}`);
+    assert.match(patch, new RegExp(`name: '${spec.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}'`),
+      `DSH patch must load ${spec} via package subpath export`);
   }
   assert.doesNotMatch(patch, /dsh-dreammate-node/);
   const destination = join(root, 'vendor/dsh');

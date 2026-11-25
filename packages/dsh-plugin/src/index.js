@@ -4,6 +4,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { CallToolResultSchema } from '@modelcontextprotocol/sdk/types.js';
 import { createRequire } from 'node:module';
 import { acquireService, resolveServiceOptions } from './service-process.js';
+import { registerRowConfigRpc } from './row-config.js';
 
 export const name = 'dreammate-node';
 export const inject = ['tools'];
@@ -33,6 +34,7 @@ function normalizeResult(name, result) {
 
 export async function apply(ctx, input = {}) {
   const options = resolveServiceOptions(input);
+  registerRowConfigRpc(ctx);
   await ctx.effect(() => acquireService(options));
   // Use the published gateway API rather than duplicating its routing or relying
   // on an unpublished callDreammateTool export. No extra MCP process is needed.

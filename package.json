@@ -1,6 +1,6 @@
 {
   "name": "@1agents/dreammate-node",
-  "version": "0.20.0",
+  "version": "0.21.0",
   "description": "DreamMate Network 的设备网关与一次性 CLI：服务发现、调用与可导入的设备地址簿。",
   "keywords": [
     "dreammate",
@@ -24,8 +24,12 @@
     },
     "./client": {
       "types": "./dist/src/client.d.ts",
-      "import": "./dist/src/client.js"
+      "node": "./dist/src/client.js",
+      "import": "./dist/src/client.js",
+      "default": "./vendor/dsh/client.js"
     },
+    "./yima-tailnet-trust": "./vendor/dsh/yima-tailnet-trust.mjs",
+    "./yima-shared-loopback": "./vendor/dsh/yima-shared-loopback.mjs",
     "./package.json": "./package.json",
     "./cordis.patch.yml": "./vendor/dsh/cordis.patch.yml"
   },
@@ -59,6 +63,16 @@
   "dsh": {
     "bundle": {
       "patch": "./vendor/dsh/cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-plugin-manager"
+      ]
     }
   },
   "sideEffects": false,

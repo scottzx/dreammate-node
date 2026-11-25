@@ -12,6 +12,7 @@
   "files": [
     "src",
     "cordis.patch.yml",
+    "client.js",
     "yima-tailnet-trust.mjs",
     "yima-shared-loopback.mjs",
     "README.md",
@@ -19,7 +20,7 @@
   ],
   "scripts": {
     "test": "node --test test/*.test.mjs",
-    "prepack": "node --check src/index.js && node --check src/service-process.js && node --check src/service-worker.js && node --check yima-tailnet-trust.mjs && node --check yima-shared-loopback.mjs"
+    "prepack": "node --check src/index.js && node --check src/service-process.js && node --check src/service-worker.js && node --check src/row-config.js && node --check client.js && node --check yima-tailnet-trust.mjs && node --check yima-shared-loopback.mjs"
   },
   "engines": {
     "node": ">=22.19.0"

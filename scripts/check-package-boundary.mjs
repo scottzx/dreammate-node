@@ -55,7 +55,7 @@ try {
     '--workspace=@1agents/artifact-index', '--pack-destination', artifacts]));
   assert.ok(!gateway.files.some(file => /^(?:dist\/)?packages\//.test(file.path)),
     'Node must not embed independent workspace implementations');
-  for (const embedded of ['vendor/dsh/index.js', 'vendor/dsh/service-worker.js', 'vendor/dsh/cordis.patch.yml', 'vendor/dsh/yima-tailnet-trust.mjs', 'vendor/dsh/yima-shared-loopback.mjs']) {
+  for (const embedded of ['vendor/dsh/index.js', 'vendor/dsh/row-config.js', 'vendor/dsh/service-worker.js', 'vendor/dsh/cordis.patch.yml', 'vendor/dsh/client.js', 'vendor/dsh/yima-tailnet-trust.mjs', 'vendor/dsh/yima-shared-loopback.mjs']) {
     assert.ok(gateway.files.some(file => file.path === embedded), `Node tarball must include ${embedded}`);
   }
   assert.equal(gatewayManifest.dsh?.bundle?.patch, './vendor/dsh/cordis.patch.yml');
@@ -93,10 +93,18 @@ assert.equal(pkg.dsh.bundle.patch, './vendor/dsh/cordis.patch.yml');
 const patch = fs.readFileSync('node_modules/@1agents/dreammate-node/vendor/dsh/cordis.patch.yml', 'utf8');
 assert.equal(patch.includes("name: '@1agents/dreammate-node'"), true);
 assert.equal(patch.includes('dsh-dreammate-node'), false);
-assert.equal(patch.includes("name: './yima-tailnet-trust.mjs'"), true);
+assert.equal(patch.includes("name: '@1agents/dreammate-node/yima-tailnet-trust'"), true);
 assert.equal(fs.existsSync('node_modules/@1agents/dreammate-node/vendor/dsh/yima-tailnet-trust.mjs'), true);
-assert.equal(patch.includes("name: './yima-shared-loopback.mjs'"), true);
+assert.equal(patch.includes("name: '@1agents/dreammate-node/yima-shared-loopback'"), true);
 assert.equal(fs.existsSync('node_modules/@1agents/dreammate-node/vendor/dsh/yima-shared-loopback.mjs'), true);
+assert.equal(fs.existsSync('node_modules/@1agents/dreammate-node/vendor/dsh/client.js'), true);
+assert.equal(pkg.exports['./client'].default, './vendor/dsh/client.js');
+const nodeClient = await import('@1agents/dreammate-node/client');
+assert.equal(typeof nodeClient.reportToAgent, 'function');
+const trustSubpath = await import('@1agents/dreammate-node/yima-tailnet-trust');
+assert.equal(trustSubpath.name, 'yima-tailnet-trust');
+const loopbackSubpath = await import('@1agents/dreammate-node/yima-shared-loopback');
+assert.equal(loopbackSubpath.name, 'yima-shared-loopback');
 assert.equal(gateway.name, 'dreammate-node');
 assert.deepEqual(gateway.inject, ['tools']);
 assert.equal(typeof gateway.apply, 'function');

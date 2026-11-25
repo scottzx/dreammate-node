@@ -24,11 +24,11 @@ test('the DSH plugin is embedded into the package root and stays unloaded until 
   assert.doesNotMatch(pluginSource, /^import .*(vendor\/dsh|packages\/dsh-plugin)/m);
 });
 
-test('the yima tailnet trust adapter ships anchored beside the embedded patch', async () => {
+test('the yima tailnet trust adapter ships via package subpath export', async () => {
   embedDsh(root);
   const patch = readFileSync(path.join(root, 'vendor/dsh/cordis.patch.yml'), 'utf8');
   assert.match(patch, /id: yima-tailnet-trust/);
-  assert.match(patch, /name: '\.\/yima-tailnet-trust\.mjs'/);
+  assert.match(patch, /name: '@1agents\/dreammate-node\/yima-tailnet-trust'/);
   assert.match(patch, /disabled: true/, 'the trust row must ship disabled until a profile supplies its authority');
   const adapter = await import(pathToFileURL(path.join(root, 'vendor/dsh/yima-tailnet-trust.mjs')).href);
   assert.equal(adapter.name, 'yima-tailnet-trust');
@@ -36,15 +36,19 @@ test('the yima tailnet trust adapter ships anchored beside the embedded patch', 
   assert.equal(typeof adapter.apply, 'function');
 });
 
-test('the yima shared loopback adapter ships anchored beside the embedded patch', async () => {
+test('the yima shared loopback adapter and browser row-config client ship embedded', async () => {
   embedDsh(root);
   const patch = readFileSync(path.join(root, 'vendor/dsh/cordis.patch.yml'), 'utf8');
   assert.match(patch, /id: yima-shared-loopback/);
-  assert.match(patch, /name: '\.\/yima-shared-loopback\.mjs'/);
+  assert.match(patch, /name: '@1agents\/dreammate-node\/yima-shared-loopback'/);
   assert.match(patch, /id: yima-shared-loopback[\s\S]*disabled: true/,
     'the loopback row must ship disabled until a profile supplies its loopback port');
   const adapter = await import(pathToFileURL(path.join(root, 'vendor/dsh/yima-shared-loopback.mjs')).href);
   assert.equal(adapter.name, 'yima-shared-loopback');
   assert.deepEqual(adapter.inject, ['connection', 'webServer', 'typertGateway']);
   assert.equal(typeof adapter.apply, 'function');
+  const clientSource = readFileSync(path.join(root, 'vendor/dsh/client.js'), 'utf8');
+  assert.match(clientSource, /plugins\.row\.config/);
+  assert.match(clientSource, /yima-shared-loopback/);
+  assert.match(clientSource, /yima-tailnet-trust/);
 });

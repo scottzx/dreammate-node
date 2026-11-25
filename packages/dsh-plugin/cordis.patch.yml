@@ -14,7 +14,7 @@
 #       authority: "scott-mac.tailfb4720.ts.net:3080"
 - insert:
     - id: yima-tailnet-trust
-      name: './yima-tailnet-trust.mjs'
+      name: '@1agents/dreammate-node/yima-tailnet-trust'
       disabled: true
       config:
         authority: ''
@@ -31,7 +31,7 @@
 #       port: 3466
 - insert:
     - id: yima-shared-loopback
-      name: './yima-shared-loopback.mjs'
+      name: '@1agents/dreammate-node/yima-shared-loopback'
       disabled: true
       config:
         host: 127.0.0.1

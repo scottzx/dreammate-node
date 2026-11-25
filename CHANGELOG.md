@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.21.0 — 2026-11-25
+
+- Export `@1agents/dreammate-node/yima-tailnet-trust` and `@1agents/dreammate-node/yima-shared-loopback` as clean package subpaths and reference them in `vendor/dsh/cordis.patch.yml` so DSH displays clean module specifiers instead of local `file://` URLs.
+- Ship `vendor/dsh/client.js` (via `exports["./client"].default`, keeping Node ESM `exports["./client"].node` / `.import` on `dist/src/client.js`) and host `dreammateRowConfig` RPC to provide per-row `plugins.row.config` configuration panels and summaries for `dreammate-node`, `yima-tailnet-trust`, and `yima-shared-loopback` directly inside DSH's Plugins page.
+
 ## 0.20.0 — 2026-11-25
 
 - Ship `yima-shared-loopback.mjs` inside the embedded DSH plugin (`vendor/dsh`) as the disabled `yima-shared-loopback` row beside `yima-tailnet-trust`. A desktop profile enables it with a loopback `host` and `port` so Tailscale Serve can share the desktop session writer without starting a second `dsh web`.
