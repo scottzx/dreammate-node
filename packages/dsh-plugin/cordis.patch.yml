@@ -18,3 +18,21 @@
       disabled: true
       config:
         authority: ''
+
+# Yima shared loopback entry for the desktop profile's own web server:
+# Tailscale Serve proxies the phone/browser to this loopback port so requests
+# share the desktop session writer, and slims /api/remote.mux and session page
+# payloads for low-bandwidth remote links by default. Shipped disabled; a
+# profile patch enables it and supplies its loopback host and port:
+#   - id: yima-shared-loopback
+#     disabled: false
+#     config:
+#       host: 127.0.0.1
+#       port: 3466
+- insert:
+    - id: yima-shared-loopback
+      name: './yima-shared-loopback.mjs'
+      disabled: true
+      config:
+        host: 127.0.0.1
+        port: 0

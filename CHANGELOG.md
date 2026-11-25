@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.20.0 — 2026-11-25
+
+- Ship `yima-shared-loopback.mjs` inside the embedded DSH plugin (`vendor/dsh`) as the disabled `yima-shared-loopback` row beside `yima-tailnet-trust`. A desktop profile enables it with a loopback `host` and `port` so Tailscale Serve can share the desktop session writer without starting a second `dsh web`.
+- Slim `/api/remote.mux` (`session/follow`, `session/observeEvent`) and `POST /api/session/page` / `/api/session/events` payloads on the shared loopback entry by default for low-bandwidth remote links: keeps user and assistant message blocks intact, keeps only tool call names, omits tool result outputs/meta and redundant stream replay payloads, raises WebSocket deflate compression to level 6, and widens heartbeat interval to 15s (set `slim: false` to disable).
+
 ## 0.19.0 — 2026-11-14
 
 - Embed the DeepSeek Harness plugin into `@1agents/dreammate-node`. Install or upgrade that one package; `@1agents/dsh-dreammate-node` is no longer published.

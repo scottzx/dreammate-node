@@ -13,12 +13,13 @@
     "src",
     "cordis.patch.yml",
     "yima-tailnet-trust.mjs",
+    "yima-shared-loopback.mjs",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
     "test": "node --test test/*.test.mjs",
-    "prepack": "node --check src/index.js && node --check src/service-process.js && node --check src/service-worker.js && node --check yima-tailnet-trust.mjs"
+    "prepack": "node --check src/index.js && node --check src/service-process.js && node --check src/service-worker.js && node --check yima-tailnet-trust.mjs && node --check yima-shared-loopback.mjs"
   },
   "engines": {
     "node": ">=22.19.0"

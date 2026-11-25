@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const PLUGIN_FILES = ['index.js', 'service-process.js', 'service-worker.js'];
 // Loader modules whose patch rows use relative names; they must stay anchored
 // beside cordis.patch.yml in both the source package and the embedded copy.
-const PATCH_MODULES = ['yima-tailnet-trust.mjs'];
+const PATCH_MODULES = ['yima-tailnet-trust.mjs', 'yima-shared-loopback.mjs'];
 const DOC_FILES = ['cordis.patch.yml', 'README.md', 'LICENSE'];
 
 export function embedDsh(root = dirname(fileURLToPath(new URL('../package.json', import.meta.url)))) {

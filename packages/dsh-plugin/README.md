@@ -119,6 +119,33 @@ accepted and matches the port-443 entry. No scheme, userinfo, path, query or
 fragment passes. It withdraws the trust again when the row is disposed, and
 never removes an authority that was already trusted before the row activated.
 
+## Shared loopback adapter (`yima-shared-loopback`)
+
+The bundle also ships `yima-shared-loopback.mjs` beside `cordis.patch.yml`. It
+opens a fixed loopback HTTP listener (`127.0.0.1` or `::1`) backed by the
+desktop profile's own web server so Tailscale Serve can proxy the phone and
+browser without starting a second `dsh web` process.
+
+The `yima-shared-loopback` row ships `disabled: true`. A profile enables it and
+sets its loopback port:
+
+```yaml
+- id: yima-shared-loopback
+  disabled: false
+  config:
+    host: 127.0.0.1
+    port: 3466
+```
+
+By default, remote traffic arriving on this loopback listener gets low-bandwidth
+slimming on `/api/remote.mux` (`session/follow`, `session/observeEvent`) and
+`POST /api/session/page` / `/api/session/events`: user and assistant message
+blocks stay intact, tool calls keep only their tool name, tool outputs/meta and
+redundant replay streams are omitted, WebSocket deflate level is raised to 6,
+and the heartbeat interval is widened to 15s. Set `slim: false` in `config` to
+disable slimming and fall back to transparent passthrough. The local Electron
+desktop UI never traverses this listener and stays 100% untouched.
+
 ## Development
 
 ```sh

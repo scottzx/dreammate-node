@@ -35,3 +35,16 @@ test('the yima tailnet trust adapter ships anchored beside the embedded patch', 
   assert.deepEqual(adapter.inject, ['connection']);
   assert.equal(typeof adapter.apply, 'function');
 });
+
+test('the yima shared loopback adapter ships anchored beside the embedded patch', async () => {
+  embedDsh(root);
+  const patch = readFileSync(path.join(root, 'vendor/dsh/cordis.patch.yml'), 'utf8');
+  assert.match(patch, /id: yima-shared-loopback/);
+  assert.match(patch, /name: '\.\/yima-shared-loopback\.mjs'/);
+  assert.match(patch, /id: yima-shared-loopback[\s\S]*disabled: true/,
+    'the loopback row must ship disabled until a profile supplies its loopback port');
+  const adapter = await import(pathToFileURL(path.join(root, 'vendor/dsh/yima-shared-loopback.mjs')).href);
+  assert.equal(adapter.name, 'yima-shared-loopback');
+  assert.deepEqual(adapter.inject, ['connection', 'webServer', 'typertGateway']);
+  assert.equal(typeof adapter.apply, 'function');
+});
