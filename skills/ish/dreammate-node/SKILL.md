@@ -112,6 +112,10 @@ stdout 是完整 MCP 结果 JSON：优先读 `structuredContent`，没有时读 
 
 需要远端生命周期操作时，`cli manage --node DEVICE --service SERVICE --action status` 查状态；只有用户已要求时才执行 `start` 或 `stop`，它们修改远端服务。
 
+## 版本与诊断边界
+
+本机 `dreammate-node` 只是调用工具；本指南对应当前仓库版本。命令报"未知命令"、参数不认或 Search 结果结构不符时，先核对 `dreammate-node --version` 与已安装 skill 的 `.dreammate-node-install.json` 里的 version，再按 `dreammate-node skills install` 更新本机 skill，不要把它当成远端网关版本问题。skill 是显式安装的，npm 包本身不自动写 skill 文件。
+
 ## 回复用户
 
 给出实际目标节点、服务和方法，以及结果或具体失败阶段。列出部分扫描失败时保留不确定性。命令未运行就说明只是建议步骤，不编造调用结果。不要把“npm 包已安装”说成“本机网关已启动”。

@@ -137,6 +137,17 @@ Qwen 与 Gemma 归同一 Node supervisor 的共享队列管理，切换时等待
 
 服务生命周期通过 `cli manage --service SERVICE --action status|start|stop` 或 `dreammate_manage_service`；传入正确的入口和节点。只在用户已要求时启停服务。写入、发布、删除等业务方法同样以用户当前授权为限。
 
+## 发版与 DSH profile 升级（维护本包时）
+
+用户要求发版、升级 DSH 里的 `@1agents/dreammate-node` 插件，或排查"安装失败后回滚旧版"时，先读仓库根的 `docs/RELEASING.md`，按里面的流程做，凭记忆容易漏步骤：
+
+- **版本号只改 `package.json`**：用 `npm version patch -m "fix: %s"`，它同步 `package-lock.json` 并打 `vX.Y.Z` tag；手工改两个文件容易和 tag 不一致，CI 会拒绝发布。
+- **推 `git push origin main --follow-tags`** 触发 `publish.yml`；看到日志里 `+ @1agents/dreammate-node@X` 才算发布成功，再等 `npm view ... version` 可见才升级本机（registry 有传播延迟）。
+- **升级 profile 必须四步**：`set_bundle enabled=false` → `remove_bundle` → `install_bundle`（0.22.3 起无 postinstall，不需 `approvedBuilds`）→ 把 bundle 在 `package.json` 的 `dsh.profile.bundles` 里挪回原位置。直接在插件页点升级会被 `bundle-in-use` 挡住；失败时 bundle 选择不会自动回滚，要检查恢复。
+- 用 `node scripts/profile-upgrade.mjs prepare --version X.Y.Z` / `finalize --version X.Y.Z` 编排和验证（中间三步仍需在 Agent 会话里调 plugin_manager 工具）。
+- **两个反复踩过的坑**：浏览器 `client.js` 顶层不能有 `const/let/class/function`（HMR 重载会报 `loaded without registering`，回归测试在 `test/dsh-embed.test.mjs`）；包内不能有生命周期安装脚本（pnpm 11 的 `ERR_PNPM_IGNORED_BUILDS` 会让安装失败并回滚旧版）。skill 用 `dreammate-node skills install` 显式安装，不是 postinstall。
+- 回滚不能删已发布的版本：用 `git revert` 后发一个更高的 patch 版本；不要改 tag 或重发同一版本号。
+
 ## 结果与故障诊断
 
 CLI stdout 是 MCP 结果 JSON。读 `structuredContent` 或 `content` 文本块，保留其他内容块和 `isError`。
