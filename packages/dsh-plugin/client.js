@@ -5,8 +5,23 @@
 //   - yima-shared-loopback
 // Loaded by DSH via exports["./client"].default (Node consumers still get
 // dist/src/client.js via exports["./client"].node / .import).
+//
+// This file runs as a classic script and DSH re-executes it on every HMR
+// reload, so it must not declare anything at the top level: a top-level
+// `const`/`let`/`class` stays in the global lexical environment and the second
+// execution throws "Identifier ... has already been declared" before the
+// factory reaches `window.__ModuleLoader__.load`, which the host reports as
+// "loaded without registering". Keep every declaration inside the factory.
 
-const STYLE = `
+window.__ModuleLoader__.load({
+  id: '@1agents/dreammate-node',
+  dependencies: ['react'],
+  factory(require) {
+    const React = require('react');
+    const { useState, useEffect, useCallback } = React;
+    const h = React.createElement;
+
+    const STYLE = `
 .dm-cfg { display: flex; flex-direction: column; gap: 16px; max-width: 640px; }
 .dm-cfg * { box-sizing: border-box; }
 .dm-cfg-group { display: flex; flex-direction: column; gap: 12px; padding: 14px 16px; border: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,0.22)); border-radius: 10px; background: var(--dsw-alias-bg-layer-1, transparent); }
@@ -29,14 +44,6 @@ const STYLE = `
 .dm-cfg-banner-err { color: var(--dsw-alias-state-error-primary, #dc2626); }
 .dm-cfg-banner-ok { color: var(--dsw-alias-state-success-primary, #16a34a); }
 `;
-
-window.__ModuleLoader__.load({
-  id: '@1agents/dreammate-node',
-  dependencies: ['react'],
-  factory(require) {
-    const React = require('react');
-    const { useState, useEffect, useCallback } = React;
-    const h = React.createElement;
 
     const PACKAGE = '@1agents/dreammate-node';
     const SERVICE = 'dreammateRowConfig';

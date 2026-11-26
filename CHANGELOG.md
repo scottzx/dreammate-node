@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.22.2 — 2026-11-26
+
+- Fix the DSH browser client bundle failing to register on reload. `vendor/dsh/client.js` declared `const STYLE` at the top level of a classic script; a top-level lexical declaration stays in the page's global environment, so DSH's second execution of the bundle (its HMR rebuild path) threw `SyntaxError: Identifier 'STYLE' has already been declared` before reaching `window.__ModuleLoader__.load`. The host reported that as `client-modules: could not load "@1agents/dreammate-node": … loaded without registering "@1agents/dreammate-node" via __ModuleLoader__.load`, and the plugin's row-config panels stayed unsynchronised in the page while the server-side enable state was unchanged. Move every declaration into the factory closure, so the bundle is free of top-level bindings and re-executes cleanly.
+- Guard the regression in the package's own test suite: the embedded browser bundle must declare nothing at the top level and must register its factory on every execution.
+
 ## 0.22.1 — 2026-11-26
 
 - Harden the shared loopback adapter (`yima-shared-loopback.mjs`) so remote traffic cannot stall the shared desktop host event loop: move brotli/gzip/gunzip compression off the main thread onto libuv worker threads and remove the redundant raw-snapshot `JSON.stringify` in `session/follow` stats logging.

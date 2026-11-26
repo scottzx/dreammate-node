@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
+import vm from 'node:vm';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { embedDsh } from '../scripts/embed-dsh.mjs';
 import { apply, inject, name, pluginEntry } from '../src/dsh.ts';
@@ -51,4 +52,30 @@ test('the yima shared loopback adapter and browser row-config client ship embedd
   assert.match(clientSource, /plugins\.row\.config/);
   assert.match(clientSource, /yima-shared-loopback/);
   assert.match(clientSource, /yima-tailnet-trust/);
+});
+
+test('the browser client bundle declares nothing at the top level', () => {
+  embedDsh(root);
+  const clientSource = readFileSync(path.join(root, 'vendor/dsh/client.js'), 'utf8');
+  const topLevel = clientSource.match(/^(?:const|let|var|class|function|async function)\s/m);
+  assert.equal(topLevel, null,
+    'a top-level declaration survives in the global lexical environment and breaks the second execution '
+    + `(found: ${topLevel?.[0] ?? ''})`);
+});
+
+test('the browser client bundle registers its factory on every execution', () => {
+  embedDsh(root);
+  const clientSource = readFileSync(path.join(root, 'vendor/dsh/client.js'), 'utf8');
+  const registered = [];
+  const context = vm.createContext({
+    window: { __ModuleLoader__: { load: registration => registered.push(registration) } },
+  });
+  // DSH re-executes the bundle on every HMR reload, so a second execution must
+  // still reach __ModuleLoader__.load instead of throwing on a stale declaration.
+  vm.runInContext(clientSource, context, { filename: 'client.js' });
+  vm.runInContext(clientSource, context, { filename: 'client.js' });
+  assert.deepEqual(registered.map(entry => entry.id),
+    ['@1agents/dreammate-node', '@1agents/dreammate-node']);
+  const module = registered[0].factory(() => ({}));
+  assert.deepEqual([...module.inject], ['slots', 'locale', 'remote']);
 });
