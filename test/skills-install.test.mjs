@@ -20,7 +20,7 @@ function temporary(t) {
 function run(home, args = [], overrides = {}) {
   return execFileSync(process.execPath, [script, ...args], {
     env: { ...process.env, HOME: home, CODEX_HOME: '', DREAMMATE_SKILLS_DIR: '',
-      DREAMMATE_SKILL_PROFILE: '', DREAMMATE_SKIP_SKILLS: '', ...overrides },
+      DREAMMATE_SKILL_PROFILE: '', ...overrides },
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000,
   });
 }
@@ -86,12 +86,12 @@ test('does not follow skill directory or SKILL.md symlinks', t => {
   assert.equal(fs.readFileSync(path.join(target, 'SKILL.md'), 'utf8'), 'user skill');
 });
 
-test('postinstall uses built-in modules, explicit profiles, and no other home state', t => {
+test('the explicit installer uses built-in modules, explicit profiles, and no other home state', t => {
   const home = temporary(t);
-  run(home, ['--postinstall'], { DREAMMATE_SKILL_PROFILE: 'ish' });
+  run(home, [], { DREAMMATE_SKILL_PROFILE: 'ish' });
   const file = path.join(home, '.agents/skills/dreammate-node/SKILL.md');
   assert.equal(fs.readFileSync(file, 'utf8'), sourceSkill('ish'));
-  run(home, ['--postinstall', '--profile', 'terminal'], { DREAMMATE_SKILL_PROFILE: 'ish' });
+  run(home, ['--profile', 'terminal'], { DREAMMATE_SKILL_PROFILE: 'ish' });
   assert.equal(fs.readFileSync(file, 'utf8'), sourceSkill('terminal'));
   assert.deepEqual(fs.readdirSync(home), ['.agents']);
 });
@@ -99,36 +99,35 @@ test('postinstall uses built-in modules, explicit profiles, and no other home st
 test('automatic detection selects the current environment without an override', t => {
   const home = temporary(t);
   // Empty values are absent configuration for a shell that unsets overrides.
-  run(home, ['--postinstall']);
+  run(home, []);
   assert.equal(fs.readFileSync(path.join(home, '.agents/skills/dreammate-node/SKILL.md'), 'utf8'), sourceSkill(detectProfile()));
 });
 
-test('skip affects only postinstall, manual installation supports custom targets', t => {
+test('manual installation honours custom targets and profile overrides', t => {
   const home = temporary(t);
-  run(home, ['--postinstall'], { DREAMMATE_SKIP_SKILLS: '1' });
-  assert.deepEqual(fs.readdirSync(home), []);
   run(home, ['--profile', 'ish', '--dir', path.join(home, 'manual')], {
-    DREAMMATE_SKIP_SKILLS: '1', DREAMMATE_SKILLS_DIR: path.join(home, 'ignored'),
+    DREAMMATE_SKILLS_DIR: path.join(home, 'ignored'),
   });
   assert.equal(fs.readFileSync(path.join(home, 'manual/dreammate-node/SKILL.md'), 'utf8'), sourceSkill('ish'));
   assert.deepEqual(fs.readdirSync(home), ['manual']);
 });
 
-test('read-only or conflicting destinations do not fail npm; manual install reports failure', t => {
+test('manual install reports failures and never writes through blockers', t => {
   const home = temporary(t);
   const blocker = path.join(home, 'blocked');
   fs.writeFileSync(blocker, 'not a directory');
-  const args = ['--profile', 'terminal', '--dir', blocker];
-  run(home, ['--postinstall', ...args]);
-  assert.throws(() => run(home, args), e => e.status === 1 && /安装未完成/.test(e.stderr));
-  run(home, ['--postinstall', '--profile', 'unknown']);
+  assert.throws(() => run(home, ['--profile', 'terminal', '--dir', blocker]),
+    e => e.status === 1 && /安装未完成/.test(e.stderr));
   assert.throws(() => run(home, ['--profile', 'unknown']), e => e.status === 1);
   assert.equal(fs.readFileSync(blocker, 'utf8'), 'not a directory');
 });
 
-test('npm manifest ships both skill variants and a postinstall independent of dist', () => {
+test('npm manifest ships both skill variants and no install scripts', () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(packageRoot, 'package.json'), 'utf8'));
-  assert.equal(pkg.scripts.postinstall, 'node scripts/install-skills.mjs --postinstall');
+  assert.equal(pkg.scripts.postinstall, undefined, 'postinstall must stay absent: pnpm rejects unapproved build scripts');
+  assert.equal(pkg.scripts.preinstall, undefined);
+  assert.equal(pkg.scripts.install, undefined);
+  assert.equal(pkg.scripts['skills:install'], 'node scripts/install-skills.mjs');
   assert.ok(pkg.files.includes('scripts/install-skills.mjs'));
   for (const profile of ['ish', 'terminal']) {
     assert.ok(pkg.files.includes(`skills/${profile}/dreammate-node/SKILL.md`));

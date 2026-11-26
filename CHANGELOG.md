@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.22.3 — 2026-11-26
+
+- Remove the package `postinstall` (`node scripts/install-skills.mjs --postinstall`). pnpm 11 treats an unapproved build script as a failed install, which made every new version fail with `ERR_PNPM_IGNORED_BUILDS` until its exact `allowBuilds` key was approved — and on failure the plugin manager rolled the dependency back to the previous version. The package now has no install-time scripts, so upgrades need no `allowBuilds` entry and never trip that check. Skill guides are installed explicitly with `dreammate-node skills install` (or `npm run skills:install` from a source checkout); the old `--postinstall` flag and the `DREAMMATE_SKIP_SKILLS` opt-out are gone.
+- Update the READMEs, CLI help comment and the skill-install tests to match; the manifest test now asserts that no install-time script exists.
+
 ## 0.22.2 — 2026-11-26
 
 - Fix the DSH browser client bundle failing to register on reload. `vendor/dsh/client.js` declared `const STYLE` at the top level of a classic script; a top-level lexical declaration stays in the page's global environment, so DSH's second execution of the bundle (its HMR rebuild path) threw `SyntaxError: Identifier 'STYLE' has already been declared` before reaching `window.__ModuleLoader__.load`. The host reported that as `client-modules: could not load "@1agents/dreammate-node": … loaded without registering "@1agents/dreammate-node" via __ModuleLoader__.load`, and the plugin's row-config panels stayed unsynchronised in the page while the server-side enable state was unchanged. Move every declaration into the factory closure, so the bundle is free of top-level bindings and re-executes cleanly.

@@ -101,22 +101,16 @@ const usage = `dreammate-node skills install [--profile auto|ish|terminal] [--di
 默认自动识别 iSH，安装至 ~/.agents/skills/dreammate-node；同时同步已存在的
 Claude、Codex、Gemini skills 目录。--dir 指定时仅安装到该目录。
 环境变量：DREAMMATE_SKILL_PROFILE、DREAMMATE_SKILLS_DIR（分别被显式参数覆盖）。
-DREAMMATE_SKIP_SKILLS=1 仅跳过 npm 自动安装；手动命令仍可补装。
 只复制本包自带 skill，不联网、不启动服务、不改 MCP 配置。
 用户修改过的 skill 会保留，并提示处理路径。`;
 
 export function runInstaller(argv = [], env = process.env) {
-  const postinstall = argv.includes('--postinstall');
   try {
     const { values } = parseArgs({ args: argv, options: {
       profile: { type: 'string' }, dir: { type: 'string' },
-      postinstall: { type: 'boolean' }, help: { type: 'boolean', short: 'h' },
+      help: { type: 'boolean', short: 'h' },
     } });
     if (values.help) { console.log(usage); return 0; }
-    if (postinstall && env.DREAMMATE_SKIP_SKILLS === '1') {
-      console.error('dreammate-node: 已按 DREAMMATE_SKIP_SKILLS=1 跳过 skill 安装');
-      return 0;
-    }
     const requested = values.profile ?? (env.DREAMMATE_SKILL_PROFILE?.trim() || 'auto');
     if (!['auto', 'ish', 'terminal'].includes(requested)) throw new Error('profile 必须是 auto、ish 或 terminal');
     const profile = requested === 'auto' ? detectProfile() : requested;
@@ -130,11 +124,11 @@ export function runInstaller(argv = [], env = process.env) {
         console.error(`dreammate-node: skill 安装未完成: ${error.message}`);
       }
     }
-    if (failures) console.error('dreammate-node: 可运行 dreammate-node skills install 补装；npm 包仍可使用');
-    return failures && !postinstall ? 1 : 0;
+    if (failures) console.error('dreammate-node: 可运行 dreammate-node skills install 补装');
+    return failures ? 1 : 0;
   } catch (error) {
-    console.error(`dreammate-node: skill 安装未完成: ${error.message}；可运行 dreammate-node skills install 补装`);
-    return postinstall ? 0 : 1;
+    console.error(`dreammate-node: skill 安装未完成: ${error instanceof Error ? error.message : String(error)}；可运行 dreammate-node skills install 补装`);
+    return 1;
   }
 }
 

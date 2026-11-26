@@ -23,7 +23,7 @@ assert.equal(Object.keys(artifactManifest.dependencies ?? {}).length, 0,
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'dreammate-package-boundary-'));
 const artifacts = path.join(temp, 'artifacts');
 fs.mkdirSync(artifacts);
-const env = { ...process.env, NODE_PATH: '', DREAMMATE_SKIP_SKILLS: '1' };
+const env = { ...process.env, NODE_PATH: '' };
 const npm = (args, cwd = root) => execFileSync('npm', args, {
   cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'], timeout: 120_000,
 });

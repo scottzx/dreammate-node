@@ -79,7 +79,7 @@ try {
         process.exitCode = await runSkillSourceCli(argv.slice(1));
         break;
       }
-      // npm postinstall must also work in an unbuilt source checkout.
+      // The explicit skill installer runs from a built package and an unbuilt source checkout.
       const installerUrl = new URL(entry.endsWith('.ts') ? '../scripts/install-skills.mjs' : '../../scripts/install-skills.mjs', import.meta.url);
       const { runInstaller } = await import(installerUrl.href);
       process.exitCode = runInstaller(argv.slice(2));

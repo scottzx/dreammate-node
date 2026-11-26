@@ -228,7 +228,7 @@ pnpm dsh plugin --profile web add @1agents/dreammate-node
 
 先卸掉旧的 `@1agents/dsh-dreammate-node`，再装这个包。两个 bundle 不要同时启用。插件 id 仍是 `dreammate-node`；自定义补丁行的包名改成 `@1agents/dreammate-node`。
 它注册本包导出的 MCP 元工具，覆盖工具与技能搜索、契约读取及调用等入口，默认使用本机 `36908`。`dreammate_access` 不进入 DSH 工具列表。
-DSH 需要 Node.js >=22.19。安装这个包会运行它自己的 `postinstall` 来放置技能指南。已有运行中的网关需单独核对版本。
+DSH 需要 Node.js >=22.19。技能指南不在安装时自动写入，需按下面的说明显式运行 `dreammate-node skills install`。包内没有安装期脚本，因此 pnpm 11 不会因未批准的构建脚本而拒绝安装。已有运行中的网关需单独核对版本。
 配置与进程生命周期见 [DSH 插件说明](packages/dsh-plugin/README.md)。
 
 ```bash
@@ -262,7 +262,7 @@ dreammate-node tunnel    # 默认 http://127.0.0.1:8787，stdout 打印 https://
 
 `cloudflared` 是可选依赖，装不上时不影响其余命令。隧道不启动 MCP，也不打开网关的公网访问开关。域名不固定，进程退出即失效；客户端地址是该域名下的 `/mcp`，仍要带 Bearer token。Cloudflare 终结 TLS。`--url` 只接受回环地址。
 
-### npm 安装时自动安装对应 skill
+### 显式安装对应 skill
 
 包内包含两份同名 `dreammate-node` skill，安装时只选择一种：
 
@@ -271,34 +271,27 @@ dreammate-node tunnel    # 默认 http://127.0.0.1:8787，stdout 打印 https://
 | iSH（Linux 内核版本含 `ish` 标记，或存在 `/proc/ish`） | 一次性 CLI 与手动地址缓存，连接其他设备的网关，不启动本机守护进程 |
 | 其他终端 | 远程 CLI、本机网关、报备与 MCP；仅远程调用时无需安装本机网关 |
 
-`postinstall` 默认写入 `~/.agents/skills/dreammate-node/SKILL.md`，并同步到**已存在**的
+包**没有 `postinstall`**，装完不会自动写任何 skill 文件；由你显式运行：
+
+```bash
+dreammate-node skills install                  # 自动识别环境，写入 ~/.agents/skills
+dreammate-node skills install --profile ish
+dreammate-node skills install --profile terminal --dir ~/.agents/skills
+```
+
+默认写入 `~/.agents/skills/dreammate-node/SKILL.md`，并同步到**已存在**的
 `~/.claude/skills`、`${CODEX_HOME:-~/.codex}/skills`、`~/.gemini/skills` 和
-`~/.gemini/config/skills` 下的 `dreammate-node` 目录。它不联网、不启动服务、不修改 MCP
-配置。CLI 不运行常驻进程；skill 文件只在 npm 安装或手动补装时写入，设备地址簿则由用户手动导入更新。
+`~/.gemini/config/skills` 下的 `dreammate-node` 目录。命令不联网、不启动服务、不修改 MCP
+配置。CLI 不运行常驻进程；skill 文件只在显式补装时写入，设备地址簿则由用户手动导入更新。
 
 默认自动识别不依赖 Alpine、CPU 架构或主机名；普通 Alpine 不会仅因发行版被判为 iSH。
 安装记录保存来源、版本和内容校验值：未改动的本包 skill 可自动升级或切换版本，用户自建或
-修改过的同名 skill 会保留并提示路径。某个目录安装失败不影响其他目录或 npm 包安装。
-
-```bash
-# 安装脚本被禁用、后装智能体、识别不符时，手动补装
-dreammate-node skills install
-dreammate-node skills install --profile ish
-dreammate-node skills install --profile terminal --dir ~/.agents/skills
-
-# 安装时覆盖识别结果或目标目录（--dir/环境变量指向 skills 根目录）
-DREAMMATE_SKILL_PROFILE=ish npm i -g @1agents/dreammate-node
-DREAMMATE_SKILLS_DIR="$HOME/.agents/skills" npm i -g @1agents/dreammate-node
-
-# 跳过自动 skill 安装，不影响以后手动补装
-DREAMMATE_SKIP_SKILLS=1 npm i -g @1agents/dreammate-node
-```
+修改过的同名 skill 会保留并提示路径。某个目录安装失败不影响其他目录，但命令会以非零码退出。
 
 `--profile auto|ish|terminal` 优先于 `DREAMMATE_SKILL_PROFILE`；`--dir` 优先于
 `DREAMMATE_SKILLS_DIR`，指定目录时只安装该处，目录须为绝对路径或以 `~/` 开头。
 源码目录尚未构建时可用 `npm run skills:install -- --profile ish`。安装/同步后由智能体重新
-加载技能；已打开的会话是否立即更新取决于宿主。`npm --ignore-scripts` 或安装脚本策略可阻止
-自动执行，此时使用手动补装命令。`dreammate-node uninstall` 仅卸载守护进程，保留 skill。
+加载技能；已打开的会话是否立即更新取决于宿主。`dreammate-node uninstall` 仅卸载守护进程，保留 skill。
 
 ### 让项目里的 Skill 可以被搜索和使用
 
@@ -340,7 +333,7 @@ npm run check:all                       # 全仓检查及独立服务的集成�
 ```
 
 独立版本与发布方式见 [Skill Manager 开发与发布说明](packages/skill-manager/README.md)，双方发布没有先后依赖。
-Node 自带指南的 `postinstall` 仍由 Node 维护，它属于该产品的安装流程。
+Node 自带指南由显式 `dreammate-node skills install` 安装，不属于包的安装流程。
 
 历史 `service.skills` 随服务附带的 SOP 及归档接口保留原有轻量兼容实现；
 项目来源发现、来源配置和版本化资源读取只由 Skill Manager 实现。

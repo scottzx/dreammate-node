@@ -22,8 +22,9 @@ Remove the old `@1agents/dsh-dreammate-node` bundle first. Do not enable both.
 The plugin id stays `dreammate-node`. Custom rows must name `@1agents/dreammate-node`,
 the package root, not a subpath.
 `@1agents/dreammate-node` declares `dsh.bundle.patch` and registers the Host plugin.
-Installing it does not start a service by itself. The package `postinstall` can
-install bundled skill guides; see [automatic skill installation](../../README.md#npm-安装时自动安装对应-skill).
+Installing it does not start a service by itself, and the package has no install-time
+scripts. Run `dreammate-node skills install` explicitly if you want the bundled skill
+guides; see [explicit skill installation](../../README.md#显式安装对应-skill).
 
 Ask the DSH Agent to find devices/services, inspect a method, then call it:
 
